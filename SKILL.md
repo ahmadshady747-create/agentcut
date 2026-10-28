@@ -267,3 +267,17 @@ AgentCut edit and verify them.
   (DejaVu has no Arabic glyphs). Shaping was verified on this
   FFmpeg build (libfribidi + libharfbuzz); on other builds,
   frame-check Arabic text before delivering it.
+- Arabic word order (1.33.0): every Arabic text/caption is
+  rendered wrapped in RLE...PDF with RLM before trailing
+  punctuation, because this build otherwise renders digit-led
+  lines LTR ("2 دولار" as "دولار 2"). Stored text stays in
+  logical order; Latin-only lines are untouched. Never
+  "fix" order by reversing tokens — verified to render
+  byte-identical to the broken line on this build.
+- Layer/text collisions (1.33.0): validate_project's info
+  carries `warnings`; an overlay path crossing a text or
+  caption region records `layer_text_overlap_warning`
+  (overlay id, text, time range). Warnings only — they never
+  block a render. Boxes are estimates (see CHANGELOG), so
+  treat a warning as "check this frame", not as proof of a
+  visible collision.

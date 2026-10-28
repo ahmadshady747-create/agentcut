@@ -91,7 +91,7 @@ TOOLS = [
          "id": {"type": "string"}, "patch": {"type": "object"}},
          "required": ["id", "patch"]}},
     {"name": "validate_project",
-     "description": "Validate a project JSON without rendering it.",
+     "description": "Validate a project JSON without rendering it. Returns errors (blocking) and info, including warnings: layer_text_overlap_warning entries (approximate overlay-vs-text box collisions, warnings only, never blocking) when an overlay path crosses a text or caption region.",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "object"}}, "required": ["project"]}},
     {"name": "preview_project",

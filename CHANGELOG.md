@@ -1,3 +1,70 @@
+## 1.33.0 — Arabic BiDi fix + layer/text collision warnings
+
+- Arabic BiDi display fix (render.py `bidi_display_text`, applied
+  to EVERY rendered text overlay and caption at the point just
+  before writing the temporary drawtext textfile — titles, pop
+  texts, word-reveal prefixes and SRT cues alike; stored project
+  text stays in logical order, only the rendered form changes;
+  the review timecode drawtext is a separate filter and is NOT
+  touched). Rule: a line containing an Arabic character
+  (U+0600..U+06FF) is wrapped RLE (U+202B) ... PDF (U+202C) with
+  RLM (U+200F) before a trailing punctuation run
+  (!, ؟, ., ،, %, ٪); Latin-only lines are returned
+  byte-identical, so non-Arabic renders are pixel-identical.
+  Root cause, verified by frame inspection on this FFmpeg
+  build (libfribidi + libharfbuzz): drawtext shapes Arabic
+  letters (they join) but picks paragraph direction from the
+  first strong character, so a digit-led line renders LTR —
+  plain "2 دولار" shows 2 left / دولار right (read as
+  "دولار 2"), plain "80٪ هواء!" puts ! on the far right, and a
+  plain sentence's trailing ، sits on the far right. With the
+  controls: "2 دولار" shows دولار left / 2 right, "80٪ هواء!"
+  shows ! far left / 80٪ far right, and a sentence's ، sits
+  far left; the title "اقتصاد القرد 2" renders byte-identical
+  plain vs wrapped (already correct, controls are a safe
+  no-op there), and the controls never render as boxes.
+  TESTED AND REJECTED: programmatic token reversal. Feeding
+  "دولار 2" for logical "2 دولار" renders byte-identical to
+  the plain line (same PNG hash) — this build's shaper
+  reorders directional runs itself, so token reversal is
+  undone before painting and must NOT be used. Both % and ٪
+  forms were frame-checked (order correct in both; see the
+  font limit below for why ٪ is still the form to write).
+  Tests: test_bidi_display_text_transform (unit, incl.
+  idempotence and Latin byte-identity) and
+  test_bidi_arabic_renders (render smoke); eye-verification
+  is recorded in STATE.md, never claimed from the transform.
+- Layer/text collision warnings (validate.py
+  `check_layer_text_overlap`, primary place; surfaced in
+  info["warnings"] so the validate_project MCP tool, the
+  timeline_summary result and produce_video's QA warnings all
+  carry them). The check estimates text boxes (x/y or
+  position, size, width = text length x size x 0.6, height =
+  size x 1.4), overlay boxes over time (position/size plus
+  keyframe paths, linearly interpolated — easing ignored —
+  sampled every 0.5s plus keyframe times and window
+  boundaries; constant keyframe scales use the overlay's base
+  size, mirroring render.py), and caption bottom-bar regions
+  during their windows. An overlay path intersecting an
+  active text region in the same time window records
+  code "layer_text_overlap_warning" naming the overlay id,
+  the overlapping text and the colliding time range.
+  Warnings NEVER block rendering or validation (warnings
+  only, never errors). Test: the old island layout (badge
+  gliding at y=240 across keyword rows at y=340) produces
+  the warning naming badge + keyword; the new layout
+  (badge at y=1030) produces none. The approximation
+  (estimated widths, sampled times, linear keyframe
+  interpolation) is documented in the function and here.
+- Known font limits, unchanged and restated: "%" (U+0025)
+  and "#" (U+0023) are MISSING in both Noto Naskh Arabic and
+  Noto Sans Arabic here (they render as tofu boxes); the
+  Arabic percent sign ٪ (U+066A) DOES render in Noto Naskh
+  Arabic. Write rendered % forms as ٪, and titles without #
+  (e.g. "اقتصاد القرد 2"). Literal % in textfile content
+  is safe since 1.32.1 (expansion=none) — it renders, as a
+  tofu box in Arabic fonts, not as an empty overlay.
+
 ## 1.32.1 — Percent-caption fix (found in production)
 - Text overlays (texts and SRT captions) now set drawtext
   `expansion=none`. FFmpeg expands %{...} sequences in textfile

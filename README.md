@@ -404,7 +404,19 @@ When a text contains Arabic characters, AgentCut uses Noto Naskh
 Arabic (or Noto Sans Arabic as fallback) instead of DejaVu, which
 has no Arabic glyphs. On this FFmpeg build (libfribidi +
 libharfbuzz) Arabic shaping was verified by eye on rendered
-frames: letters join correctly and word order is right-to-left.
+frames: letters join correctly. Word ORDER is a separate issue
+that shaping alone does not fix (1.33.0): drawtext picks the
+paragraph direction from the first strong character, so a
+digit-led line renders LTR unless forced. AgentCut therefore
+renders every Arabic line (texts and captions alike) wrapped in
+RLE...PDF with RLM before trailing punctuation (see
+`bidi_display_text` in render.py); stored project text stays in
+logical order, Latin-only lines are untouched, and the review
+timecode is not affected. Frame-verified: "2 دولار" shows
+دولار left of 2, "80٪ هواء!" shows ! far left, sentence
+punctuation ، sits far left. Font limits: "%" and "#" have no
+glyph in either Arabic font here (tofu boxes) — write rendered
+percents as ٪ (U+066A, which does render) and titles without #.
 On a build without that shaping support, Arabic may render
 disconnected; the font rule still applies, but the shaping
 result depends on the local FFmpeg build.

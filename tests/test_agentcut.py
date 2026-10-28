@@ -2037,5 +2037,100 @@ class TestAgentCut(unittest.TestCase):
         self.assertGreater(bright, 50)
 
 
+    def test_bidi_display_text_transform(self):
+        # v1.33.0: one function, applied at textfile-write time.
+        # Arabic lines get RLE...PDF with RLM before trailing
+        # punctuation; Latin-only lines are byte-identical.
+        from agentcut.render import bidi_display_text
+        self.assertEqual(bidi_display_text("2 دولار"),
+                         "\u202b2 دولار\u202c")
+        self.assertEqual(bidi_display_text("80٪ هواء!"),
+                         "\u202b80٪ هواء\u200f!\u202c")
+        self.assertEqual(bidi_display_text("80% هواء!"),
+                         "\u202b80% هواء\u200f!\u202c")
+        self.assertEqual(
+            bidi_display_text("عشان تشتري جزيرة خاصة وتعيش ملك،"),
+            "\u202bعشان تشتري جزيرة خاصة وتعيش ملك\u200f،\u202c")
+        self.assertEqual(bidi_display_text("اقتصاد القرد 2"),
+                         "\u202bاقتصاد القرد 2\u202c")
+        self.assertEqual(bidi_display_text("Hello world"), "Hello world")
+        self.assertEqual(bidi_display_text("80% off"), "80% off")
+        # Idempotent: an already-wrapped line is not double-wrapped.
+        wrapped = bidi_display_text("2 دولار")
+        self.assertEqual(bidi_display_text(wrapped), wrapped)
+
+    def test_bidi_arabic_renders(self):
+        # Render smoke test: an Arabic keyword renders (frame
+        # non-empty in the text band). Order correctness is proven
+        # by eye on frames, recorded in STATE.md (RLE frames for
+        # "2 دولار", "80٪ هواء!" and a full sentence) — the
+        # transform alone is never claimed as proof.
+        from agentcut.render import render_project
+        project = {"id": "bidi-test", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image",
+                              "src": os.path.join(BASE, "data", "test_media", "pattern.png"),
+                              "duration": 3}],
+                   "texts": [{"text": "2 دولار", "color": "yellow",
+                              "size": 54, "x": "center", "y": 200,
+                              "start": 0, "end": 3}]}
+        out = os.path.join(BASE, "data", "test_bidi.mp4")
+        ok, rinfo = render_project(project, out)
+        self.assertTrue(ok, rinfo)
+        _w, _h, px = _frame_png(out, 1.5,
+                                os.path.join(BASE, "data", "test_bidi_frame.png"))
+        bright = 0
+        for y in range(180, 280, 2):
+            for x in range(0, 360, 2):
+                r, g, b = px(x, y)[:3]
+                if r > 180 and g > 180 and b < 120:
+                    bright += 1
+        self.assertGreater(bright, 20)
+
+    def test_layer_text_overlap_warning(self):
+        # v1.33.0: geometric check, warnings only (never errors).
+        # Old island layout (badge gliding at y=240 across keyword
+        # rows at y=340) MUST warn naming badge + keyword; the new
+        # layout (badge at y=1030, below the panel, above the
+        # captions at y=1160) MUST NOT warn.
+        def _project(badge_y):
+            badge = os.path.join(BASE, "data", "test_badge.png")
+            if not os.path.isfile(badge):
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                                "-i", "color=c=0xFFCC00:s=200x200",
+                                "-frames:v", "1", badge], check=True)
+            return {"id": "overlap-test", "version": 1,
+                    "output": {"width": 720, "height": 1280, "fps": 12},
+                    "clips": [{"id": "a", "kind": "image",
+                               "src": os.path.join(BASE, "data", "test_media", "pattern.png"),
+                               "duration": 10}],
+                    "texts": [{"text": "2 دولار", "color": "yellow",
+                               "size": 54, "x": "center", "y": 340,
+                               "start": 0, "end": 10}],
+                    "captions": [{"text": "عبي هذا الهواء في قوارير",
+                                  "start": 0, "end": 10}],
+                    "overlays": [{"id": "badge", "kind": "image",
+                                  "src": badge,
+                                  "start": 0, "duration": 10, "size": 0.15,
+                                  "keyframes": [{"time": 0, "x": 20, "y": badge_y,
+                                                "scale": 1.0, "opacity": 1.0,
+                                                "easing": "ease_in_out"},
+                                               {"time": 10, "x": 520, "y": badge_y,
+                                                "scale": 1.0, "opacity": 1.0,
+                                                "easing": "ease_in_out"}]}]}
+        errors, info = validate_project(_project(240))
+        self.assertEqual(errors, [])  # warnings never block
+        warns = [w for w in info.get("warnings", [])
+                 if w.get("code") == "layer_text_overlap_warning"]
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0]["overlay_id"], "badge")
+        self.assertEqual(warns[0]["text"], "2 دولار")
+        errors2, info2 = validate_project(_project(1030))
+        self.assertEqual(errors2, [])
+        warns2 = [w for w in info2.get("warnings", [])
+                  if w.get("code") == "layer_text_overlap_warning"]
+        self.assertEqual(warns2, [])
+
+
 if __name__ == "__main__":
     unittest.main()

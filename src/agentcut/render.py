@@ -48,6 +48,66 @@ def _even(n):
     return int(n) if int(n) % 2 == 0 else int(n) - 1
 
 
+# --- Arabic BiDi display transform (v1.33.0) -------------------------
+# Verified fact about this FFmpeg build (libfribidi + libharfbuzz,
+# 2026-10-28, frame inspection, not assumed): drawtext shapes Arabic
+# letters correctly (they join) but chooses the paragraph direction
+# from the first strong character. A line starting with a digit or a
+# Latin run therefore renders LTR: "2 دولار" shows 2 on the left and
+# دولار on the right, which an RTL reader reads as "دولار 2"; a
+# trailing ، or ! lands on the far right instead of the far left.
+# Pure-Arabic lines starting with an Arabic letter were already
+# correct, which is why single words and Arabic-led sentences
+# passed earlier checks while digit-led keywords failed.
+#
+# The fix is Unicode embedding controls, applied at render time
+# only (stored project text stays in logical order):
+#   RLE (U+202B) ... PDF (U+202C) forces an RTL paragraph, and an
+#   RLM (U+200F) before a trailing punctuation run (!, ؟, ., ،,
+#   %, ٪) pins that punctuation to the left end of the line.
+# Frame evidence (2026-10-28, Noto Naskh Arabic, yellow on black):
+#   plain "2 دولار" -> 2 left, دولار right (WRONG);
+#   RLE "2 دولار"  -> دولار left, 2 right (CORRECT);
+#   plain "80٪ هواء!" -> ! far right (WRONG);
+#   RLE "80٪ هواء" + RLM + "!" -> ! far left, 80٪ far right (CORRECT);
+#   plain sentence ending "،" -> ، far right (WRONG);
+#   RLE sentence + RLM + "،" -> ، far left (CORRECT);
+#   title "اقتصاد القرد 2" -> identical pixels plain vs RLE
+#   (already correct; the controls are a safe no-op there).
+#   Controls render as zero-width controls, never as boxes.
+# The alternative that was TESTED AND REJECTED: programmatic token
+# reversal. Feeding "دولار 2" for logical "2 دولار" renders
+# byte-identical to the plain line (same PNG hash) — this build's
+# shaper reorders directional runs itself, so reversing tokens is
+# undone before painting. Token reversal must NOT be used here.
+# Only lines containing an Arabic character (U+0600..U+06FF) are
+# wrapped; Latin-only lines are returned byte-identical, so
+# non-Arabic renders are pixel-identical to before. The review
+# timecode drawtext is NOT passed through this function (it is a
+# separate filter using %{pts:hms}, not a textfile overlay).
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+_TRAILING_PUNCT_RE = re.compile(r"([!؟.،%٪]+)$")
+_RLE = "\u202b"
+_PDF = "\u202c"
+_RLM = "\u200f"
+
+
+def bidi_display_text(text):
+    """Render form of one text/caption line (logical order in, display
+    form out). Arabic lines get RLE...PDF with RLM before trailing
+    punctuation; every other line is returned unchanged."""
+    s = str(text)
+    if not _ARABIC_RE.search(s):
+        return s
+    if s.startswith(_RLE) and s.endswith(_PDF):
+        return s
+    m = _TRAILING_PUNCT_RE.search(s)
+    if m:
+        core, punct = s[:m.start()], m.group(1)
+        return _RLE + core + _RLM + punct + _PDF
+    return _RLE + s + _PDF
+
+
 def _atempo_chain(speed):
     """atempo only accepts 0.5..100, so split out-of-range speeds."""
     parts = []
@@ -844,7 +904,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             stroke_part = f":borderw={stroke}:bordercolor={sc}"
         text_path = os.path.join(text_dir, f"text_{overlay_index}.txt")
         with open(text_path, "w", encoding="utf-8") as fh:
-            fh.write(str(item["text"]))
+            # BiDi display form (v1.33.0): stored text stays in
+            # logical order; only the textfile content is wrapped
+            # (see bidi_display_text). Reveal prefixes are already
+            # expanded into render_items above, so they are covered
+            # here exactly like titles, pop texts and SRT cues.
+            fh.write(bidi_display_text(str(item["text"])))
         # Font by script: Arabic text gets Noto Naskh Arabic when
         # present (DejaVu has no Arabic glyphs), everything else
         # keeps the validated default font.
@@ -1762,6 +1827,11 @@ def produce_video(brief, output_path, review_dir=None):
         "freeze_segments": freeze_segs, "freeze_duration": freeze_total,
         "warnings": warnings,
     }
+    # Layer/text collision warnings from validation (v1.33.0):
+    # warnings only, merged into QA so a produce run surfaces them
+    # exactly like the validate_project tool does.
+    for _w in (info.get("warnings") or []):
+        warnings.append(f"{_w.get('code')}: {_w.get('message')}")
     # Overlay feedback (integration item e): placement and
     # keyframe summary in the result, plus warnings for overlays
     # that would be invisible or dominate the frame — never silent.
@@ -1937,6 +2007,7 @@ def timeline_summary(project):
                   "texts": texts, "captions": captions,
                   "audio": audio, "overlays": overlays,
                   "chapters": info.get("chapters", []),
+                  "warnings": info.get("warnings", []),
                   "ducking": info.get("ducking")}
 
 

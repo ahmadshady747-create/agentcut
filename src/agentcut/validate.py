@@ -331,6 +331,173 @@ def _validate_effects(obj, errors, oid, field_prefix):
                           fix="set vignette to true for a darkened-corner effect, or remove it"))
 
 
+def _text_box(item, is_caption, width, height, total):
+    """Approximate on-screen box (x, y, w, h) for a text/caption item.
+
+    APPROXIMATION, documented honestly: the true drawtext box
+    depends on the font's glyph advances, which validation does not
+    measure. Width is estimated as len(text) x size x 0.6 and height
+    as size x 1.4; positions mirror render.py (numeric x/y, the
+    POS_MAP presets, centred texts, captions at height-120 by
+    default). The check is a warning, never an error, precisely
+    because these boxes are estimates.
+    """
+    text = str(item.get("text", ""))
+    size = float(item.get("size", 36 if is_caption else 48))
+    est_w = max(10.0, len(text) * size * 0.6)
+    est_h = size * 1.4
+    pos = item.get("position")
+    if pos:
+        presets = {
+            "top_left": (40.0, 40.0),
+            "top_center": ((width - est_w) / 2, 40.0),
+            "top_right": (width - est_w - 40.0, 40.0),
+            "center": ((width - est_w) / 2, (height - est_h) / 2),
+            "bottom_left": (40.0, height - est_h - 40.0),
+            "bottom_center": ((width - est_w) / 2, height - est_h - 40.0),
+            "bottom_right": (width - est_w - 40.0, height - est_h - 40.0),
+        }
+        x, y = presets[pos]
+    elif is_caption:
+        x, y = (width - est_w) / 2, float(height - 120)
+    else:
+        xv = item.get("x", "center")
+        x = (width - est_w) / 2 if xv == "center" else float(xv)
+        y = float(item.get("y", 100))
+    return (x, y, est_w, est_h)
+
+
+def _overlay_box_at(ov, t, width, height):
+    """Approximate overlay box at timeline time t (linear keyframe
+    interpolation; easing ignored — another documented
+    approximation). Returns (x, y, w, h) or None for invisible
+    overlays (opacity 0 at that time)."""
+    kfs = ov.get("keyframes_resolved")
+    if kfs:
+        rel = t - float(ov["start"])
+        # Render semantics (render.py): when keyframe scales do NOT
+        # vary, the overlay is scaled by its base size and the
+        # keyframe scale values are ignored; only a varying scale
+        # drives the per-frame width. Mirror that here, or a
+        # constant scale=1.0 keyframe would fake a full-width box.
+        varying_scale = len({float(f["scale"]) for f in kfs}) > 1
+        if rel <= kfs[0]["time"]:
+            x, y, scale = float(kfs[0]["x"]), float(kfs[0]["y"]), float(kfs[0]["scale"])
+            opacity = float(kfs[0]["opacity"])
+        elif rel >= kfs[-1]["time"]:
+            x, y, scale = float(kfs[-1]["x"]), float(kfs[-1]["y"]), float(kfs[-1]["scale"])
+            opacity = float(kfs[-1]["opacity"])
+        else:
+            x = y = scale = opacity = None
+            for a, b in zip(kfs, kfs[1:]):
+                if a["time"] <= rel <= b["time"]:
+                    f = (rel - a["time"]) / (b["time"] - a["time"]) if b["time"] > a["time"] else 0.0
+                    x = float(a["x"]) + (float(b["x"]) - float(a["x"])) * f
+                    y = float(a["y"]) + (float(b["y"]) - float(a["y"])) * f
+                    scale = float(a["scale"]) + (float(b["scale"]) - float(a["scale"])) * f
+                    opacity = float(a["opacity"]) + (float(b["opacity"]) - float(a["opacity"])) * f
+                    break
+        if opacity == 0:
+            return None
+        if not varying_scale:
+            scale = float(ov.get("size", 0.35))
+    else:
+        scale = float(ov.get("size", 0.35))
+        if float(ov.get("opacity", 1.0)) == 0:
+            return None
+        probe = ov.get("probe") or {}
+        pw, ph = probe.get("width") or width, probe.get("height") or height
+        bw = scale * width
+        bh = bw * (ph / pw) if pw else bw
+        presets = {
+            "top_left": (20.0, 20.0),
+            "top_center": ((width - bw) / 2, 20.0),
+            "top_right": (width - bw - 20.0, 20.0),
+            "center": ((width - bw) / 2, (height - bh) / 2),
+            "bottom_left": (20.0, height - bh - 20.0),
+            "bottom_center": ((width - bw) / 2, height - bh - 20.0),
+            "bottom_right": (width - bw - 20.0, height - bh - 20.0),
+        }
+        if "x" in ov and "y" in ov:
+            x, y = float(ov["x"]), float(ov["y"])
+        else:
+            x, y = presets[ov.get("position", "bottom_right")]
+        return (x, y, bw, bh)
+    probe = ov.get("probe") or {}
+    pw, ph = probe.get("width") or width, probe.get("height") or height
+    bw = scale * width
+    bh = bw * (ph / pw) if pw else bw
+    return (x, y, bw, bh)
+
+
+def _boxes_overlap(a, b):
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and \
+        a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def check_layer_text_overlap(project, info):
+    """Geometric overlay-vs-text collision warnings (v1.33.0).
+
+    Primary place for this check: validate.py, surfaced in
+    info["warnings"] (and therefore in the validate_project MCP
+    tool's info) and merged into produce_video's QA warnings.
+    Warnings NEVER block rendering or validation: they are
+    advisory only. One warning per (overlay, text) pair, naming
+    the overlay id, the overlapping text and the colliding time
+    range (sampled every 0.5s plus keyframe times and window
+    boundaries, so a gliding overlay that only crosses a text
+    briefly is still caught, and the range is the sampled
+    collision range, not the whole window).
+    """
+    width, height, total = info["width"], info["height"], info["total_duration"]
+    texts = []
+    for item in (project.get("texts") or []):
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            texts.append((item["text"], float(item.get("start", 0)),
+                          float(item.get("end", total)),
+                          _text_box(item, False, width, height, total)))
+    for cap in (info.get("captions") or []):
+        if isinstance(cap, dict) and isinstance(cap.get("text"), str):
+            texts.append((cap["text"], float(cap.get("start", 0)),
+                          float(cap.get("end", total)),
+                          _text_box(cap, True, width, height, total)))
+    warnings = []
+    for ov in (info.get("overlays") or []):
+        o_start = float(ov["start"])
+        o_end = o_start + float(ov["duration"])
+        for text, t_start, t_end, tbox in texts:
+            w_start, w_end = max(o_start, t_start), min(o_end, t_end)
+            if w_end <= w_start:
+                continue
+            samples = {w_start, w_end}
+            t = w_start
+            while t < w_end:
+                samples.add(round(t, 3))
+                t += 0.5
+            for kf in (ov.get("keyframes_resolved") or []):
+                at = o_start + float(kf["time"])
+                if w_start <= at <= w_end:
+                    samples.add(round(at, 3))
+            samples.add(round(t_start, 3)) if w_start <= t_start <= w_end else None
+            samples.add(round(t_end, 3)) if w_start <= t_end <= w_end else None
+            hits = []
+            for s in sorted(samples):
+                obox = _overlay_box_at(ov, s, width, height)
+                if obox is not None and _boxes_overlap(obox, tbox):
+                    hits.append(s)
+            if hits:
+                end = min(round(hits[-1] + 0.5, 3), round(w_end, 3))
+                warnings.append({
+                    "code": "layer_text_overlap_warning",
+                    "message": (f"overlay '{ov['id']}' overlaps text "
+                                f"'{text}' during {hits[0]:.2f}..{end:.2f}s "
+                                f"(approximate boxes; move the overlay path "
+                                f"or shorten the text window)"),
+                    "overlay_id": ov["id"], "text": text,
+                    "start": round(hits[0], 3), "end": end})
+    return warnings
+
+
 def validate_project(project):
     """Validate a project dict.
 
@@ -1340,4 +1507,9 @@ def validate_project(project):
             "captions": merged_captions, "overlays": resolved_overlays,
             "chapters": chapters, "ducking": ducking,
             "video_bitrate": video_bitrate, "loudness_target": loudness_target}
+    # Layer/text collision is warnings-only: it never adds errors.
+    try:
+        info["warnings"] = check_layer_text_overlap(project, info)
+    except Exception:
+        info["warnings"] = []
     return errors, info
