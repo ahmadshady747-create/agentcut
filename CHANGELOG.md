@@ -1,3 +1,25 @@
+## 1.31.0 — Feature package (templates, word reveal, Arabic font)
+- Arabic text now renders with Noto Naskh Arabic when the text
+  contains Arabic characters (DejaVu has no Arabic glyphs); other
+  texts keep DejaVu. Shaping verified by eye on frames from this
+  FFmpeg build (libfribidi + libharfbuzz): letters join and word
+  order is correct RTL.
+- New text field `reveal: "word"`: the text expands as cumulative
+  word prefixes staggered across its window in proportion to word
+  length, so only the first word shows early and the full text
+  shows by the window end. Word reveal ONLY, never per-character:
+  Arabic letters join, and splitting them would break joining.
+  Reveal cannot combine with animation (rejected with a fix).
+- New blackboard template: synthetic board background
+  (data/test_media/board.png, dark board + wooden frame),
+  examples/blackboard.json and examples/brief-blackboard.json
+  with chalk-style white/yellow texts, including an Arabic
+  word-reveal line.
+- New animated template: examples/animated.json and
+  examples/brief-animated.json combining Ken Burns images,
+  dissolve/circle_open transitions and a picture-in-picture
+  overlay.
+
 ## 1.30.0 — Loop 6 round 4 (optional overlay audio mixing)
 - Post-audit test fix (no behaviour change): test_continuous_keyframe_scaling now generates its own green test image instead of relying on a file created by a later test, which made it fail in clean copies.
 - Overlay videos may set `volume` (0..2, default 0.0 muted, so

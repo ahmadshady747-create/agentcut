@@ -1,0 +1,58 @@
+{
+  "clips": [
+    {
+      "duration": 3,
+      "id": "a",
+      "ken_burns": "zoom_in",
+      "kind": "image",
+      "src": "data/test_media/poster.png"
+    },
+    {
+      "duration": 3,
+      "id": "b",
+      "ken_burns": "pan_left",
+      "kind": "image",
+      "src": "data/test_media/pattern.png",
+      "transition": "dissolve"
+    },
+    {
+      "duration": 3,
+      "id": "c",
+      "ken_burns": "zoom_out",
+      "kind": "image",
+      "src": "data/test_media/poster.png",
+      "transition": "circle_open"
+    }
+  ],
+  "id": "animated",
+  "output": {
+    "fps": 24,
+    "height": 720,
+    "width": 720
+  },
+  "overlays": [
+    {
+      "duration": 4.0,
+      "id": "pip",
+      "kind": "image",
+      "opacity": 0.9,
+      "position": "bottom_right",
+      "size": 0.3,
+      "src": "data/test_media/pattern.png",
+      "start": 1.0
+    }
+  ],
+  "texts": [
+    {
+      "box": true,
+      "color": "white",
+      "end": 3.0,
+      "size": 48,
+      "start": 0.5,
+      "text": "Animated slideshow",
+      "x": "center",
+      "y": 80
+    }
+  ],
+  "version": 1
+}

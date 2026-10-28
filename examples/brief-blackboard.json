@@ -1,0 +1,1 @@
+{"clips":[{"duration":8,"src":"data/test_media/board.png"}],"format":"vertical","id":"template-blackboard","texts":[{"box":false,"color":"yellow","end":3.5,"size":72,"start":0.5,"text":"درس اليوم","x":"center","y":200},{"box":false,"color":"white","end":7.5,"reveal":"word","size":64,"start":3.5,"text":"مرحبا بالعالم","x":"center","y":520}]}

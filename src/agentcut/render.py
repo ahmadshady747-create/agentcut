@@ -16,7 +16,8 @@ import sys
 import tempfile
 import uuid
 
-from .validate import XFADE_TRANSITIONS, find_font, probe_media, validate_project
+from .validate import (XFADE_TRANSITIONS, find_font, find_font_for_text,
+                       probe_media, validate_project)
 
 
 # Text overlays use drawtext textfile=, not text=. A literal apostrophe,
@@ -652,8 +653,40 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         text_dir = tempfile.mkdtemp(prefix="agentcut-text-")
     overlay_index = 0
     merged_captions = info.get("captions", project.get("captions") or [])
-    for item in (project.get("texts") or []) + merged_captions:
-        is_caption = overlay_index >= len(project.get("texts") or [])
+    # Word reveal: one text becomes cumulative prefixes, staggered
+    # across its window in proportion to word length, so the full
+    # text is visible by the window end. Prefixes (not characters)
+    # are the unit on purpose: Arabic letters join, so a per-letter
+    # reveal would break joining; word reveal keeps every word
+    # intact in every language. Fades are dropped on reveal
+    # prefixes (the reveal itself is the entrance).
+    render_items = []
+    for _item, _is_cap in ([(t, False) for t in (project.get("texts") or [])]
+                           + [(c, True) for c in merged_captions]):
+        if _item.get("reveal") == "word":
+            words = str(_item["text"]).split()
+            if len(words) > 1:
+                _start = float(_item.get("start", 0))
+                _end = float(_item.get("end", total))
+                _window = _end - _start
+                _weights = [len(w) for w in words]
+                _total_w = sum(_weights)
+                _acc = 0
+                for _k, _w in enumerate(words):
+                    _sub = dict(_item)
+                    _sub["text"] = " ".join(words[:_k + 1])
+                    _sub["start"] = _start + _window * (_acc / _total_w)
+                    _acc += _weights[_k]
+                    _sub["end"] = _end if _k == len(words) - 1 else \
+                        _start + _window * (_acc / _total_w)
+                    _sub.pop("reveal", None)
+                    _sub.pop("animation", None)
+                    _sub.pop("fade_in", None)
+                    _sub.pop("fade_out", None)
+                    render_items.append((_sub, _is_cap))
+                continue
+        render_items.append((_item, _is_cap))
+    for item, is_caption in render_items:
         size = item.get("size", 36 if is_caption else 48)
         if is_caption:
             if item.get("position"):
@@ -714,8 +747,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         text_path = os.path.join(text_dir, f"text_{overlay_index}.txt")
         with open(text_path, "w", encoding="utf-8") as fh:
             fh.write(str(item["text"]))
+        # Font by script: Arabic text gets Noto Naskh Arabic when
+        # present (DejaVu has no Arabic glyphs), everything else
+        # keeps the validated default font.
+        item_font = find_font_for_text(str(item["text"])) or font
         filters.append(
-            f"[{vcur}]drawtext=fontfile={font}:textfile={text_path}:"
+            f"[{vcur}]drawtext=fontfile={item_font}:textfile={text_path}:"
             f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}:"
             f"x='{x_out}':y={y_expr}:"
             f"enable='between(t,{start},{end})'[vout{overlay_index}]")

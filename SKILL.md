@@ -215,3 +215,17 @@ agent, supply the intelligence. Work in this loop:
 Never ask AgentCut to generate, transcribe or synthesise:
 supply SRT captions, audio and media as local files, and let
 AgentCut edit and verify them.
+
+## Templates, word reveal, Arabic text
+
+- Templates to copy: blackboard (`examples/blackboard.json`,
+  `examples/brief-blackboard.json`) and animated slideshow
+  (`examples/animated.json`, `examples/brief-animated.json`).
+- `reveal: "word"` on a text reveals it word by word across its
+  window (proportional to word length). Never invent a
+  per-character reveal: Arabic letters join, and splitting them
+  breaks joining. Reveal and `animation` cannot combine.
+- Arabic text automatically uses Noto Naskh Arabic when present
+  (DejaVu has no Arabic glyphs). Shaping was verified on this
+  FFmpeg build (libfribidi + libharfbuzz); on other builds,
+  frame-check Arabic text before delivering it.

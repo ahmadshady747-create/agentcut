@@ -319,3 +319,35 @@ and `overlays`); and `snapshot_project` /
 experimentation — snapshot, patch, preview, roll back on a
 bad result. Validation errors on new features carry a
 `fix` hint with the field and clip id.
+
+## Templates
+
+Ready projects and produce briefs an agent can copy:
+
+- Blackboard: `examples/blackboard.json` (project) and
+  `examples/brief-blackboard.json` (brief) — a synthetic dark
+  board with a wooden frame (`data/test_media/board.png`) and
+  chalk-style white/yellow texts, including an Arabic line.
+- Animated slideshow: `examples/animated.json` and
+  `examples/brief-animated.json` — Ken Burns images, dissolve
+  and circle_open transitions, and a picture-in-picture overlay.
+
+## Word reveal
+
+A text may set `reveal: "word"`. At render time it expands into
+cumulative word prefixes staggered across its window in
+proportion to word length: only the first word is visible early,
+the full text is visible by the window end. Reveal is word-only
+by design — Arabic letters join, so per-character reveal would
+break joining. Reveal cannot combine with `animation` on one text.
+
+## Arabic text
+
+When a text contains Arabic characters, AgentCut uses Noto Naskh
+Arabic (or Noto Sans Arabic as fallback) instead of DejaVu, which
+has no Arabic glyphs. On this FFmpeg build (libfribidi +
+libharfbuzz) Arabic shaping was verified by eye on rendered
+frames: letters join correctly and word order is right-to-left.
+On a build without that shaping support, Arabic may render
+disconnected; the font rule still applies, but the shaping
+result depends on the local FFmpeg build.

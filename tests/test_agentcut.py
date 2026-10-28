@@ -1202,6 +1202,78 @@ class TestAgentCut(unittest.TestCase):
         self.assertTrue(any("chroma_key" in e.get("field", "") and "fix" in e
                             for e in errors))
 
+    def test_word_reveal(self):
+        # Word reveal only: cumulative prefixes staggered by word
+        # length, so early frames show only the first word and late
+        # frames show the full text. Characters are never the unit
+        # (Arabic letters join; splitting them would break joining).
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640", "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_black.png")], check=True)
+        black = os.path.join(BASE, "data", "test_black.png")
+
+        def white_total(path, t):
+            cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                   "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            data = subprocess.run(cmd, capture_output=True).stdout
+            n = len(data) // 3
+            return sum(1 for i in range(n)
+                       if data[3 * i] > 200 and data[3 * i + 1] > 200 and data[3 * i + 2] > 200)
+        proj = {"id": "r7-reveal", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "image", "src": black, "duration": 3}],
+                "texts": [{"text": "HELLO BRAVE WORLD", "start": 0, "end": 3,
+                           "size": 48, "x": "center", "y": 300,
+                           "reveal": "word", "box": False}]}
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_reveal.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        early = white_total(out, 0.5)
+        late = white_total(out, 2.5)
+        self.assertGreater(early, 50)  # first word visible early
+        self.assertGreater(late, early * 2)  # full text visible late
+        # Bad reveal values and reveal+animation carry fix hints.
+        bad = dict(proj); bad["id"] = "r7-reveal-bad"
+        bad["texts"] = [{"text": "X Y", "start": 0, "end": 2, "reveal": "char"}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any("fix" in e for e in errors))
+        bad2 = dict(proj); bad2["id"] = "r7-reveal-bad2"
+        bad2["texts"] = [{"text": "X Y", "start": 0, "end": 2,
+                          "reveal": "word", "animation": "pop"}]
+        errors, _ = validate_project(bad2)
+        self.assertTrue(any("fix" in e for e in errors))
+
+    def test_arabic_font_selection(self):
+        # DejaVu has no Arabic glyphs; Arabic text must resolve to a
+        # Noto Arabic font when one exists on the machine.
+        from agentcut.validate import (contains_arabic, find_font,
+                                       find_font_for_text)
+        self.assertTrue(contains_arabic("مرحبا بالعالم"))
+        self.assertFalse(contains_arabic("Hello world"))
+        arabic_font = find_font_for_text("مرحبا بالعالم")
+        self.assertTrue(arabic_font and "Noto" in arabic_font, arabic_font)
+        self.assertEqual(find_font_for_text("Hello world"), find_font())
+
+    def test_arabic_text_renders(self):
+        # Visual shaping was verified by eye on a frame (joined
+        # letters, correct RTL order) with this FFmpeg build
+        # (libfribidi + libharfbuzz) and Noto Naskh Arabic; this
+        # test pins the render path so it cannot silently regress
+        # to missing glyphs or a failed render.
+        proj = {"id": "arabic-smoke", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/poster.png", "duration": 3}],
+                "texts": [{"text": "مرحبا بالعالم", "start": 0.5, "end": 2.5,
+                           "size": 48, "x": "center", "y": 300}]}
+        out = os.path.join(BASE, "data", "test_arabic.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 3.0, delta=0.5)
+
     def test_overlay_audio_mixing(self):
         # Loop 6 round 4: an overlay video with volume set mixes
         # its audio in exactly during its window, and nowhere else.

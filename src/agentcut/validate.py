@@ -68,6 +68,35 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/DejaVuSans.ttf",
 ]
 
+# DejaVu has no Arabic glyphs, so Arabic texts previously rendered
+# as missing glyphs. Noto Naskh Arabic is the preferred Arabic font
+# when it exists on the machine; Noto Sans Arabic is the fallback.
+ARABIC_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Medium.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+]
+
+
+def contains_arabic(text):
+    """True when text contains any Arabic Unicode character."""
+    for ch in str(text):
+        code = ord(ch)
+        if (0x0600 <= code <= 0x06FF or 0x0750 <= code <= 0x077F
+                or 0x08A0 <= code <= 0x08FF or 0xFB50 <= code <= 0xFDFF
+                or 0xFE70 <= code <= 0xFEFF):
+            return True
+    return False
+
+
+def find_font_for_text(text):
+    """Font for one text: an Arabic font for Arabic text, else DejaVu."""
+    if contains_arabic(text):
+        for path in ARABIC_FONT_CANDIDATES:
+            if os.path.isfile(path):
+                return path
+    return find_font()
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -930,6 +959,15 @@ def validate_project(project):
                 elif anim in ("slide_in", "slide_out", "pop") and ad >= (end - start):
                     errors.append(err("INVALID_SCHEMA", "animation_duration must be less than the text duration", field=label + ".animation_duration",
                                       fix="shorten animation_duration, or lengthen the text window"))
+            reveal = item.get("reveal")
+            if reveal is not None and reveal != "word":
+                errors.append(err("INVALID_SCHEMA", "text reveal must be 'word'",
+                                  field=label + ".reveal",
+                                  fix="set reveal to 'word' (word reveal only) or remove it"))
+            if reveal == "word" and anim is not None:
+                errors.append(err("INVALID_SCHEMA", "text reveal cannot combine with animation",
+                                  field=label + ".reveal",
+                                  fix="use reveal or animation, not both, on one text"))
             if "stroke" in item:
                 try:
                     st = int(item["stroke"])

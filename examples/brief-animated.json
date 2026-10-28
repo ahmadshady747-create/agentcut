@@ -1,0 +1,47 @@
+{
+  "clips": [
+    {
+      "duration": 3,
+      "ken_burns": "zoom_in",
+      "src": "data/test_media/poster.png"
+    },
+    {
+      "duration": 3,
+      "ken_burns": "pan_left",
+      "src": "data/test_media/pattern.png",
+      "transition": "dissolve"
+    },
+    {
+      "duration": 3,
+      "ken_burns": "zoom_out",
+      "src": "data/test_media/poster.png",
+      "transition": "circle_open"
+    }
+  ],
+  "format": "square",
+  "id": "template-animated",
+  "overlays": [
+    {
+      "duration": 4.0,
+      "id": "pip",
+      "kind": "image",
+      "opacity": 0.9,
+      "position": "bottom_right",
+      "size": 0.3,
+      "src": "data/test_media/pattern.png",
+      "start": 1.0
+    }
+  ],
+  "texts": [
+    {
+      "box": true,
+      "color": "white",
+      "end": 3.0,
+      "size": 48,
+      "start": 0.5,
+      "text": "Animated slideshow",
+      "x": "center",
+      "y": 80
+    }
+  ]
+}
