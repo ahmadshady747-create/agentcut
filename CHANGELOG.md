@@ -1,3 +1,74 @@
+## 1.32.0 — Pro pack (easing, grading, ducking, chapters, delivery, review aids)
+- Easing keyframes: overlay keyframes accept `easing` — `linear`
+  (default, the old behaviour), `ease_in` (u^2, slow start),
+  `ease_out` (1-(1-u)^2, slow end) or `ease_in_out` (slow both
+  ends) — applied to scale, position and opacity via FFmpeg
+  time expressions on normalised segment time. The segment's
+  easing comes from its end keyframe when that keyframe sets a
+  non-linear easing, else its start keyframe. An unknown easing
+  value is a validation error with a fix hint, never a silent
+  fall back to linear.
+- Colour grading: per-clip `grade` presets — `cinematic`,
+  `teal_orange`, `warm`, `cool`, `noir` — each a documented
+  eq/colorbalance/saturation filter combination, not a claim
+  of film emulation; and per-clip `lut`, a local .cube file
+  rendered via lut3d (validated: must exist and end in .cube,
+  with a fix hint). Grade and LUT may combine; the LUT runs in
+  RGB (format conversion around lut3d) and back to yuv420p.
+- Deterministic audio ducking: a project `ducking` object
+  (`voice_track` as an audio-list index or a voice track's src,
+  `amount_db` 0..30, `fade` 0..2s, optional explicit `windows`)
+  replaces the automatic sidechain compressor for music tracks.
+  Music gain follows the voice track's time windows — derived
+  from the voice track's start plus its probed duration, or
+  the explicit windows — dropping by amount_db with linear
+  fades, evaluated per frame (volume eval=frame). This is
+  volume automation from time windows, not sidechain
+  compression and not level detection: it ducks on schedule
+  even if the voice track is quiet, and never outside windows.
+  Without a ducking object, voice+music still uses the
+  sidechain compressor as before.
+- Producer QA extended (warnings only, never changes to the
+  render): measured loudness (loudnorm input_i/input_tp/
+  input_lra, in LUFS/dB), sample-peak level (astats, warned
+  above -1 dB as close to clipping — a sample peak, not a
+  true-peak claim) and freeze-frame segments (freezedetect,
+  with a still-frozen-at-EOF freeze closed at the file end),
+  alongside the existing black/silence warnings.
+- Chapters: a project `chapters` list ({title, start}) is
+  written into the output file's metadata (ffmetadata, via
+  -map_chapters) and verified with ffprobe; each chapter runs
+  to the next chapter's start or the timeline end. Produce
+  briefs accept `chapters` directly, and section briefs get
+  chapters from their section titles when no explicit list is
+  given. Produce results carry the resolved chapters.
+- Delivery presets: `youtube_1080` (1920x1080, 30fps, 8M,
+  -14 LUFS), `shorts_720` (720x1280, 30fps, 5M, -14 LUFS) and
+  `instagram_square` (1080x1080, 30fps, 5M, -16 LUFS) for
+  produce_video (`delivery_preset`) and produce_variants
+  (`delivery_presets` list, or a single `delivery_preset`).
+  Preset sizes are delivery settings, not platform guarantees
+  (platforms may re-encode on upload). Precedence, enforced
+  and reported in the result: explicit width/height >
+  explicit format > delivery preset > default vertical;
+  explicit fps > preset fps > 24. A preset never silently
+  overrides an explicit size: the result's
+  delivery_preset_applied block records the size source.
+  Preset bitrate replaces crf 23 with a target bitrate;
+  preset loudness is the target used by loudnorm tracks.
+- Review aids: preview proxies carry title-safe (10% margin,
+  red) and action-safe (5% margin, yellow) drawbox guides by
+  default, flagged in the preview result (guides, timecode,
+  safe_areas); previews may also burn in a running timecode
+  (drawtext %{pts:hms}) on request. Final renders have
+  neither unless the project explicitly sets timecode: true —
+  that explicit choice does reach the final render.
+- Examples: examples/grading.json (grade + LUT project),
+  examples/ducking.json (ducking project),
+  examples/brief-grading.json, examples/brief-ducking.json,
+  and examples/test-lut.cube (a gentle warm LUT). All use
+  synthetic test media only.
+
 ## 1.31.0 — Feature package (templates, word reveal, Arabic font)
 - Arabic text now renders with Noto Naskh Arabic when the text
   contains Arabic characters (DejaVu has no Arabic glyphs); other

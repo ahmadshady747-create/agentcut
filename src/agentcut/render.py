@@ -16,8 +16,8 @@ import sys
 import tempfile
 import uuid
 
-from .validate import (XFADE_TRANSITIONS, find_font, find_font_for_text,
-                       probe_media, validate_project)
+from .validate import (GRADE_PRESETS, XFADE_TRANSITIONS, find_font,
+                       find_font_for_text, probe_media, validate_project)
 
 
 # Text overlays use drawtext textfile=, not text=. A literal apostrophe,
@@ -147,6 +147,51 @@ def _interp_expr(points, var):
     return f"if(lt({var},{points[0][0]!r}),{points[0][1]!r},{expr})"
 
 
+def _easing_factor(easing, u):
+    """Easing curve f(u) for normalised segment time u in [0, 1].
+
+    linear is the old behaviour. ease_in grows as u^2 (slow start,
+    fast end), ease_out as 1-(1-u)^2 (fast start, slow end), and
+    ease_in_out as 2u^2 below the midpoint and 1-2(1-u)^2 above it
+    (slow at both ends, fast in the middle). All are plain
+    FFmpeg expressions, evaluated per frame.
+    """
+    if easing == "ease_in":
+        return f"({u})*({u})"
+    if easing == "ease_out":
+        return f"(1-(1-({u}))*(1-({u})))"
+    if easing == "ease_in_out":
+        return (f"if(lt({u},0.5),2*({u})*({u}),"
+                f"1-2*(1-({u}))*(1-({u})))")
+    return f"({u})"
+
+
+def _interp_expr_eased(points, var):
+    """Piecewise-eased expression for `var` over (time, value, easing)
+    points, sorted by strictly increasing time.
+
+    The easing for a segment is taken from the segment's END
+    keyframe when that keyframe sets a non-linear easing, else
+    from its START keyframe, else linear. So setting easing on
+    either keyframe of a segment shapes that segment, and when
+    both set a non-linear easing the later keyframe wins. Outside
+    the range the first/last value holds, exactly like the
+    linear version.
+    """
+    if len(points) == 1:
+        return repr(float(points[0][1]))
+    expr = repr(float(points[-1][1]))
+    for i in range(len(points) - 2, -1, -1):
+        t0, v0, e0 = points[i]
+        t1, v1, e1 = points[i + 1]
+        easing = e1 if e1 and e1 != "linear" else (e0 or "linear")
+        u = f"(({var})-{t0!r})/({t1!r}-{t0!r})"
+        factor = _easing_factor(easing, u)
+        seg = f"{v0!r}+({v1!r}-{v0!r})*({factor})"
+        expr = f"if(lt({var},{t1!r}),{seg},{expr})"
+    return f"if(lt({var},{points[0][0]!r}),{points[0][1]!r},{expr})"
+
+
 def _interp_value(points, t):
     """Python-side linear interpolation over (time, value) points."""
     if t <= points[0][0]:
@@ -161,8 +206,36 @@ def _interp_value(points, t):
     return points[-1][1]
 
 
-def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
-    """Return (argv, total_duration) for a validated project."""
+def _bitrate_kbps(value):
+    """Bitrate (string like '8M'/'5000k' or integer kbps) -> kbps int."""
+    if isinstance(value, int):
+        return int(value)
+    s = str(value).strip().lower()
+    if s.endswith("m"):
+        return int(round(float(s[:-1]) * 1000))
+    if s.endswith("k"):
+        return int(round(float(s[:-1])))
+    return int(round(float(s)))
+
+
+def _ffmetadata_escape(text):
+    """Escape a chapter title for an ffmetadata file."""
+    return (str(text).replace("\\", "\\\\").replace(";", "\\;")
+            .replace("#", "\\#").replace("=", "\\="))
+
+
+def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
+                      metadata_path=None, guides=False,
+                      review_timecode=False):
+    """Return (argv, total_duration) for a validated project.
+
+    metadata_path is an ffmetadata file carrying chapters (or None).
+    guides draws title-safe/action-safe boxes (preview only, never
+    a final render unless the caller asks). review_timecode burns
+    a running timecode into this render; final renders pass False
+    here unless the project itself sets timecode (see
+    render_project), so a normal final render is unaffected.
+    """
     width = _even(info["width"] * scale_factor)
     height = _even(info["height"] * scale_factor)
     fps = info["fps"]
@@ -208,6 +281,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             audio_idx = _input_count(argv)
             argv += ["-i", ov["src"]]
         overlay_segments.append((ov, seg_start, seg_end, idx, audio_idx))
+    metadata_idx = None
+    if metadata_path:
+        # Chapters live in an ffmetadata input appended after all
+        # media inputs, so its index is known exactly here.
+        metadata_idx = _input_count(argv)
+        argv += ["-i", metadata_path]
     filters = []
     # Per-clip video and audio. vlabels[i] is the label the chain
     # must use for clip i (v{i}, or vout{i} when chroma-keyed).
@@ -364,6 +443,18 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         if eq_parts:
             vf += ",eq=" + ":".join(eq_parts)
         vf += _effect_chain(clip)
+        # Pro pack: colour grade preset and/or .cube LUT, applied
+        # after the clip's other colour filters. Presets are the
+        # documented filter combinations in GRADE_PRESETS, not
+        # film emulation. A LUT runs through lut3d in RGB: the
+        # chain converts to rgb24 for the LUT and back to
+        # yuv420p, because lut3d needs RGB input on this build.
+        if clip.get("grade") in GRADE_PRESETS:
+            vf += "," + GRADE_PRESETS[clip["grade"]]
+        if clip.get("lut_resolved") or clip.get("lut"):
+            lut_path = clip.get("lut_resolved") or clip["lut"]
+            vf += (f",format=rgb24,lut3d=file='{lut_path}',"
+                   f"format=yuv420p")
         fades = []
         if clip.get("transition") == "fade":
             ftd = float(clip.get("transition_duration", 0.3))
@@ -559,7 +650,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             # with format after, growing smoothly with format
             # before). The source size is constant, so format
             # before the scale pins nothing.
-            w_expr = _interp_expr([(f["time"], f["scale"]) for f in kfs], "t")
+            w_expr = _interp_expr_eased([(f["time"], f["scale"], f.get("easing", "linear")) for f in kfs], "t")
             _probe = ov.get("probe") or {}
             _iw, _ih = _probe.get("width"), _probe.get("height")
             if _iw and _ih:
@@ -594,7 +685,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             if ov.get("mask"):
                 factors.append(f"({_mask_factor_expr(ov['mask'])})")
             if op_vary:
-                op_expr = _interp_expr([(f["time"], f["opacity"]) for f in kfs],
+                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
                 factors.append(f"({op_expr})")
             alpha_expr = "lum(X,Y)" + "".join(f"*{f}" for f in factors)
@@ -622,7 +713,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
                 # stream (fps-normalised), so overlay time is
                 # seg_start + N/fps. Verified against FFmpeg: geq's T
                 # does not track segment time, N does.
-                op_expr = _interp_expr([(f["time"], f["opacity"]) for f in kfs],
+                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
                 chain += (f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
                           f"a='255*({op_expr})'")
@@ -633,8 +724,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         if kfs:
             # Smooth position: overlay x/y expressions use main
             # timeline time t (verified: overlay honours t).
-            x_expr = _interp_expr([(ostart + f["time"], f["x"]) for f in kfs], "t")
-            y_expr = _interp_expr([(ostart + f["time"], f["y"]) for f in kfs], "t")
+            x_expr = _interp_expr_eased([(ostart + f["time"], f["x"], f.get("easing", "linear")) for f in kfs], "t")
+            y_expr = _interp_expr_eased([(ostart + f["time"], f["y"], f.get("easing", "linear")) for f in kfs], "t")
         else:
             px, py = OVERLAY_POS[ov.get("position", "bottom_right")]
             x_expr = str(ov["x"]) if "x" in ov else px
@@ -758,17 +849,53 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             f"enable='between(t,{start},{end})'[vout{overlay_index}]")
         vcur = f"vout{overlay_index}"
         overlay_index += 1
+    # Pro pack review aids (preview only, unless the project itself
+    # asks for timecode — see render_project). Guides are drawbox
+    # outlines at the action-safe (5% margin) and title-safe (10%
+    # margin) rectangles; timecode is a running drawtext clock.
+    # They are drawn on top of everything else, so a preview frame
+    # shows exactly where safe areas and the clock sit — and a
+    # final render without them is pixel-identical to before.
+    # Timecode is effective when the caller asks for it OR the
+    # project itself sets timecode: true, so the graph builder
+    # alone honours an explicit project choice.
+    review_timecode = bool(review_timecode or project.get("timecode"))
+    if guides or review_timecode:
+        cur = vcur
+        if guides:
+            filters.append(
+                f"[{cur}]drawbox=x='iw*0.05':y='ih*0.05':w='iw*0.9':"
+                f"h='ih*0.9':color=yellow@0.9:t=2[vguide1]")
+            cur = "vguide1"
+            filters.append(
+                f"[{cur}]drawbox=x='iw*0.1':y='ih*0.1':w='iw*0.8':"
+                f"h='ih*0.8':color=red@0.9:t=2[vguide2]")
+            cur = "vguide2"
+        if review_timecode:
+            tc_font = info.get("font") or find_font()
+            filters.append(
+                f"[{cur}]drawtext=fontfile={tc_font}:"
+                f"text='%{{pts\\:hms}}':fontsize=28:fontcolor=yellow:"
+                f"box=1:boxcolor=black@0.5:boxborderw=8:x=20:y=20[vtc]")
+            cur = "vtc"
+        vcur = cur
     # vcur is the last stage so far: overlay output when overlays exist
     # (and no texts), the last text output when texts exist, or the
     # main chain when neither exists. Resetting to vcur_chain here
     # would silently drop the overlay stage.
     vout = vcur
-    # Audio tracks. When voice and music are both present, music is
-    # ducked with a real sidechain compressor keyed off the voice mix
-    # (FFmpeg sidechaincompress), not a flat volume cut: music drops
-    # while voice is speaking and returns when it stops.
+    # Audio tracks. When voice and music are both present WITHOUT
+    # an explicit ducking object, music is ducked with a real
+    # sidechain compressor keyed off the voice mix (FFmpeg
+    # sidechaincompress), not a flat volume cut: music drops while
+    # voice is speaking and returns when it stops. WITH an
+    # explicit ducking object, the sidechain is replaced by
+    # deterministic volume automation (below): music gain follows
+    # the voice track's time windows, dropping by amount_db with
+    # smooth fades, regardless of the voice audio's level.
     has_voice = any(t.get("kind") == "voice" for t in audio_tracks)
     has_music = any(t.get("kind") == "music" for t in audio_tracks)
+    duck = info.get("ducking")
     mix_inputs = [f"[{acur_chain}]"]
     base = len(clips)
     for j, track in enumerate(audio_tracks):
@@ -781,9 +908,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             fade_parts += f",afade=t=out:st={total - float(track['fade_out'])}:d={float(track['fade_out'])}"
         loudnorm_part = ""
         if track.get("loudnorm"):
-            # Single-pass EBU R128-style normalisation to -16 LUFS
-            # (online-video target, not the -23 broadcast target).
-            loudnorm_part = ",loudnorm=I=-16:TP=-1.5:LRA=11"
+            # Single-pass EBU R128-style normalisation. The target
+            # is -16 LUFS by default, or the project's
+            # output.loudness_target (a delivery preset's target)
+            # when the project sets one.
+            lt = info.get("loudness_target", -16.0)
+            loudnorm_part = f",loudnorm=I={lt}:TP=-1.5:LRA=11"
         dn_part = ",afftdn" if track.get("denoise") else ""
         filters.append(
             f"[{base + j}:a]aresample=48000,"
@@ -791,7 +921,38 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             f"adelay={start_ms}|{start_ms},apad=whole_dur={total},"
             f"atrim=end={total},asetpts=PTS-STARTPTS,"
             f"volume={vol}{fade_parts}{loudnorm_part}{dn_part}[t{j}]")
-    if has_voice and has_music:
+    if duck:
+        # Deterministic ducking: one volume-automation filter per
+        # music track. Gain is 1 outside every voice window, the
+        # ducked factor inside it, ramping linearly over `fade`
+        # seconds before the window (down) and after it (up).
+        # The volume filter evaluates the expression per frame
+        # (eval=frame) on main-timeline time t, so the automation
+        # is sample-accurate to the stated windows.
+        import math as _math
+        g = 10 ** (-float(duck["amount_db"]) / 20.0)
+        fade = float(duck["fade"])
+        factors = []
+        for w in duck["windows"]:
+            s, e = float(w["start"]), float(w["end"])
+            if fade <= 0:
+                factors.append(
+                    f"if(lt(t,{s!r}),1,if(lt(t,{e!r}),{g!r},1))")
+            else:
+                factors.append(
+                    f"if(lt(t,{s - fade!r}),1,"
+                    f"if(lt(t,{s!r}),1-(1-{g!r})*(t-({s - fade!r}))/{fade!r},"
+                    f"if(lt(t,{e!r}),{g!r},"
+                    f"if(lt(t,{e + fade!r}),{g!r}+(1-{g!r})*(t-({e!r}))/{fade!r},1))))")
+        gain_expr = "*".join(factors) if factors else "1"
+        for j, track in enumerate(audio_tracks):
+            if track.get("kind") != "music":
+                mix_inputs.append(f"[t{j}]")
+                continue
+            filters.append(
+                f"[t{j}]volume='{gain_expr}':eval=frame[td{j}]")
+            mix_inputs.append(f"[td{j}]")
+    elif has_voice and has_music:
         voice_labels = [f"[t{j}]" for j, t in enumerate(audio_tracks)
                         if t.get("kind") == "voice"]
         filters.append(
@@ -853,12 +1014,30 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
     filter_complex = ";".join(filters)
     argv += ["-filter_complex", filter_complex,
              "-map", "[vfinal]", "-map", f"[{aout}]",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:v", "libx264", "-preset", "veryfast"]
+    # Pro pack delivery bitrate: a preset (or an explicit
+    # output.video_bitrate) sets a target bitrate instead of the
+    # default constant-quality crf 23. Without it, crf 23 is
+    # unchanged, so every existing project renders as before.
+    if info.get("video_bitrate"):
+        kbps = _bitrate_kbps(info["video_bitrate"])
+        argv += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k",
+                 "-bufsize", f"{2 * kbps}k"]
+    else:
+        argv += ["-crf", "23"]
+    argv += [
              # Force the widely playable pixel format. Without this,
              # image inputs (JPEG yuvj) can leak through xfade as
              # yuvj444p / High 4:4:4, which most phone players refuse.
              "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "128k", "-t", str(total), output_path]
+             "-c:a", "aac", "-b:a", "128k", "-t", str(total)]
+    if metadata_idx is not None:
+        # Chapters (and only chapters: -map_chapters takes the
+        # chapter list from the ffmetadata input; the output's
+        # own title/tags still come from the media inputs).
+        argv += ["-map_metadata", str(metadata_idx),
+                 "-map_chapters", str(metadata_idx)]
+    argv += [output_path]
     return argv, total, text_dir
 
 
@@ -870,13 +1049,19 @@ def _remove_quietly(path):
         pass
 
 
-def render_project(project, output_path, scale_factor=1.0, timeout=600):
+def render_project(project, output_path, scale_factor=1.0, timeout=600,
+                   guides=False, review_timecode=False):
     """Render a project dict. Returns (ok, info_or_error).
 
     Atomic output: ffmpeg writes to a temp file in the output
     directory, and it is moved into place only on success. A failed
     render therefore never leaves a partial file at output_path, and
     never overwrites a previous good output at that path.
+
+    guides draws safe-area boxes (preview only in practice: callers
+    pass False for final renders). Timecode is burned in when
+    review_timecode is True OR the project itself sets
+    timecode: true; otherwise a final render has no timecode.
     """
     errors, info = validate_project(project)
     if errors:
@@ -954,7 +1139,29 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600):
     except OSError as exc:
         return False, {"code": "RENDER_FAILED",
                        "message": f"cannot create output temp file in {out_dir}: {exc}"}
-    argv, total, text_dir = build_ffmpeg_args(project, info, tmp_path, scale_factor)
+    # Pro pack chapters: write the ffmetadata file the render
+    # maps chapters from (deleted in the finally below, like the
+    # text/stab/prescale temp dirs). No chapters means no extra
+    # input and no metadata mapping at all.
+    meta_dir = None
+    metadata_path = None
+    if info.get("chapters"):
+        meta_dir = tempfile.mkdtemp(prefix="agentcut-meta-")
+        metadata_path = os.path.join(meta_dir, "chapters.txt")
+        lines = [";FFMETADATA1"]
+        for ch in info["chapters"]:
+            lines.append("[CHAPTER]")
+            lines.append("TIMEBASE=1/1000")
+            lines.append(f"START={int(round(float(ch['start']) * 1000))}")
+            lines.append(f"END={int(round(float(ch['end']) * 1000))}")
+            lines.append(f"title={_ffmetadata_escape(ch['title'])}")
+        with open(metadata_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    effective_timecode = bool(review_timecode or project.get("timecode"))
+    argv, total, text_dir = build_ffmpeg_args(
+        project, info, tmp_path, scale_factor,
+        metadata_path=metadata_path, guides=guides,
+        review_timecode=effective_timecode)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -967,6 +1174,8 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600):
             shutil.rmtree(prescale_dir, ignore_errors=True)
         if stab_dir:
             shutil.rmtree(stab_dir, ignore_errors=True)
+        if meta_dir:
+            shutil.rmtree(meta_dir, ignore_errors=True)
     if proc.returncode != 0:
         _remove_quietly(tmp_path)
         return False, {"code": "RENDER_FAILED", "message": proc.stderr[-2000:]}
@@ -1023,11 +1232,24 @@ def poster_frame(project, output_path, time=None, timeout=600):
                   "height": probe["height"] if probe else None}
 
 
-def preview_project(project, out_dir, scale_factor=0.5):
-    """Render a proxy and extract frames + a contact sheet."""
+def preview_project(project, out_dir, scale_factor=0.5, guides=True,
+                    timecode=False):
+    """Render a proxy and extract frames + a contact sheet.
+
+    Pro pack review aids: the proxy carries title-safe/action-safe
+    guide boxes by default (guides=True) and, when timecode=True
+    (or the project itself sets timecode), a running timecode
+    burn-in. Both are preview-only in effect: the result flags
+    them, and a final render_project call with default arguments
+    has neither, so previewing can never leak guides or a clock
+    into a delivery. A project that explicitly sets timecode:
+    true DOES get timecode in its final render — that is the
+    user's explicit choice, not a preview leak.
+    """
     os.makedirs(out_dir, exist_ok=True)
     proxy = os.path.join(out_dir, "proxy.mp4")
-    ok, info = render_project(project, proxy, scale_factor=scale_factor)
+    ok, info = render_project(project, proxy, scale_factor=scale_factor,
+                              guides=guides, review_timecode=timecode)
     if not ok:
         return False, info
     _, vinfo = validate_project(project)
@@ -1050,15 +1272,37 @@ def preview_project(project, out_dir, scale_factor=0.5):
         labels = "".join(f"[{i}:v]" for i in range(len(frames)))
         cmd += ["-filter_complex", f"{labels}hstack=inputs={len(frames)}", contact]
         subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    effective_timecode = bool(timecode or project.get("timecode"))
     return True, {"proxy": proxy, "frames": frames,
                   "contact_sheet": contact if os.path.isfile(contact) else None,
-                  "duration": total}
+                  "duration": total,
+                  "guides": bool(guides),
+                  "timecode": effective_timecode,
+                  "safe_areas": ({"action_safe": "5% margin",
+                                  "title_safe": "10% margin"}
+                                 if guides else None)}
 
 
 FORMATS = {
     "vertical": (720, 1280),
     "square": (720, 720),
     "landscape": (1280, 720),
+}
+
+# Pro pack delivery presets. Each maps to a size, fps, video
+# bitrate and loudness target. These are delivery settings for
+# the render, not platform guarantees: a platform may still
+# re-encode on upload. A brief's explicit size (format, or
+# width/height) always wins over a preset's size — see
+# produce_video — and the result records which source won, so a
+# preset can never silently override an explicit request.
+DELIVERY_PRESETS = {
+    "youtube_1080": {"width": 1920, "height": 1080, "fps": 30,
+                     "video_bitrate": "8M", "loudness_target": -14.0},
+    "shorts_720": {"width": 720, "height": 1280, "fps": 30,
+                   "video_bitrate": "5M", "loudness_target": -14.0},
+    "instagram_square": {"width": 1080, "height": 1080, "fps": 30,
+                         "video_bitrate": "5M", "loudness_target": -16.0},
 }
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
 
@@ -1110,6 +1354,114 @@ def _run_detect(path, filter_arg, kind, duration, timeout=60):
 
 
 
+def _run_loudness(path, timeout=60):
+    """Measured loudness via loudnorm print_format=json.
+
+    Returns (dict_or_None, ok). The dict carries input_i (LUFS),
+    input_tp (true peak dBTP as reported by loudnorm), input_lra
+    and input_thresh as floats when parseable. This measures the
+    finished file; it never changes it.
+    """
+    cmd = ["ffmpeg", "-i", path, "-af", "loudnorm=print_format=json",
+           "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None, False
+    text = proc.stderr or ""
+    start = text.find("{", text.find("Parsed_loudnorm"))
+    if start < 0:
+        return None, False
+    end = text.find("}", start)
+    if end < 0:
+        return None, False
+    try:
+        raw = json.loads(text[start:end + 1])
+    except Exception:
+        return None, False
+    out = {}
+    for key in ("input_i", "input_tp", "input_lra", "input_thresh",
+                "output_i", "output_tp", "target_offset"):
+        try:
+            out[key] = float(raw[key])
+        except (KeyError, TypeError, ValueError):
+            out[key] = None
+    return out, True
+
+
+def _run_peak(path, timeout=60):
+    """Maximum sample-peak level in dBFS via astats (overall).
+
+    Returns (peak_or_None, ok). astats reports a sample peak, not
+    a true peak — the QA field is named audio_peak_db and the
+    warning is worded as a near-clipping warning, not a
+    true-peak claim.
+    """
+    cmd = ["ffmpeg", "-i", path, "-af", "astats=metadata=1:reset=0",
+           "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None, False
+    peaks = []
+    for m in re.finditer(r"Peak level dB:\s*(-?[0-9.]+)", proc.stderr or ""):
+        try:
+            peaks.append(float(m.group(1)))
+        except ValueError:
+            pass
+    if not peaks:
+        return None, False
+    return max(peaks), True
+
+
+def _run_freeze(path, timeout=60):
+    """Frozen-frame segments via freezedetect (warnings only).
+
+    Returns (segments, total, ok) in the same shape as _run_detect.
+    Unlike blackdetect, freezedetect reports freeze_start and
+    freeze_end as separate metadata events — and a video that is
+    still frozen at EOF never emits a freeze_end at all. So the
+    parser tracks an open freeze and closes it at the file
+    duration, exactly like the silence parser in _run_detect.
+    """
+    cmd = ["ffmpeg", "-v", "info", "-i", path,
+           "-vf", "freezedetect=noise=-60dB:d=1",
+           "-an", "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return [], 0.0, False
+    text = proc.stderr or ""
+    # File duration for the EOF-close case (from the caller's
+    # perspective the freeze runs to the end of the file).
+    dur_match = None
+    try:
+        import json as _json
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", path], capture_output=True, text=True, timeout=30)
+        dur_match = float(_json.loads(probe.stdout).get("format", {}).get("duration") or 0.0)
+    except Exception:
+        dur_match = 0.0
+    segs = []
+    open_start = None
+    open_end = None
+    for m in re.finditer(r"freeze_(start|end|duration):\s*([0-9.]+)", text):
+        kind, val = m.group(1), float(m.group(2))
+        if kind == "start":
+            open_start, open_end = val, None
+        elif kind == "end":
+            open_end = val
+        elif kind == "duration" and open_start is not None:
+            en = open_end if open_end is not None else open_start + val
+            segs.append({"start": open_start, "end": en, "duration": val})
+            open_start, open_end = None, None
+    if open_start is not None and dur_match:
+        segs.append({"start": open_start, "end": dur_match,
+                     "duration": max(0.0, dur_match - open_start)})
+    return segs, sum(s["duration"] for s in segs), True
+
+
 def _brief_audio(brief):
     """Build the audio list for a brief, including the soundtrack shortcut.
 
@@ -1150,11 +1502,51 @@ def produce_video(brief, output_path, review_dir=None):
     """
     if not isinstance(brief, dict):
         return False, {"code": "INVALID_SCHEMA", "message": "produce brief must be an object"}
-    fmt = brief.get("format", "vertical")
-    if fmt not in FORMATS:
+    # Pro pack: a delivery preset supplies size/fps/bitrate/
+    # loudness, but an explicit size always wins over it. The
+    # precedence is: explicit width/height > explicit format >
+    # delivery preset > default (vertical). fps follows the same
+    # rule (explicit fps > preset fps > 24). The applied preset
+    # and the size source are returned in the result, so the
+    # override is visible, never silent.
+    preset_name = brief.get("delivery_preset")
+    preset = None
+    if preset_name is not None:
+        if not isinstance(preset_name, str) or preset_name not in DELIVERY_PRESETS:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"delivery_preset must be one of {sorted(DELIVERY_PRESETS)}",
+                           "fix": "set delivery_preset to one of: " + ", ".join(sorted(DELIVERY_PRESETS)) + ", or remove it"}
+        preset = DELIVERY_PRESETS[preset_name]
+    fmt = brief.get("format")
+    if fmt is not None and fmt not in FORMATS:
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"format must be one of {sorted(FORMATS)}"}
-    width, height = FORMATS[fmt]
+    explicit_size = None
+    if brief.get("width") is not None or brief.get("height") is not None:
+        ew, eh = brief.get("width"), brief.get("height")
+        if type(ew) is not int or type(eh) is not int or not 16 <= ew <= 3840 or not 16 <= eh <= 3840:
+            return False, {"code": "INVALID_DIMENSION",
+                           "message": "brief width/height must both be integers 16..3840",
+                           "fix": "set both width and height, e.g. width 1080 and height 1080, or remove them"}
+        explicit_size = (ew, eh)
+    if explicit_size is not None:
+        width, height = explicit_size
+        size_source = "explicit width/height"
+    elif fmt is not None:
+        width, height = FORMATS[fmt]
+        size_source = "format"
+    elif preset is not None:
+        width, height = preset["width"], preset["height"]
+        size_source = "delivery_preset"
+    else:
+        width, height = FORMATS["vertical"]
+        size_source = "default"
+    if brief.get("fps") is not None:
+        fps_value = brief["fps"]
+    elif preset is not None:
+        fps_value = preset["fps"]
+    else:
+        fps_value = 24
     # Sections are an alternative to a flat clips list, not an addition:
     # each section contributes its clips in order, and gets an auto
     # title card at its start (see below). A brief with both is an
@@ -1196,7 +1588,8 @@ def produce_video(brief, output_path, review_dir=None):
         if i > 0:
             clip["transition"] = item.get("transition", "crossfade")
         for key in ("ken_burns", "fit", "speed", "brightness", "contrast",
-                    "saturation", "grayscale", "transition_duration"):
+                    "saturation", "grayscale", "transition_duration",
+                    "grade", "lut"):
             if key in item:
                 clip[key] = item[key]
         clips.append(clip)
@@ -1253,17 +1646,41 @@ def produce_video(brief, output_path, review_dir=None):
         end = min(4.0, total - 0.5) if total > 1.5 else total
         texts.append({"text": title, "start": 0.5, "end": end,
                       "size": 64, "x": "center", "y": 100})
+    try:
+        _fps_int = int(fps_value)
+    except (TypeError, ValueError):
+        _fps_int = fps_value  # validation below reports it properly
+    output_block = {"width": width, "height": height,
+                    "fps": _fps_int}
+    if preset is not None or brief.get("video_bitrate") is not None:
+        output_block["video_bitrate"] = (brief.get("video_bitrate")
+                                         if brief.get("video_bitrate") is not None
+                                         else preset["video_bitrate"])
+    if preset is not None or brief.get("loudness_target") is not None:
+        output_block["loudness_target"] = brief.get("loudness_target") if brief.get("loudness_target") is not None else preset["loudness_target"]
     project = {
         "id": brief.get("id", "produced"),
         "title": title or "Produced video",
         "version": 1,
-        "output": {"width": width, "height": height,
-                   "fps": int(brief.get("fps", 24))},
+        "output": output_block,
         "clips": clips,
         "texts": texts,
         "captions": brief.get("captions") or [],
         "audio": brief_audio,
     }
+    # Pro pack brief passthrough: chapters (explicit list, or
+    # section titles when no explicit list), ducking, and
+    # timecode all land on the project, where validation and
+    # rendering already handle them.
+    if brief.get("chapters") is not None:
+        project["chapters"] = brief["chapters"]
+    elif sections is not None and section_info:
+        project["chapters"] = [{"title": s["title"], "start": s["start"]}
+                               for s in section_info]
+    if brief.get("ducking") is not None:
+        project["ducking"] = brief["ducking"]
+    if brief.get("timecode") is not None:
+        project["timecode"] = brief["timecode"]
     if brief.get("overlays"):
         project["overlays"] = brief["overlays"]
     if brief.get("caption_color") is not None:
@@ -1308,6 +1725,22 @@ def produce_video(brief, output_path, review_dir=None):
         warnings.append("silence detection unavailable")
     elif has_audio and actual_duration and sil_total >= actual_duration - 0.5:
         warnings.append("audio is silent throughout; add a music track if you want sound")
+    # Pro pack QA: measured loudness, sample-peak clipping warning
+    # and freeze-frame detection, alongside black/silence. All are
+    # warnings only: QA never changes the render it checked.
+    loudness, loud_ok = _run_loudness(output_path) if has_audio else (None, False)
+    if has_audio and not loud_ok:
+        warnings.append("loudness measurement unavailable")
+    peak_db, peak_ok = _run_peak(output_path) if has_audio else (None, False)
+    if has_audio and not peak_ok:
+        warnings.append("audio peak measurement unavailable")
+    elif peak_db is not None and peak_db > -1.0:
+        warnings.append(f"audio peak {peak_db:.1f} dB is close to clipping (above -1 dB)")
+    freeze_segs, freeze_total, freeze_ok = _run_freeze(output_path)
+    if not freeze_ok:
+        warnings.append("freeze detection unavailable")
+    elif freeze_total > 0:
+        warnings.append(f"frozen frames detected: {freeze_total:.1f}s in {len(freeze_segs)} segment(s)")
     qa = {
         "duration_expected": total, "duration_actual": actual_duration,
         "width_expected": width, "height_expected": height,
@@ -1315,6 +1748,11 @@ def produce_video(brief, output_path, review_dir=None):
         "pix_fmt": actual_pix, "has_audio": has_audio,
         "black_segments": black_segs, "black_duration": black_total,
         "silence_segments": sil_segs, "silence_duration": sil_total,
+        "loudness": loudness,
+        "loudness_target": (output_block.get("loudness_target")
+                            if preset is not None or brief.get("loudness_target") is not None else None),
+        "audio_peak_db": peak_db,
+        "freeze_segments": freeze_segs, "freeze_duration": freeze_total,
         "warnings": warnings,
     }
     # Overlay feedback (integration item e): placement and
@@ -1367,39 +1805,79 @@ def produce_video(brief, output_path, review_dir=None):
         "overlays": overlay_summary,
         "conformance": conformance,
         "sections": section_info,
+        "chapters": info.get("chapters", []),
+        "delivery_preset": preset_name,
+        "delivery_preset_applied": ({"name": preset_name,
+                                     "size_source": size_source,
+                                     "width": width, "height": height,
+                                     "fps": project["output"]["fps"],
+                                     "video_bitrate": output_block.get("video_bitrate"),
+                                     "loudness_target": output_block.get("loudness_target")}
+                                    if preset is not None else None),
         "project": project,
     }
 
 
 def produce_variants(brief, output_dir):
-    """Render one brief as vertical, square and landscape in one call.
+    """Render one brief in several shapes in one call.
 
-    Each variant is a full produce_video run (validate, render,
-    review frames, QA) with the same clips, title, texts and audio,
-    only the format preset changed. Outputs are
-    <output_dir>/<brief-id>-<format>.mp4. Returns (ok, info) where
-    info["variants"] maps format -> produce info (project stripped).
-    On a variant failure the call stops and reports that format;
-    variants already produced stay on disk (each is atomic).
+    Without delivery fields, the classic behaviour: vertical,
+    square and landscape renders of the same brief, each a full
+    produce_video run (validate, render, review frames, QA).
+    Outputs are <output_dir>/<brief-id>-<format>.mp4.
+
+    Pro pack: a brief may instead name delivery presets —
+    delivery_presets: ["youtube_1080", "shorts_720",
+    "instagram_square"] (or a single delivery_preset, which
+    renders just that preset). Each preset is a full
+    produce_video run with that preset, and the variant key is
+    the preset name. An explicit format/width/height in the
+    brief still wins over a preset's size inside each variant
+    (see produce_video), and the variant result records it.
+    Returns (ok, info) where info["variants"] maps format or
+    preset name -> produce info (project stripped). On a variant
+    failure the call stops and reports that variant; variants
+    already produced stay on disk (each is atomic).
     """
     import copy
     if not isinstance(brief, dict):
         return False, {"code": "INVALID_SCHEMA", "message": "produce brief must be an object"}
     os.makedirs(output_dir, exist_ok=True)
     base_id = brief.get("id", "produced")
+    if brief.get("delivery_presets") is not None:
+        preset_list = brief["delivery_presets"]
+        if not isinstance(preset_list, list) or not preset_list:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": "delivery_presets must be a non-empty list of preset names",
+                           "fix": "set delivery_presets to e.g. ['youtube_1080', 'shorts_720'], or remove it"}
+        bad = [p for p in preset_list if p not in DELIVERY_PRESETS]
+        if bad:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"unknown delivery preset(s): {', '.join(bad)}; known: {', '.join(sorted(DELIVERY_PRESETS))}",
+                           "fix": "use delivery presets from: " + ", ".join(sorted(DELIVERY_PRESETS))}
+        jobs = [(name, name) for name in preset_list]
+    elif brief.get("delivery_preset") is not None:
+        jobs = [(brief["delivery_preset"], brief["delivery_preset"])]
+    else:
+        jobs = [(fmt, fmt) for fmt in ("vertical", "square", "landscape")]
     variants = {}
-    for fmt in ("vertical", "square", "landscape"):
+    for key, _preset_marker in jobs:
         variant = copy.deepcopy(brief)
-        variant["format"] = fmt
-        out = os.path.join(output_dir, f"{base_id}-{fmt}.mp4")
+        variant.pop("delivery_presets", None)
+        if key in DELIVERY_PRESETS:
+            variant["delivery_preset"] = key
+        else:
+            variant["format"] = key
+            variant.pop("delivery_preset", None)
+        out = os.path.join(output_dir, f"{base_id}-{key}.mp4")
         ok, info = produce_video(variant, out)
         if not ok:
             return False, {"code": info.get("code", "RENDER_FAILED"),
                            "message": info.get("message") or info,
-                           "format": fmt, "variants": variants}
+                           "format": key, "variants": variants}
         info = dict(info)
         info.pop("project", None)
-        variants[fmt] = info
+        variants[key] = info
     return True, {"output_dir": output_dir, "variants": variants}
 
 
@@ -1450,7 +1928,9 @@ def timeline_summary(project):
                   "width": info["width"], "height": info["height"],
                   "fps": info["fps"], "segments": segments,
                   "texts": texts, "captions": captions,
-                  "audio": audio, "overlays": overlays}
+                  "audio": audio, "overlays": overlays,
+                  "chapters": info.get("chapters", []),
+                  "ducking": info.get("ducking")}
 
 
 def check_brief_conformance(brief, project, actual_duration=None):

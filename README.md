@@ -77,7 +77,9 @@ Rules, enforced by validation before any render:
   in seconds (default 0; a track starting at or after the timeline
   end is a validation error). When voice and music are both present, music is ducked
   with a real sidechain compressor keyed off the voice mix
-  (threshold 0.02, ratio 8, attack 200ms, release 1000ms).
+  (threshold 0.02, ratio 8, attack 200ms, release 1000ms) — unless
+  the project sets an explicit `ducking` object, which replaces
+  the sidechain with deterministic volume automation (see Pro pack).
 - Image clips may set `"ken_burns"` to `zoom_in`, `zoom_out`,
   `pan_left` or `pan_right` (default `none`). It is image-only;
   on a video clip, or with an unknown value, validation fails
@@ -340,6 +342,61 @@ proportion to word length: only the first word is visible early,
 the full text is visible by the window end. Reveal is word-only
 by design — Arabic letters join, so per-character reveal would
 break joining. Reveal cannot combine with `animation` on one text.
+
+## Pro pack (1.32.0): easing, grading, ducking, chapters, delivery, review aids
+
+- Easing keyframes: an overlay keyframe may set `easing` to
+  `linear` (default), `ease_in`, `ease_out` or `ease_in_out`.
+  It shapes scale, position and opacity interpolation between
+  keyframes (FFmpeg time expressions on normalised segment
+  time). Set it on either keyframe of a segment; if both set
+  a non-linear easing, the later keyframe wins. Example:
+  `{"time": 0, "x": 0, "easing": "ease_in"}, {"time": 4, "x": 200, "easing": "ease_in"}`.
+  Unknown values fail validation with a fix hint.
+- Colour grading: a clip may set `grade` to `cinematic`,
+  `teal_orange`, `warm`, `cool` or `noir`. These are plain
+  eq/colorbalance/saturation combinations (see CHANGELOG for
+  each definition) — they are not film stocks and do not
+  emulate any film process. A clip may also set `lut` to a
+  local `.cube` file, rendered via FFmpeg lut3d; the file
+  must exist and end in `.cube`. Grade and LUT may combine.
+- Deterministic ducking: a project may set `ducking`, e.g.
+  `{"voice_track": 1, "amount_db": 12, "fade": 0.25}` where
+  `voice_track` is the index of the voice track in `audio`
+  (or that track's src), `amount_db` is how far music drops
+  (0..30 dB) and `fade` is the ramp time in seconds (0..2).
+  Optional explicit `windows` (`[{start, end}]`) override
+  the derived window (voice start + probed voice duration).
+  This is volume automation from time windows, not sidechain
+  compression and not level detection. Without `ducking`,
+  voice+music still uses the sidechain compressor as before.
+  See `examples/ducking.json` and `examples/brief-ducking.json`.
+- Producer QA now also reports measured loudness (LUFS via
+  loudnorm), sample-peak level (astats; warned above -1 dB)
+  and freeze-frame segments (freezedetect) — warnings only,
+  never changes to the render.
+- Chapters: a project `chapters` list, e.g.
+  `[{"title": "Intro", "start": 0}, {"title": "End", "start": 4}]`,
+  is written into the output file's metadata and can be
+  verified with `ffprobe -show_chapters`. Produce briefs
+  accept `chapters`, and section briefs get chapters from
+  section titles when no explicit list is given.
+- Delivery presets: `youtube_1080`, `shorts_720` and
+  `instagram_square` (size, fps, video bitrate and loudness
+  target each — see CHANGELOG). Use `delivery_preset` in a
+  produce brief, or `delivery_presets` (a list) in a
+  produce-variants brief. Resolution rule, enforced and
+  reported in `delivery_preset_applied`: an explicit
+  width/height or format in the brief always wins over a
+  preset's size; a preset never silently overrides an
+  explicit request. Presets are delivery settings, not
+  platform guarantees — platforms may re-encode on upload.
+- Review aids: preview proxies draw title-safe (10% margin)
+  and action-safe (5% margin) guide boxes by default, and
+  may burn in a running timecode on request; the preview
+  result flags both. Final renders have no guides and no
+  timecode unless the project explicitly sets
+  `timecode: true`.
 
 ## Arabic text
 

@@ -1672,6 +1672,339 @@ class TestAgentCut(unittest.TestCase):
         self.assertAlmostEqual(info["duration"], 5.0, delta=0.2)
         self.assertTrue(info["has_video"])
 
+    # ---- Pro pack 1.32.0 ----
+
+    def _solid(self, name, color, size=160):
+        path = os.path.join(BASE, "data", name)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", f"color=c={color}:s={size}x{size}:d=2",
+                        "-frames:v", "1", path], check=True)
+        return path
+
+    def _volumedetect(self, path, start, end):
+        out = subprocess.run(
+            ["ffmpeg", "-i", path, "-af",
+             f"atrim=start={start}:end={end},volumedetect",
+             "-vn", "-sn", "-f", "null", "-"],
+            capture_output=True, text=True)
+        import re as _re
+        m = _re.search(r"mean_volume:\s*(-?[0-9.]+)", out.stderr)
+        self.assertIsNotNone(m, out.stderr[-500:])
+        return float(m.group(1))
+
+    def test_easing_keyframes_nonlinear(self):
+        # A red overlay moves x 0 -> 200 over 0..4s. At t=1 (u=0.25):
+        # linear is at 50, ease_in at 12.5, ease_out at 87.5. Crops
+        # separate all three: at x=30..40, only ease_in (12..102)
+        # covers; at x=60..70, linear (50..140) and ease_in cover
+        # but ease_out (87..177) does not; at t=3, x=160..170 is
+        # covered by ease_in (112..202) and linear (150..240) but
+        # not ease_out (187..277).
+        red = os.path.join(BASE, "data", "test_red.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=200x200", "-frames:v", "1", red],
+                       check=True)
+        black = os.path.join(BASE, "data", "test_black_bg.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640:d=5",
+                        "-frames:v", "1", black], check=True)
+        # A black still background, so every non-red crop is
+        # guaranteed black regardless of any video content.
+        clips = [{"id": "a", "kind": "image", "src": black, "duration": 5}]
+
+        def render(easing, name):
+            project = {"id": name, "version": 1,
+                       "output": {"width": 360, "height": 640, "fps": 24},
+                       "clips": clips,
+                       "overlays": [{"id": "p", "kind": "image", "src": red,
+                                     "start": 0, "duration": 4, "size": 0.25,
+                                     "keyframes": [{"time": 0, "x": 0, "y": 0, "easing": easing},
+                                                   {"time": 4, "x": 200, "y": 0, "easing": easing}]}]}
+            errors, _ = validate_project(project)
+            self.assertEqual(errors, [])
+            out = os.path.join(BASE, "data", name + ".mp4")
+            ok, info = render_project(project, out)
+            self.assertTrue(ok, info)
+            return out
+
+        lin = render("linear", "test_ease_lin")
+        ein = render("ease_in", "test_ease_in")
+        eout = render("ease_out", "test_ease_out")
+        self.assertLess(_crop_mean(lin, 1.0, 30, 10, 10, 10)[0], 80)
+        self.assertGreater(_crop_mean(ein, 1.0, 30, 10, 10, 10)[0], 200)
+        self.assertLess(_crop_mean(eout, 1.0, 30, 10, 10, 10)[0], 80)
+        self.assertGreater(_crop_mean(lin, 1.0, 60, 10, 10, 10)[0], 200)
+        self.assertGreater(_crop_mean(ein, 1.0, 60, 10, 10, 10)[0], 200)
+        self.assertLess(_crop_mean(eout, 1.0, 60, 10, 10, 10)[0], 80)
+        self.assertGreater(_crop_mean(ein, 3.0, 160, 10, 10, 10)[0], 200)
+        self.assertLess(_crop_mean(eout, 3.0, 160, 10, 10, 10)[0], 80)
+        # Unknown easing is a validation error with a fix hint.
+        bad = {"id": "bad-ease", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 24},
+               "clips": clips,
+               "overlays": [{"id": "p", "kind": "image", "src": red,
+                             "start": 0, "duration": 2,
+                             "keyframes": [{"time": 0, "x": 0},
+                                           {"time": 2, "x": 100, "easing": "bounce"}]}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+        self.assertTrue(all("fix" in e for e in errors))
+
+    def test_colour_grading_and_lut(self):
+        blue = self._solid("test_blue_solid.png", "blue")
+        # Dark COLOURED solid, not gray: FFmpeg colorbalance keeps
+        # neutral gray neutral even under extreme shadow settings
+        # (verified), so a gray probe cannot show a shadow tint.
+        dark = self._solid("test_slate_dark.png", "0x28323C")
+        bright = self._solid("test_gray192.png", "0xC0C0C0")
+
+        def render(clip_extra, name, src=blue):
+            project = {"id": name, "version": 1,
+                       "output": {"width": 160, "height": 160, "fps": 12},
+                       "clips": [{"id": "a", "kind": "image", "src": src,
+                                  "duration": 2, **clip_extra}]}
+            errors, _ = validate_project(project)
+            self.assertEqual(errors, [])
+            out = os.path.join(BASE, "data", name + ".mp4")
+            ok, info = render_project(project, out)
+            self.assertTrue(ok, info)
+            return out
+
+        def mean(path):
+            return _crop_mean(path, 1.0, 40, 40, 80, 80)
+
+        plain = mean(render({}, "test_grade_plain"))
+        noir = mean(render({"grade": "noir"}, "test_grade_noir"))
+        # Noir removes colour: channels (nearly) equal, unlike blue.
+        self.assertLess(max(noir) - min(noir), 10)
+        self.assertGreater(abs(plain[0] - plain[2]), 100)
+        # Teal shadows: on a dark slate solid, the green-red and
+        # blue-red gaps widen markedly (in: G-R 9, B-R 20).
+        teal_dark = mean(render({"grade": "teal_orange"}, "test_grade_teal_dark", src=dark))
+        self.assertGreater(teal_dark[1] - teal_dark[0], 20)
+        self.assertGreater(teal_dark[2] - teal_dark[0], 30)
+        # Orange highlights: on bright gray, red rises above blue.
+        teal_bright = mean(render({"grade": "teal_orange"}, "test_grade_teal_bright", src=bright))
+        self.assertGreater(teal_bright[0], teal_bright[2] + 5)
+        # Warm: bright gray gains red over blue.
+        warm = mean(render({"grade": "warm"}, "test_grade_warm", src=bright))
+        self.assertGreater(warm[0], warm[2] + 5)
+        # LUT: a red-boost .cube turns blue into magenta (R jumps).
+        lut_path = os.path.join(BASE, "data", "test_redboost.cube")
+        with open(lut_path, "w") as fh:
+            fh.write('TITLE "redboost"\nLUT_3D_SIZE 2\n'
+                     "1 0 0\n1 0 0\n1 1 0\n1 1 0\n"
+                     "1 0 1\n1 0 1\n1 1 1\n1 1 1\n")
+        lut_out = mean(render({"lut": lut_path}, "test_grade_lut"))
+        self.assertGreater(lut_out[0], plain[0] + 100)
+        # LUT validation: missing file and wrong extension, with fix.
+        for bad_lut in ("data/does-not-exist.cube", "data/test_media/clip1.mp4"):
+            bad = {"id": "bad-lut", "version": 1,
+                   "output": {"width": 160, "height": 160, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image", "src": blue,
+                              "duration": 2, "lut": bad_lut}]}
+            errors, _ = validate_project(bad)
+            self.assertTrue(errors)
+            self.assertTrue(all("fix" in e for e in errors))
+
+    def test_deterministic_ducking(self):
+        music = os.path.join(BASE, "data", "test_music.wav")
+        voice = os.path.join(BASE, "data", "test_voice.wav")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=1000:duration=8", music], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=300:duration=4", voice], check=True)
+        blue = self._solid("test_blue_solid.png", "blue")
+        # Voice volume 0: the mix is ducked music alone, so
+        # volumedetect measures the automation directly. Voice
+        # window is derived: start 2.0 + 4s source = 2..6.
+        project = {"id": "duck-test", "version": 1,
+                   "output": {"width": 160, "height": 160, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image", "src": blue, "duration": 8}],
+                   "audio": [{"src": music, "kind": "music", "volume": 1.0},
+                             {"src": voice, "kind": "voice", "volume": 0.0, "start": 2.0}],
+                   "ducking": {"voice_track": 1, "amount_db": 12, "fade": 0.25}}
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [])
+        self.assertEqual(info["ducking"]["windows"], [{"start": 2.0, "end": 6.0}])
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        argv, _, _td = build_ffmpeg_args(project, info, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        graph = " ".join(argv)
+        self.assertIn("eval=frame", graph)
+        self.assertNotIn("sidechaincompress", graph)
+        out = os.path.join(BASE, "data", "test_ducking.mp4")
+        ok, rinfo = render_project(project, out)
+        self.assertTrue(ok, rinfo)
+        only = self._volumedetect(out, 0.5, 1.5)
+        ducked = self._volumedetect(out, 3.0, 5.0)
+        after = self._volumedetect(out, 6.5, 7.5)
+        self.assertAlmostEqual(only - ducked, 12.0, delta=2.0)
+        self.assertAlmostEqual(only - after, 0.0, delta=2.0)
+        # Explicit windows: duck 1..3 only, whatever the voice does.
+        project2 = {"id": "duck-test2", "version": 1,
+                    "output": {"width": 160, "height": 160, "fps": 12},
+                    "clips": [{"id": "a", "kind": "image", "src": blue, "duration": 8}],
+                    "audio": [{"src": music, "kind": "music", "volume": 1.0},
+                              {"src": voice, "kind": "voice", "volume": 0.0, "start": 0.0}],
+                    "ducking": {"voice_track": 1, "amount_db": 12, "fade": 0.25,
+                                "windows": [{"start": 1, "end": 3}]}}
+        errors, _ = validate_project(project2)
+        self.assertEqual(errors, [])
+        out2 = os.path.join(BASE, "data", "test_ducking2.mp4")
+        ok, rinfo = render_project(project2, out2)
+        self.assertTrue(ok, rinfo)
+        self.assertAlmostEqual(
+            self._volumedetect(out2, 4.0, 6.0) - self._volumedetect(out2, 1.5, 2.5),
+            12.0, delta=2.0)
+
+    def test_chapters_and_delivery_presets(self):
+        from agentcut.render import produce_video, produce_variants
+        blue = self._solid("test_blue_solid.png", "blue")
+        project = {"id": "ch-test", "version": 1,
+                   "output": {"width": 160, "height": 160, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image", "src": blue, "duration": 6}],
+                   "chapters": [{"title": "Intro", "start": 0},
+                                {"title": "End", "start": 4}]}
+        errors, _ = validate_project(project)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_chapters.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        # The shared ffprobe() helper shows format/streams only;
+        # chapters need their own ffprobe call.
+        probe = json.loads(subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_chapters", out], capture_output=True, text=True).stdout)
+        chapters = probe.get("chapters", [])
+        self.assertEqual([c["tags"]["title"] for c in chapters], ["Intro", "End"])
+        self.assertEqual([float(c["start_time"]) for c in chapters], [0.0, 4.0])
+        # Delivery presets via produce_variants, with sizes probed.
+        # No explicit format here on purpose: an explicit format
+        # wins over a preset (tested below), so a format in this
+        # brief would make every variant square.
+        brief = {"id": "preset-test",
+                 "clips": [{"src": "data/test_media/poster.png", "duration": 2}],
+                 "soundtrack": "data/test_media/clip1.mp4"}
+        out_dir = os.path.join(BASE, "data", "test_preset_variants")
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)
+        ok, info = produce_variants(
+            {**brief, "delivery_presets": ["shorts_720", "instagram_square"]}, out_dir)
+        self.assertTrue(ok, info)
+        self.assertEqual((info["variants"]["shorts_720"]["width"],
+                          info["variants"]["shorts_720"]["height"]), (720, 1280))
+        self.assertEqual((info["variants"]["instagram_square"]["width"],
+                          info["variants"]["instagram_square"]["height"]), (1080, 1080))
+        # Explicit format wins over a preset's size, and the result
+        # says so instead of silently applying the preset.
+        ok, info = produce_video(
+            {**brief, "delivery_preset": "youtube_1080", "format": "square"},
+            os.path.join(BASE, "data", "test_preset_override.mp4"))
+        self.assertTrue(ok, info)
+        self.assertEqual((info["width"], info["height"]), (720, 720))
+        self.assertEqual(info["delivery_preset_applied"]["size_source"], "format")
+        # Preset alone gives its own size, fps and bitrate target.
+        ok, info = produce_video(
+            {**brief, "delivery_preset": "youtube_1080"},
+            os.path.join(BASE, "data", "test_preset_yt.mp4"))
+        self.assertTrue(ok, info)
+        self.assertEqual((info["width"], info["height"]), (1920, 1080))
+        self.assertEqual(info["fps"], 30)
+        self.assertEqual(info["delivery_preset_applied"]["video_bitrate"], "8M")
+        # Unknown preset is a structured error, not a silent default.
+        ok, info = produce_video(
+            {**brief, "delivery_preset": "nope_123"},
+            os.path.join(BASE, "data", "test_preset_bad.mp4"))
+        self.assertFalse(ok)
+        self.assertIn("delivery_preset", str(info))
+        # Sections become chapters in produce results and in the file.
+        brief2 = {"id": "sec-ch-test", "format": "square",
+                  "sections": [{"title": "Intro", "clips": [{"src": "data/test_media/poster.png", "duration": 2}]},
+                               {"title": "Finale", "clips": [{"src": "data/test_media/pattern.png", "duration": 2}]}]}
+        ok, info = produce_video(brief2, os.path.join(BASE, "data", "test_sec_chapters.mp4"))
+        self.assertTrue(ok, info)
+        self.assertEqual([c["title"] for c in info["chapters"]], ["Intro", "Finale"])
+        probe = json.loads(subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_chapters", info["output"]], capture_output=True, text=True).stdout)
+        self.assertEqual([c["tags"]["title"] for c in probe.get("chapters", [])],
+                         ["Intro", "Finale"])
+
+    def test_producer_qa_loudness_peak_freeze(self):
+        from agentcut.render import produce_video
+        # Still image + music: video frozen throughout, audio loud.
+        brief = {"id": "qa-pro", "format": "square",
+                 "clips": [{"src": "data/test_media/poster.png", "duration": 4}],
+                 "soundtrack": "data/test_media/clip1.mp4"}
+        out = os.path.join(BASE, "data", "test_qa_pro.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        qa = info["qa"]
+        self.assertIn("loudness", qa)
+        self.assertIsInstance(qa["loudness"], dict)
+        self.assertIsInstance(qa["loudness"]["input_i"], float)
+        self.assertIsInstance(qa["audio_peak_db"], float)
+        self.assertLess(qa["audio_peak_db"], 0.0)
+        self.assertIsInstance(qa["freeze_segments"], list)
+        self.assertGreaterEqual(qa["freeze_duration"], 3.0)
+        self.assertTrue(any("frozen" in w for w in qa["warnings"]))
+        # Black/silence QA still present alongside the new fields.
+        self.assertIn("black_segments", qa)
+        self.assertIn("silence_segments", qa)
+
+    def test_review_aids_preview_only(self):
+        from agentcut.render import build_ffmpeg_args, preview_project
+        blue = self._solid("test_blue_solid.png", "blue")
+        project = {"id": "review-test", "version": 1,
+                   "output": {"width": 160, "height": 160, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image", "src": blue, "duration": 4}]}
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [])
+        import shutil as _shutil
+        argv, _, _td = build_ffmpeg_args(project, info, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        self.assertNotIn("drawbox", " ".join(argv))
+        self.assertNotIn("drawtext", " ".join(argv))
+        argv, _, _td = build_ffmpeg_args(project, info, "/tmp/x.mp4",
+                                         guides=True, review_timecode=True)
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        graph = " ".join(argv)
+        self.assertIn("drawbox", graph)
+        self.assertIn("drawtext", graph)
+        # Final render of the same project: no guides, no timecode.
+        out = os.path.join(BASE, "data", "test_review_final.mp4")
+        ok, rinfo = render_project(project, out)
+        self.assertTrue(ok, rinfo)
+        # Preview: guides + timecode flagged, and the guide box is
+        # visible in the proxy frame where the final frame is blue.
+        out_dir = os.path.join(BASE, "data", "test_review_preview")
+        ok, prev = preview_project(project, out_dir, guides=True, timecode=True)
+        self.assertTrue(ok, prev)
+        self.assertTrue(prev["guides"])
+        self.assertTrue(prev["timecode"])
+        self.assertEqual(prev["safe_areas"]["action_safe"], "5% margin")
+        _w, _h, px_prev = _frame_png(prev["proxy"], 1.0,
+                                     os.path.join(BASE, "data", "test_review_prev.png"))
+        _w2, _h2, px_fin = _frame_png(out, 1.0,
+                                      os.path.join(BASE, "data", "test_review_fin.png"))
+        # Proxy is half scale (80x80): action-safe border at x=4.
+        self.assertGreater(px_prev(4, 40)[0], 200)  # yellow box
+        self.assertLess(px_fin(8, 80)[0], 80)       # plain blue
+        # Explicit project timecode DOES reach a final render.
+        project_tc = dict(project)
+        project_tc["timecode"] = True
+        errors, info_tc = validate_project(project_tc)
+        self.assertEqual(errors, [])
+        argv, _, _td = build_ffmpeg_args(project_tc, info_tc, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        self.assertIn("drawtext", " ".join(argv))
+
 
 if __name__ == "__main__":
     unittest.main()

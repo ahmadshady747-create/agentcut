@@ -1,0 +1,1 @@
+{"audio":[{"kind":"music","src":"data/test_media/clip1.mp4","volume":0.8},{"kind":"voice","src":"data/test_media/clip2.mp4","start":2.0,"volume":1.0}],"clips":[{"duration":4,"src":"data/test_media/poster.png"},{"duration":4,"src":"data/test_media/pattern.png"}],"ducking":{"amount_db":12,"fade":0.25,"voice_track":1},"format":"square","id":"brief-ducking","title":"Ducked montage"}

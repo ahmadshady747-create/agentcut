@@ -1,0 +1,12 @@
+# Warm LUT for the AgentCut grading example: a gentle red lift and
+# blue pull-back. LUT_3D_SIZE 2, red fastest, then green, then blue.
+TITLE "AgentCut warm example"
+LUT_3D_SIZE 2
+0.05 0.00 0.00
+1.00 0.00 0.00
+0.05 1.00 0.00
+1.00 1.00 0.00
+0.05 0.00 0.90
+1.00 0.00 0.90
+0.05 1.00 0.90
+1.00 1.00 0.90

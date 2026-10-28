@@ -53,7 +53,9 @@ failure is a JSON object with `code` and `message`.
   `start` in seconds (default 0, must be before the timeline end),
   `fade_in`/`fade_out`, `loudnorm` (true/false, single-pass -16 LUFS).
   When voice and music are both present, music is ducked with a real
-  sidechain compressor keyed off the voice mix.
+  sidechain compressor keyed off the voice mix — unless the
+  project sets an explicit `ducking` object (see Pro pack), which
+  replaces the sidechain with deterministic volume automation.
 - Clips accept `brightness` (-1..1), `contrast` (0..2), `saturation`
   (0..3), `grayscale` (true/false). Renders are atomic: a failed
   render never leaves a partial file or overwrites a previous good
@@ -215,6 +217,42 @@ agent, supply the intelligence. Work in this loop:
 Never ask AgentCut to generate, transcribe or synthesise:
 supply SRT captions, audio and media as local files, and let
 AgentCut edit and verify them.
+
+## Pro pack (1.32.0)
+
+- Easing: overlay keyframes accept `easing` (`linear` default,
+  `ease_in`, `ease_out`, `ease_in_out`) for scale, position and
+  opacity. Set it on either keyframe of a segment; the later
+  keyframe wins if both set a non-linear easing. Unknown
+  values fail validation with a fix hint.
+- Grading: clips accept `grade` (`cinematic`, `teal_orange`,
+  `warm`, `cool`, `noir` — documented filter combinations,
+  not film stocks) and/or `lut` (a local `.cube` file that
+  must exist). Copy `examples/grading.json` to start.
+- Ducking: a project `ducking` object
+  (`voice_track` index or src, `amount_db`, `fade`, optional
+  `windows`) replaces the sidechain compressor with
+  deterministic volume automation from the voice track's time
+  windows. It is not sidechain compression and not level
+  detection. Copy `examples/ducking.json` to start.
+- Chapters: project `chapters` (`{title, start}`) are written
+  into the output metadata; verify with
+  `ffprobe -show_chapters`. Produce briefs accept `chapters`;
+  section briefs get chapters from section titles.
+- Delivery presets: `youtube_1080`, `shorts_720`,
+  `instagram_square` via `delivery_preset` (produce) or
+  `delivery_presets` (produce-variants). Explicit
+  width/height or format in the brief always wins over a
+  preset's size; check `delivery_preset_applied` in the
+  result for what was actually applied. Presets are delivery
+  settings, not platform guarantees.
+- Review aids: previews draw title-safe/action-safe guides by
+  default and can burn in timecode; the preview result flags
+  both. Final renders have neither unless the project sets
+  `timecode: true` explicitly.
+- Producer QA now also reports `loudness` (LUFS), `audio_peak_db`
+  (sample peak; warned above -1 dB) and `freeze_segments` /
+  `freeze_duration`. All QA entries are warnings only.
 
 ## Templates, word reveal, Arabic text
 

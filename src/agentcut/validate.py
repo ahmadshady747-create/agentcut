@@ -59,6 +59,33 @@ XFADE_TRANSITIONS = {
 
 TEXT_COLORS = {"white", "black", "yellow", "red", "green", "blue", "cyan",
                "magenta", "orange", "purple"}
+
+# Keyframe easing values (pro pack). "linear" is the default and the
+# old behaviour; the others reshape the normalised segment time
+# before interpolation (see _interp_expr_eased in render.py).
+EASING_VALUES = {"linear", "ease_in", "ease_out", "ease_in_out"}
+
+# Colour-grade presets (pro pack). These are honest, documented
+# filter combinations — eq/colorbalance/saturation settings, NOT
+# film-stock emulation. Each value is the FFmpeg filter chain
+# appended after a clip's other colour filters.
+GRADE_PRESETS = {
+    # Slightly lifted contrast, pulled-back saturation, a touch of
+    # blue in the shadows and warmth in the highlights.
+    "cinematic": ("eq=contrast=1.10:brightness=-0.03:saturation=0.85,"
+                  "colorbalance=rs=-0.05:bs=0.10:rh=0.05:bh=-0.05"),
+    # Shadows pushed toward teal (green+blue up, red down),
+    # highlights pushed toward orange (red up, blue down).
+    "teal_orange": ("colorbalance=rs=-0.20:gs=0.20:bs=0.20:"
+                    "rh=0.30:gh=0.05:bh=-0.30,eq=saturation=1.10"),
+    # Warm highlights, slightly brighter and more saturated.
+    "warm": ("colorbalance=rh=0.20:gh=0.05:bh=-0.20,"
+             "eq=brightness=0.02:saturation=1.10"),
+    # Cool highlights (blue up, red down), slightly more saturated.
+    "cool": ("colorbalance=rh=-0.20:bh=0.20,eq=saturation=1.05"),
+    # No colour at all, with raised contrast: black-and-white.
+    "noir": "eq=saturation=0:contrast=1.15:brightness=-0.02",
+}
 TEXT_POSITIONS = {"top_left", "top_center", "top_right", "center",
                   "bottom_left", "bottom_center", "bottom_right"}
 
@@ -559,6 +586,32 @@ def validate_project(project):
         if resolved:
             resolved[-1].update(_validate_chroma_mask(clip, errors, cid, "clips"))
         _validate_effects(clip, errors, cid, "clips")
+        # Pro pack: per-clip colour grade preset and/or .cube LUT.
+        # A grade is a named filter combination (see GRADE_PRESETS),
+        # never a claim of film emulation. A LUT must be a local
+        # .cube file that exists; it renders via FFmpeg lut3d.
+        if "grade" in clip:
+            if not isinstance(clip["grade"], str) or clip["grade"] not in GRADE_PRESETS:
+                errors.append(err("INVALID_SCHEMA", "clip grade must be one of: " + ", ".join(sorted(GRADE_PRESETS)), field="clips.grade", clip_id=cid,
+                                  fix="set grade to one of: " + ", ".join(sorted(GRADE_PRESETS)) + ", or remove it"))
+        if "lut" in clip:
+            lut = clip["lut"]
+            if not isinstance(lut, str) or not lut:
+                errors.append(err("INVALID_SCHEMA", "clip lut must be a local .cube file path", field="clips.lut", clip_id=cid,
+                                  fix="set lut to a local .cube file path, e.g. examples/test-lut.cube"))
+            elif "'" in lut:
+                errors.append(err("INVALID_SCHEMA", "clip lut path must not contain a quote character", field="clips.lut", clip_id=cid,
+                                  fix="rename or copy the LUT to a path without quotes"))
+            elif not lut.lower().endswith(".cube"):
+                errors.append(err("INVALID_SCHEMA", "clip lut must end in .cube", field="clips.lut", clip_id=cid,
+                                  fix="use a .cube LUT file (FFmpeg lut3d format), or remove lut"))
+            else:
+                resolved_lut = resolve_path(lut)
+                if not os.path.isfile(resolved_lut):
+                    errors.append(err("FILE_NOT_FOUND", f"LUT file not found: {resolved_lut}", field="clips.lut", clip_id=cid,
+                                      fix="fix the lut path, or copy the .cube file to that path"))
+                elif resolved:
+                    resolved[-1]["lut_resolved"] = resolved_lut
         if "stabilize" in clip and not isinstance(clip["stabilize"], bool):
             errors.append(err("INVALID_SCHEMA", "clip stabilize must be true or false", field="clips.stabilize", clip_id=cid,
                               fix="set stabilize to true for two-pass vidstab stabilisation, or remove it"))
@@ -860,7 +913,19 @@ def validate_project(project):
                                           fix="add x, y, scale or opacity to the keyframe"))
                         bad_kf = True
                         break
-                    raw_kfs.append((kt, vals))
+                    # Pro pack: easing reshapes the segment's time
+                    # curve. It is stored alongside the values so
+                    # the render can apply it to scale, position
+                    # and opacity alike. An unknown value is a
+                    # validation error with a fix, never a silent
+                    # fall back to linear.
+                    ev = kf.get("easing", "linear")
+                    if not isinstance(ev, str) or ev not in EASING_VALUES:
+                        errors.append(err("INVALID_SCHEMA", "keyframe easing must be one of: " + ", ".join(sorted(EASING_VALUES)), field="overlays.keyframes.easing", clip_id=oid,
+                                          fix="set easing to linear, ease_in, ease_out or ease_in_out, or remove it"))
+                        bad_kf = True
+                        break
+                    raw_kfs.append((kt, vals, ev))
                 if not bad_kf:
                     # Resolve base position pixels for preset positions:
                     # the overlay's display size at its base scale.
@@ -880,11 +945,12 @@ def validate_project(project):
                     base_x = rov.get("x", int(round(_preset_xy[rov["position"]][0])))
                     base_y = rov.get("y", int(round(_preset_xy[rov["position"]][1])))
                     filled = []
-                    cur = {"x": base_x, "y": base_y, "scale": float(rov["size"]), "opacity": float(rov["opacity"])}
-                    for kt, vals in raw_kfs:
-                        cur = {**cur, **vals}
+                    cur = {"x": base_x, "y": base_y, "scale": float(rov["size"]), "opacity": float(rov["opacity"]), "easing": "linear"}
+                    for kt, vals, ev in raw_kfs:
+                        cur = {**cur, **vals, "easing": ev}
                         filled.append({"time": kt, "x": cur["x"], "y": cur["y"],
-                                       "scale": cur["scale"], "opacity": cur["opacity"]})
+                                       "scale": cur["scale"], "opacity": cur["opacity"],
+                                       "easing": cur["easing"]})
                     scales = {f["scale"] for f in filled}
                     if kind == "video" and len(scales) > 1 and rov["duration"] > rov.get("source_duration", rov["duration"]) + 0.01:
                         errors.append(err("INVALID_SCHEMA", "scale keyframes on a looping video overlay are not supported", field="overlays.keyframes.scale", clip_id=oid,
@@ -1083,7 +1149,195 @@ def validate_project(project):
         if fade_in + fade_out >= total and total > 0:
             errors.append(err("INVALID_SCHEMA", f"audio fade_in + fade_out ({fade_in + fade_out}s) must be less than the timeline ({total:.2f}s)", field="audio"))
         track["start"] = start
+    # Pro pack: project-level output options for delivery presets.
+    # video_bitrate is a bitrate string (e.g. "8M", "5000k") or a
+    # positive integer (kbps); loudness_target is a LUFS value
+    # used by loudnorm tracks (default -16 when absent).
+    video_bitrate = None
+    loudness_target = -16.0
+    if isinstance(output, dict):
+        if "video_bitrate" in output:
+            vb = output["video_bitrate"]
+            if isinstance(vb, bool) or (isinstance(vb, int) and vb <= 0) or \
+                    (isinstance(vb, str) and not re.fullmatch(r"[0-9]+(\.[0-9]+)?[kKmM]", vb)) or \
+                    not isinstance(vb, (int, str)):
+                errors.append(err("INVALID_SCHEMA", "output video_bitrate must be a bitrate like '8M' or a positive integer kbps", field="output.video_bitrate",
+                                  fix="set video_bitrate to e.g. '8M', or remove it to use the default quality setting"))
+            else:
+                video_bitrate = vb
+        if "loudness_target" in output:
+            try:
+                lt = float(output["loudness_target"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "output loudness_target must be a number", field="output.loudness_target",
+                                  fix="set loudness_target to a LUFS value such as -14 or -16, or remove it"))
+                lt = None
+            if lt is not None:
+                if not -30.0 <= lt <= 0.0:
+                    errors.append(err("INVALID_SCHEMA", "output loudness_target must be -30..0 LUFS", field="output.loudness_target",
+                                      fix="set loudness_target between -30 and 0, e.g. -14"))
+                else:
+                    loudness_target = lt
+    # Pro pack: chapters. An explicit list of {title, start} written
+    # into the output file's metadata at render time. Starts must
+    # strictly increase and stay inside the timeline; each chapter
+    # runs until the next chapter's start, or the timeline end.
+    chapters = []
+    raw_chapters = project.get("chapters")
+    if raw_chapters is not None:
+        if not isinstance(raw_chapters, list) or not raw_chapters:
+            errors.append(err("INVALID_SCHEMA", "chapters must be a non-empty list of {title, start} objects", field="chapters",
+                              fix="give chapters as e.g. [{'title': 'Intro', 'start': 0}], or remove chapters"))
+        else:
+            prev_start = None
+            for ci, ch in enumerate(raw_chapters):
+                if not isinstance(ch, dict) or not isinstance(ch.get("title"), str) or not ch["title"].strip():
+                    errors.append(err("INVALID_SCHEMA", "each chapter needs a non-empty title string", field="chapters.title",
+                                      fix="give every chapter a title, e.g. 'Intro'"))
+                    continue
+                try:
+                    cs = float(ch["start"])
+                except (KeyError, TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "each chapter needs a numeric start", field="chapters.start",
+                                      fix="set start to the timeline second where the chapter begins"))
+                    continue
+                if cs < 0 or cs >= total:
+                    errors.append(err("CLIP_OUT_OF_RANGE", f"chapter start {cs}s outside timeline {total:.2f}s", field="chapters.start",
+                                      fix=f"set chapter starts between 0 and {total:.2f}"))
+                    continue
+                if prev_start is not None and cs <= prev_start:
+                    errors.append(err("INVALID_SCHEMA", "chapter starts must strictly increase", field="chapters.start",
+                                      fix="sort chapters by start with no duplicates"))
+                    continue
+                if "\n" in ch["title"] or "\r" in ch["title"]:
+                    errors.append(err("INVALID_SCHEMA", "chapter titles must not contain newlines", field="chapters.title",
+                                      fix="remove newlines from the chapter title"))
+                    continue
+                prev_start = cs
+                chapters.append({"title": ch["title"], "start": cs})
+            for ci, ch in enumerate(chapters):
+                ch["end"] = chapters[ci + 1]["start"] if ci + 1 < len(chapters) else total
+    # Pro pack: explicit timecode burn-in. False (the default)
+    # means final renders carry no timecode; True burns a running
+    # timecode into the final render itself. Previews may add
+    # timecode independently (see preview_project).
+    if "timecode" in project and not isinstance(project["timecode"], bool):
+        errors.append(err("INVALID_SCHEMA", "timecode must be true or false", field="timecode",
+                          fix="set timecode to true to burn a timecode into the render, or remove it"))
+    # Pro pack: deterministic ducking. An explicit ducking object
+    # replaces the automatic sidechain compressor for music tracks:
+    # while the voice track's time windows are active, music gain
+    # drops by amount_db with smooth fades. This is volume
+    # automation from time windows, NOT sidechain compression and
+    # NOT level detection — it ducks on schedule even if the voice
+    # track itself is quiet, and it never ducks outside windows.
+    ducking = None
+    raw_duck = project.get("ducking")
+    if raw_duck is not None:
+        audio_tracks = project.get("audio") or []
+        music_tracks = [t for t in audio_tracks if isinstance(t, dict) and t.get("kind") == "music"]
+        if not isinstance(raw_duck, dict):
+            errors.append(err("INVALID_SCHEMA", "ducking must be an object", field="ducking",
+                              fix="set ducking to e.g. {'voice_track': 1, 'amount_db': 12, 'fade': 0.25}"))
+        elif not music_tracks:
+            errors.append(err("INVALID_SCHEMA", "ducking needs a music track to duck", field="ducking",
+                              fix="add a music audio track, or remove ducking"))
+        else:
+            vref = raw_duck.get("voice_track")
+            voice_index = None
+            if isinstance(vref, bool) or not isinstance(vref, (int, str)):
+                errors.append(err("INVALID_SCHEMA", "ducking voice_track must be an audio-track index or a track src", field="ducking.voice_track",
+                                  fix="set voice_track to the index of the voice track in audio (e.g. 1), or to its src path"))
+            elif isinstance(vref, int):
+                if not 0 <= vref < len(audio_tracks):
+                    errors.append(err("INVALID_SCHEMA", f"ducking voice_track index {vref} is outside the audio list", field="ducking.voice_track",
+                                      fix=f"set voice_track to an index between 0 and {len(audio_tracks) - 1}"))
+                elif audio_tracks[vref].get("kind") != "voice":
+                    errors.append(err("INVALID_SCHEMA", "ducking voice_track must point at a voice track", field="ducking.voice_track",
+                                      fix="point voice_track at a track whose kind is 'voice'"))
+                else:
+                    voice_index = vref
+            else:
+                matches = [i for i, t in enumerate(audio_tracks)
+                           if isinstance(t, dict) and t.get("kind") == "voice"
+                           and (t.get("src") == vref or os.path.basename(str(t.get("src", ""))) == os.path.basename(vref))]
+                if len(matches) != 1:
+                    errors.append(err("INVALID_SCHEMA", f"ducking voice_track {vref!r} does not match exactly one voice track", field="ducking.voice_track",
+                                      fix="set voice_track to the voice track's index in audio, or to its exact src path"))
+                else:
+                    voice_index = matches[0]
+            try:
+                amount_db = float(raw_duck.get("amount_db", 12.0))
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "ducking amount_db must be a number", field="ducking.amount_db",
+                                  fix="set amount_db to a number of decibels, e.g. 12"))
+                amount_db = None
+            if amount_db is not None and not 0.0 <= amount_db <= 30.0:
+                errors.append(err("INVALID_SCHEMA", "ducking amount_db must be 0..30 dB", field="ducking.amount_db",
+                                  fix="set amount_db between 0 and 30"))
+                amount_db = None
+            try:
+                fade = float(raw_duck.get("fade", 0.25))
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "ducking fade must be a number", field="ducking.fade",
+                                  fix="set fade to seconds, e.g. 0.25, or remove it"))
+                fade = None
+            if fade is not None and not 0.0 <= fade <= 2.0:
+                errors.append(err("INVALID_SCHEMA", "ducking fade must be 0..2 seconds", field="ducking.fade",
+                                  fix="set fade between 0 and 2 seconds"))
+                fade = None
+            windows = None
+            if "windows" in raw_duck:
+                if not isinstance(raw_duck["windows"], list) or not raw_duck["windows"]:
+                    errors.append(err("INVALID_SCHEMA", "ducking windows must be a non-empty list of {start, end} objects", field="ducking.windows",
+                                      fix="give windows as e.g. [{'start': 2, 'end': 5}], or omit windows to derive them from the voice track"))
+                else:
+                    windows = []
+                    prev_end = None
+                    for w in raw_duck["windows"]:
+                        if not isinstance(w, dict):
+                            errors.append(err("INVALID_SCHEMA", "each ducking window must be an object", field="ducking.windows",
+                                              fix="make each window an object with start and end"))
+                            windows = None
+                            break
+                        try:
+                            ws, we = float(w["start"]), float(w["end"])
+                        except (KeyError, TypeError, ValueError):
+                            errors.append(err("INVALID_SCHEMA", "ducking windows need numeric start and end", field="ducking.windows",
+                                              fix="set start and end to timeline seconds"))
+                            windows = None
+                            break
+                        if ws < 0 or we <= ws or we > total + 0.05:
+                            errors.append(err("CLIP_OUT_OF_RANGE", f"ducking window {ws}..{we}s outside timeline {total:.2f}s", field="ducking.windows",
+                                              fix=f"keep windows inside 0..{total:.2f} with end after start"))
+                            windows = None
+                            break
+                        if prev_end is not None and ws < prev_end:
+                            errors.append(err("INVALID_SCHEMA", "ducking windows must not overlap", field="ducking.windows",
+                                              fix="sort windows by start with no overlaps"))
+                            windows = None
+                            break
+                        prev_end = we
+                        windows.append({"start": ws, "end": min(we, total)})
+            if voice_index is not None and amount_db is not None and fade is not None and windows is None and "windows" not in raw_duck:
+                # Derive the window from the voice track: its start
+                # plus its probed source duration, clipped to the
+                # timeline. This is the voice segment's time window.
+                vtrack = audio_tracks[voice_index]
+                vprobe = probe_media(vtrack.get("src", ""))
+                if vprobe is None or vprobe.get("duration") is None:
+                    errors.append(err("CLIP_OUT_OF_RANGE", "ducking cannot derive a window: the voice track duration could not be probed", field="ducking.voice_track",
+                                      fix="give explicit ducking windows, or replace the voice track with a file ffprobe can read"))
+                else:
+                    vs = float(vtrack.get("start", 0))
+                    ve = min(vs + float(vprobe["duration"]), total)
+                    windows = [{"start": vs, "end": ve}] if ve > vs else []
+            if voice_index is not None and amount_db is not None and fade is not None and windows is not None:
+                ducking = {"voice_index": voice_index, "amount_db": amount_db,
+                           "fade": fade, "windows": windows}
     info = {"width": width, "height": height, "fps": fps, "clips": resolved,
             "total_duration": total, "clip_starts": clip_starts, "font": font,
-            "captions": merged_captions, "overlays": resolved_overlays}
+            "captions": merged_captions, "overlays": resolved_overlays,
+            "chapters": chapters, "ducking": ducking,
+            "video_bitrate": video_bitrate, "loudness_target": loudness_target}
     return errors, info

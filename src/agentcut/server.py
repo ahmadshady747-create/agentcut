@@ -95,7 +95,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "object"}}, "required": ["project"]}},
     {"name": "preview_project",
-     "description": "Render a low-resolution proxy of a stored project and extract frames plus a contact sheet. Returns a job id; poll with get_job. The job runs as a detached process and survives the client closing stdio.",
+     "description": "Render a low-resolution proxy of a stored project and extract frames plus a contact sheet. The proxy carries title-safe/action-safe guide boxes and, when the project sets timecode (or preview timecode is requested), a timecode burn-in; the result flags guides/timecode. Returns a job id; poll with get_job. The job runs as a detached process and survives the client closing stdio.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
     {"name": "render_project",
@@ -114,7 +114,7 @@ TOOLS = [
          "output": {"type": "string"}},
          "required": ["brief", "output"]}},
     {"name": "produce_variants",
-     "description": "Producer multi-format export: render one brief as vertical, square and landscape videos in one call. Returns per-format outputs, durations, review frames and QA.",
+     "description": "Producer multi-format export: render one brief as vertical, square and landscape videos in one call, or as named delivery presets (youtube_1080, shorts_720, instagram_square) when the brief sets delivery_presets or delivery_preset; an explicit format/width/height in the brief wins over a preset's size. Returns per-format outputs, durations, review frames and QA.",
      "inputSchema": {"type": "object", "properties": {
          "brief": {"type": "object"},
          "output_dir": {"type": "string"}},

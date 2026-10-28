@@ -1,0 +1,1 @@
+{"clips":[{"duration":3,"grade":"cinematic","id":"a","kind":"image","src":"data/test_media/pattern.png"},{"duration":3,"id":"b","kind":"image","lut":"examples/test-lut.cube","src":"data/test_media/poster.png","transition":"crossfade"}],"id":"grading-demo","output":{"fps":24,"height":640,"width":360},"title":"Colour grading demo","version":1}
