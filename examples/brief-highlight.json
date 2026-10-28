@@ -1,0 +1,17 @@
+{
+  "id": "template-highlight",
+  "title": "Highlights",
+  "format": "landscape",
+  "clips": [
+    {
+      "src": "data/test_media/clip1.mp4",
+      "trim_in": 0,
+      "trim_out": 3
+    },
+    {
+      "src": "data/test_media/clip2.mp4",
+      "trim_in": 1,
+      "trim_out": 4
+    }
+  ]
+}

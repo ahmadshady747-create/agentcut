@@ -1,0 +1,20 @@
+{
+  "id": "template-montage",
+  "title": "Montage",
+  "format": "square",
+  "clips": [
+    {
+      "src": "data/test_media/poster.png",
+      "duration": 2
+    },
+    {
+      "src": "data/test_media/pattern.png",
+      "duration": 2,
+      "ken_burns": "zoom_in"
+    },
+    {
+      "src": "data/test_media/poster.png",
+      "duration": 2
+    }
+  ]
+}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -485,6 +486,332 @@ def preview_project(project, out_dir, scale_factor=0.5):
     return True, {"proxy": proxy, "frames": frames,
                   "contact_sheet": contact if os.path.isfile(contact) else None,
                   "duration": total}
+
+
+FORMATS = {
+    "vertical": (720, 1280),
+    "square": (720, 720),
+    "landscape": (1280, 720),
+}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+
+
+def _brief_kind(src):
+    return "image" if os.path.splitext(src)[1].lower() in _IMAGE_EXTS else "video"
+
+
+
+def _run_detect(path, filter_arg, kind, duration, timeout=60):
+    """Return (segments, total, ok). kind is 'black' or 'silence'."""
+    if kind == "black":
+        cmd = ["ffmpeg", "-v", "info", "-i", path, "-vf", filter_arg,
+               "-an", "-f", "null", "-"]
+        start_re = re.compile(r"black_start:\s*([0-9.]+)\s+black_end:\s*([0-9.]+)\s+black_duration:\s*([0-9.]+)")
+    else:
+        cmd = ["ffmpeg", "-v", "info", "-i", path, "-af", filter_arg,
+               "-vn", "-sn", "-f", "null", "-"]
+        start_re = None
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return [], 0.0, False
+    if proc.returncode != 0:
+        return [], 0.0, False
+    text = proc.stderr or ""
+    segments = []
+    if kind == "black":
+        for m in start_re.finditer(text):
+            st, en, du = (float(x) for x in m.groups())
+            segments.append({"start": st, "end": en, "duration": du})
+    else:
+        open_start = None
+        for line in text.splitlines():
+            m = re.search(r"silence_start:\s*([0-9.\-]+)", line)
+            if m:
+                open_start = float(m.group(1))
+                continue
+            m = re.search(r"silence_end:\s*([0-9.\-]+)\s*\|\s*silence_duration:\s*([0-9.]+)", line)
+            if m and open_start is not None:
+                en, du = float(m.group(1)), float(m.group(2))
+                segments.append({"start": open_start, "end": en, "duration": du})
+                open_start = None
+        if open_start is not None and duration:
+            segments.append({"start": open_start, "end": duration,
+                             "duration": max(0.0, duration - open_start)})
+    total = sum(seg["duration"] for seg in segments)
+    return segments, total, True
+
+
+
+def _brief_audio(brief):
+    """Build the audio list for a brief, including the soundtrack shortcut.
+
+    `soundtrack` is a string (a music source path) or a dict with `src`
+    plus any of volume/start/fade_in/fade_out/loudnorm. It is appended
+    as a music track after any explicit `audio` list. Returns a list,
+    or raises ValueError with a structured-style message (caught by
+    produce_video below into an INVALID_SCHEMA error).
+    """
+    audio = list(brief.get("audio") or [])
+    st = brief.get("soundtrack")
+    if st is None:
+        return audio
+    if isinstance(st, str):
+        audio.append({"src": st, "kind": "music", "volume": 1.0})
+    elif isinstance(st, dict) and st.get("src"):
+        track = {"src": st["src"], "kind": "music"}
+        for key in ("volume", "start", "fade_in", "fade_out", "loudnorm"):
+            if key in st:
+                track[key] = st[key]
+        audio.append(track)
+    else:
+        raise ValueError("soundtrack must be a path string or a dict with src")
+    return audio
+
+
+
+def produce_video(brief, output_path, review_dir=None):
+    """Producer-level one call: a short brief in, a finished video out.
+
+    A brief is far smaller than a full project: a format preset, a list
+    of media paths, an optional title, and optional texts/audio. The
+    function builds the full project, validates it, renders it, and
+    extracts review frames from the finished video, so any agent —
+    Muse, Claude, Cursor, or any other MCP client — can produce a
+    video in one step and then review its own frames before delivery.
+    Returns (ok, info_or_error).
+    """
+    if not isinstance(brief, dict):
+        return False, {"code": "INVALID_SCHEMA", "message": "produce brief must be an object"}
+    fmt = brief.get("format", "vertical")
+    if fmt not in FORMATS:
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"format must be one of {sorted(FORMATS)}"}
+    width, height = FORMATS[fmt]
+    # Sections are an alternative to a flat clips list, not an addition:
+    # each section contributes its clips in order, and gets an auto
+    # title card at its start (see below). A brief with both is an
+    # error, so the timeline can never be ambiguous.
+    sections = brief.get("sections")
+    section_first = []
+    if sections is not None:
+        if brief.get("clips"):
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": "use sections or clips, not both"}
+        if not isinstance(sections, list) or not sections:
+            return False, {"code": "EMPTY_TIMELINE",
+                           "message": "produce brief sections must be a non-empty list"}
+        brief_items = []
+        for si, sec in enumerate(sections):
+            if not isinstance(sec, dict) or not sec.get("clips"):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"section {si} needs a non-empty clips list"}
+            section_first.append(len(brief_items))
+            brief_items.extend(sec["clips"])
+    else:
+        brief_items = brief.get("clips") or []
+    if not brief_items:
+        return False, {"code": "EMPTY_TIMELINE", "message": "produce brief needs a non-empty clips list"}
+    clips = []
+    for i, item in enumerate(brief_items):
+        if not isinstance(item, dict) or not item.get("src"):
+            return False, {"code": "INVALID_SCHEMA", "message": f"clip {i} needs a src path"}
+        src = item["src"]
+        kind = item.get("kind") or _brief_kind(src)
+        clip = {"id": item.get("id", f"c{i + 1}"), "kind": kind, "src": src}
+        if kind == "image":
+            clip["duration"] = float(item.get("duration", 3))
+        else:
+            if item.get("trim_in") is not None:
+                clip["trim_in"] = item["trim_in"]
+            if item.get("trim_out") is not None:
+                clip["trim_out"] = item["trim_out"]
+        if i > 0:
+            clip["transition"] = item.get("transition", "crossfade")
+        for key in ("ken_burns", "fit", "speed", "brightness", "contrast",
+                    "saturation", "grayscale", "transition_duration"):
+            if key in item:
+                clip[key] = item[key]
+        clips.append(clip)
+    # Timeline durations and clip starts in final-timeline coordinates
+    # (after xfade overlaps; fade-to-black does not shorten the
+    # timeline). Used for the total, for section title cards, and
+    # for the default title card.
+    durations = []
+    for clip in clips:
+        if clip["kind"] == "image":
+            dur = float(clip["duration"])
+        else:
+            info_p = probe_media(clip["src"])
+            if info_p is None or info_p.get("duration") is None:
+                return False, {"code": "FILE_NOT_FOUND",
+                               "message": f"cannot probe video clip: {clip['src']}"}
+            dur = (clip.get("trim_out", info_p["duration"])
+                   - clip.get("trim_in", 0))
+            if "speed" in clip:
+                dur = dur / float(clip["speed"])
+        durations.append(dur)
+    starts = [0.0]
+    total = durations[0] if durations else 0.0
+    for i in range(1, len(clips)):
+        overlap = 0.0
+        if clips[i].get("transition") in XFADE_TRANSITIONS:
+            overlap = float(clips[i].get("transition_duration", 0.5))
+        starts.append(starts[-1] + durations[i - 1] - overlap)
+        total += durations[i] - overlap
+    try:
+        brief_audio = _brief_audio(brief)
+    except ValueError as exc:
+        return False, {"code": "INVALID_SCHEMA", "message": str(exc)}
+    texts = list(brief.get("texts") or [])
+    # Section title cards: one auto text at each section's start.
+    section_info = []
+    if sections is not None:
+        for si, sec in enumerate(sections):
+            title_s = sec.get("title")
+            if not title_s:
+                continue
+            st = starts[section_first[si]]
+            nxt = (starts[section_first[si + 1]] if si + 1 < len(sections)
+                   else total)
+            end = min(st + 4.0, nxt, total)
+            if end <= st:
+                end = total
+            tstart = st + 0.5 if st + 0.5 < end else st
+            texts.append({"text": title_s, "start": tstart, "end": end,
+                          "size": 64, "x": "center", "y": 100})
+            section_info.append({"title": title_s, "start": st, "end": end})
+    title = brief.get("title")
+    if title and not brief.get("texts") and sections is None:
+        end = min(4.0, total - 0.5) if total > 1.5 else total
+        texts.append({"text": title, "start": 0.5, "end": end,
+                      "size": 64, "x": "center", "y": 100})
+    project = {
+        "id": brief.get("id", "produced"),
+        "title": title or "Produced video",
+        "version": 1,
+        "output": {"width": width, "height": height,
+                   "fps": int(brief.get("fps", 24))},
+        "clips": clips,
+        "texts": texts,
+        "captions": brief.get("captions") or [],
+        "audio": brief_audio,
+    }
+    if brief.get("caption_color") is not None:
+        project["caption_color"] = brief["caption_color"]
+    if brief.get("caption_size") is not None:
+        project["caption_size"] = brief["caption_size"]
+    if brief.get("caption_position") is not None:
+        project["caption_position"] = brief["caption_position"]
+    errors, info = validate_project(project)
+    if errors:
+        return False, {"code": "INVALID_PROJECT", "errors": errors}
+    ok, rinfo = render_project(project, output_path)
+    if not ok:
+        return False, rinfo
+    probe = probe_media(output_path) or {}
+    video = [st for st in (probe.get("raw", {}).get("streams") or [])
+             if st.get("codec_type") == "video"]
+    has_audio = any(st.get("codec_type") == "audio"
+                    for st in (probe.get("raw", {}).get("streams") or []))
+    actual_duration = float((probe.get("raw", {}) or {}).get("format", {}).get("duration") or 0.0)
+    actual_w = video[0].get("width") if video else None
+    actual_h = video[0].get("height") if video else None
+    actual_pix = video[0].get("pix_fmt") if video else None
+    black_segs, black_total, black_ok = _run_detect(
+        output_path, "blackdetect=d=0.5:pix_th=0.10", "black", actual_duration)
+    sil_segs, sil_total, sil_ok = _run_detect(
+        output_path, "silencedetect=noise=-50dB:d=0.5", "silence", actual_duration)
+    warnings = []
+    if abs(actual_duration - total) > 0.5:
+        warnings.append(f"duration mismatch: expected {total:.2f}s, got {actual_duration:.2f}s")
+    if actual_w != width or actual_h != height:
+        warnings.append(f"resolution mismatch: expected {width}x{height}, got {actual_w}x{actual_h}")
+    if actual_pix != "yuv420p":
+        warnings.append(f"pix_fmt is {actual_pix}, expected yuv420p (phone playback risk)")
+    if not has_audio:
+        warnings.append("no audio stream in output")
+    if not black_ok:
+        warnings.append("black-frame detection unavailable")
+    elif black_total > 0:
+        warnings.append(f"black frames detected: {black_total:.1f}s in {len(black_segs)} segment(s)")
+    if not sil_ok:
+        warnings.append("silence detection unavailable")
+    elif has_audio and actual_duration and sil_total >= actual_duration - 0.5:
+        warnings.append("audio is silent throughout; add a music track if you want sound")
+    qa = {
+        "duration_expected": total, "duration_actual": actual_duration,
+        "width_expected": width, "height_expected": height,
+        "width_actual": actual_w, "height_actual": actual_h,
+        "pix_fmt": actual_pix, "has_audio": has_audio,
+        "black_segments": black_segs, "black_duration": black_total,
+        "silence_segments": sil_segs, "silence_duration": sil_total,
+        "warnings": warnings,
+    }
+    if review_dir is None:
+        review_dir = output_path + ".review"
+    os.makedirs(review_dir, exist_ok=True)
+    frames = []
+    total = info["total_duration"]
+    for k, t in enumerate(sorted({0.0, total * 0.25, total * 0.5,
+                                  total * 0.75, total * 0.99})):
+        frame = os.path.join(review_dir, f"frame_{k}.png")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", output_path,
+             "-frames:v", "1", frame],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0 and os.path.isfile(frame):
+            frames.append({"time": t, "path": frame})
+    return True, {
+        "output": output_path,
+        "duration": total,
+        "width": width,
+        "height": height,
+        "fps": project["output"]["fps"],
+        "pix_fmt": video[0].get("pix_fmt") if video else None,
+        "has_video": bool(video),
+        "has_audio": any(st.get("codec_type") == "audio"
+                         for st in (probe.get("raw", {}).get("streams") or [])),
+        "audio_tracks_provided": bool(project["audio"]),
+        "review_frames": frames,
+        "review_dir": review_dir,
+        "qa": qa,
+        "sections": section_info,
+        "project": project,
+    }
+
+
+def produce_variants(brief, output_dir):
+    """Render one brief as vertical, square and landscape in one call.
+
+    Each variant is a full produce_video run (validate, render,
+    review frames, QA) with the same clips, title, texts and audio,
+    only the format preset changed. Outputs are
+    <output_dir>/<brief-id>-<format>.mp4. Returns (ok, info) where
+    info["variants"] maps format -> produce info (project stripped).
+    On a variant failure the call stops and reports that format;
+    variants already produced stay on disk (each is atomic).
+    """
+    import copy
+    if not isinstance(brief, dict):
+        return False, {"code": "INVALID_SCHEMA", "message": "produce brief must be an object"}
+    os.makedirs(output_dir, exist_ok=True)
+    base_id = brief.get("id", "produced")
+    variants = {}
+    for fmt in ("vertical", "square", "landscape"):
+        variant = copy.deepcopy(brief)
+        variant["format"] = fmt
+        out = os.path.join(output_dir, f"{base_id}-{fmt}.mp4")
+        ok, info = produce_video(variant, out)
+        if not ok:
+            return False, {"code": info.get("code", "RENDER_FAILED"),
+                           "message": info.get("message") or info,
+                           "format": fmt, "variants": variants}
+        info = dict(info)
+        info.pop("project", None)
+        variants[fmt] = info
+    return True, {"output_dir": output_dir, "variants": variants}
+
 
 
 class JobStore:

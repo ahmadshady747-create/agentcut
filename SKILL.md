@@ -102,3 +102,60 @@ Audio fades: track `fade_in`/`fade_out` seconds. Clip speed: video clip `speed` 
 Poster frame: MCP tool `poster_frame` (id, optional time in seconds, default middle) or `./run.sh poster <json> <png> [seconds]`.
 
 Robustness: image clips are probed; images over 2560px long side are downscaled first; dimensions must be integers; empty text is rejected.
+
+## Producer workflow (any agent) — the review loop
+
+This loop is the same in every MCP client. It does not depend on
+any one assistant, chat app, or editor: any agent that can call
+MCP tools can run it, and the brief (or the stored project) is
+the only source of truth it edits.
+
+1. Brief. Write down the goal, the audience, the format
+   (`vertical`, `square` or `landscape`), the media paths, the
+   title, and the music if any. A `soundtrack` shortcut covers
+   the music in one field; `sections` (title + clips each) add
+   an auto title card at each section's start. Start from a template brief in
+   `examples/brief-*.json` when one fits, and swap in your own
+   media paths. Probe every source first with `probe_media`;
+   never guess a duration.
+2. Produce. Call `produce_video` with that brief (or
+   `./run.sh produce <brief.json> <out.mp4>`). For all three
+   shapes at once, call `produce_variants` (or
+   `./run.sh produce-variants <brief.json> <dir>`). The call validates,
+   renders, and returns the finished video plus `review_frames`
+   and a `qa` block. It blocks until the render completes; there
+   is no job to poll for this call.
+3. Review. Look at every review frame, not just the first:
+   title legible, no unexpected black frames, no letterboxing
+   surprise, transitions clean, text not cut off at the edges.
+   Then read `qa.warnings` and judge each one, because warnings
+   are not errors:
+   - `duration` / `resolution` / `pix_fmt` warnings mean the
+     output does not match the brief: fix the brief and
+     re-produce.
+   - A `black frames detected` warning names the segments: a
+     fade-to-black transition explains short black segments;
+     unexplained black means a bad clip or a bad trim.
+   - An `audio is silent throughout` warning is expected for a
+     montage with no music track, and is only a problem if
+     sound was wanted — then add a soundtrack and re-produce.
+   - `detection unavailable` warnings mean the check itself
+     failed; the video may still be fine, but say so when you
+     deliver it instead of claiming it was checked.
+4. Patch. Change exactly what the review showed was wrong, in
+   one place only:
+   - Brief path (the normal producer path): edit the brief
+     JSON — clip order, clip duration, text, `fit`, transition,
+     soundtrack, or sections — and go back to step 2.
+   - Stored-project path: edit the stored project with
+     `patch_project`, then `render_project`, then poll `get_job`
+     until `done` or `failed`; never present a queued or
+     running job as a finished video.
+   Do not patch the rendered MP4, and do not hand-edit a
+   review frame and call it the video.
+5. Final check. After the last re-produce, review the new
+   frames and the new `qa` block again, and verify the output
+   with its probe data: duration, width, height, video and
+   audio streams, `yuv420p`. Only then deliver the MP4, with
+   its duration, size and format. Do not deliver a video you
+   have not frame-checked in its final form.

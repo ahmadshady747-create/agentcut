@@ -598,6 +598,132 @@ class TestAgentCut(unittest.TestCase):
         self.assertIn('"id": 3', proc.stdout)
         self.assertIn("INVALID_SCHEMA", proc.stdout)
 
+    def test_produce_video_montage(self):
+        from agentcut.render import produce_video
+        brief = {
+            "id": "produced-test", "title": "Produced by an agent",
+            "format": "square",
+            "clips": [
+                {"src": "data/test_media/poster.png"},
+                {"src": "data/test_media/pattern.png"},
+                {"src": "data/test_media/poster.png"},
+            ],
+        }
+        out = os.path.join(BASE, "data", "test_produce.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        self.assertAlmostEqual(info["duration"], 8.0, places=2)
+        self.assertEqual((info["width"], info["height"]), (720, 720))
+        self.assertEqual(info["pix_fmt"], "yuv420p")
+        self.assertTrue(info["has_video"])
+        self.assertTrue(len(info["review_frames"]) >= 3)
+        self.assertTrue(all(os.path.isfile(f["path"]) for f in info["review_frames"]))
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 8.0, delta=0.5)
+
+    def test_produce_video_auto_video_duration(self):
+        from agentcut.render import produce_video
+        brief = {
+            "id": "produced-video", "format": "landscape",
+            "clips": [
+                {"src": "data/test_media/clip1.mp4"},
+                {"src": "data/test_media/clip2.mp4"},
+            ],
+        }
+        out = os.path.join(BASE, "data", "test_produce_video.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        self.assertAlmostEqual(info["duration"], 9.5, places=2)
+
+    def test_producer_template_montage_renders(self):
+        from agentcut.render import produce_video
+        for name in ("brief-montage", "brief-highlight",
+                     "brief-announcement", "brief-showcase"):
+            with open(os.path.join(BASE, "examples", f"{name}.json")) as fh:
+                brief = json.load(fh)
+            self.assertTrue(brief["clips"])
+            self.assertIn(brief["format"], ("vertical", "square", "landscape"))
+        with open(os.path.join(BASE, "examples", "brief-montage.json")) as fh:
+            brief = json.load(fh)
+        out = os.path.join(BASE, "data", "test_template_montage.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        self.assertAlmostEqual(info["duration"], 5.0, delta=0.5)
+        self.assertEqual(info["pix_fmt"], "yuv420p")
+        self.assertEqual(len(info["review_frames"]), 5)
+
+    def test_producer_qa_checks(self):
+        from agentcut.render import produce_video
+        with open(os.path.join(BASE, "examples", "brief-montage.json")) as fh:
+            brief = json.load(fh)
+        out = os.path.join(BASE, "data", "test_producer_qa.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        qa = info["qa"]
+        self.assertAlmostEqual(qa["duration_actual"], 5.0, delta=0.5)
+        self.assertEqual((qa["width_actual"], qa["height_actual"]), (720, 720))
+        self.assertEqual(qa["pix_fmt"], "yuv420p")
+        self.assertIsInstance(qa["black_segments"], list)
+        self.assertIsInstance(qa["silence_segments"], list)
+        # The montage brief has no music track, so its audio is silent
+        # throughout by construction; QA must say so, not hide it.
+        self.assertTrue(any("silent" in w for w in qa["warnings"]), qa["warnings"])
+        self.assertFalse(any("resolution" in w for w in qa["warnings"]), qa["warnings"])
+
+    def test_producer_sections_and_soundtrack(self):
+        from agentcut.render import produce_video
+        brief = {
+            "id": "sectioned", "format": "square",
+            "soundtrack": "data/test_media/clip1.mp4",
+            "sections": [
+                {"title": "Intro", "clips": [
+                    {"src": "data/test_media/poster.png", "duration": 2},
+                    {"src": "data/test_media/pattern.png", "duration": 2}]},
+                {"title": "Finale", "clips": [
+                    {"src": "data/test_media/poster.png", "duration": 2}]},
+            ],
+        }
+        out = os.path.join(BASE, "data", "test_sections.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        self.assertAlmostEqual(info["duration"], 5.0, delta=0.5)
+        self.assertEqual(info["pix_fmt"], "yuv420p")
+        self.assertEqual([s["title"] for s in info["sections"]], ["Intro", "Finale"])
+        self.assertAlmostEqual(info["sections"][1]["start"], 3.0, delta=0.1)
+        texts = info["project"]["texts"]
+        self.assertTrue(any(t["text"] == "Intro" and abs(t["start"] - 0.5) < 0.1 for t in texts))
+        self.assertTrue(any(t["text"] == "Finale" and abs(t["start"] - 3.5) < 0.1 for t in texts))
+        audio = info["project"]["audio"]
+        self.assertEqual(len(audio), 1)
+        self.assertEqual(audio[0]["kind"], "music")
+        # Soundtrack as a dict carries its own volume through.
+        brief2 = {"id": "soundtrack-dict", "format": "square",
+                  "soundtrack": {"src": "data/test_media/clip1.mp4", "volume": 0.5},
+                  "clips": [{"src": "data/test_media/poster.png", "duration": 2}]}
+        out2 = os.path.join(BASE, "data", "test_soundtrack_dict.mp4")
+        ok2, info2 = produce_video(brief2, out2)
+        self.assertTrue(ok2, info2)
+        self.assertEqual(info2["project"]["audio"][0]["volume"], 0.5)
+
+    def test_producer_variants_all_formats(self):
+        from agentcut.render import produce_variants
+        import shutil
+        with open(os.path.join(BASE, "examples", "brief-montage.json")) as fh:
+            brief = json.load(fh)
+        out_dir = os.path.join(BASE, "data", "test_variants")
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)
+        ok, info = produce_variants(brief, out_dir)
+        self.assertTrue(ok, info)
+        expected = {"vertical": (720, 1280), "square": (720, 720),
+                    "landscape": (1280, 720)}
+        for fmt, (w, h) in expected.items():
+            v = info["variants"][fmt]
+            self.assertEqual((v["width"], v["height"]), (w, h))
+            self.assertAlmostEqual(v["duration"], 5.0, delta=0.5)
+            self.assertEqual(v["pix_fmt"], "yuv420p")
+            self.assertTrue(os.path.isfile(v["output"]))
+
     def test_probe_media(self):
         info = probe_media(os.path.join(BASE, "data", "test_media", "clip1.mp4"))
         self.assertAlmostEqual(info["duration"], 5.0, delta=0.2)

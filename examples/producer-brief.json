@@ -1,0 +1,17 @@
+{
+  "id": "producer-demo",
+  "title": "Produced by an agent",
+  "format": "square",
+  "clips": [
+    {
+      "src": "data/test_media/poster.png"
+    },
+    {
+      "src": "data/test_media/pattern.png"
+    },
+    {
+      "src": "data/test_media/poster.png",
+      "ken_burns": "zoom_in"
+    }
+  ]
+}

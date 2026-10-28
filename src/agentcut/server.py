@@ -12,7 +12,7 @@ import os
 import re
 import sys
 
-from .render import JobStore, poster_frame, preview_project, render_project
+from .render import JobStore, poster_frame, preview_project, produce_variants, produce_video, render_project
 from .validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -96,6 +96,18 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "time": {"type": "number"}},
          "required": ["id"]}},
+    {"name": "produce_video",
+     "description": "Producer one-call: take a short brief (format preset, media paths, optional title/texts/audio) and return a finished video plus review frames. Blocks until the render completes.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object"},
+         "output": {"type": "string"}},
+         "required": ["brief", "output"]}},
+    {"name": "produce_variants",
+     "description": "Producer multi-format export: render one brief as vertical, square and landscape videos in one call. Returns per-format outputs, durations, review frames and QA.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object"},
+         "output_dir": {"type": "string"}},
+         "required": ["brief", "output_dir"]}},
     {"name": "get_job",
      "description": "Poll a render or preview job by id.",
      "inputSchema": {"type": "object", "properties": {
@@ -176,6 +188,18 @@ def call_tool(name, args):
         ok, info = poster_frame(project, out_path, time=args.get("time"))
         if not ok:
             return _tool_error(info)
+        return _text(info)
+    if name == "produce_variants":
+        ok, info = produce_variants(args["brief"], args["output_dir"])
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "produce_video":
+        ok, info = produce_video(args["brief"], args["output"])
+        if not ok:
+            return _tool_error(info)
+        info = dict(info)
+        info.pop("project", None)
         return _text(info)
     if name == "get_job":
         record = JOBS.get(args["id"])

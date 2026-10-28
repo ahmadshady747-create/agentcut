@@ -1,3 +1,46 @@
+## 1.20.0 — 2026-10-28
+- Multi-format export: produce_variants renders one brief as
+  vertical, square and landscape in one call (MCP tool
+  produce_variants, now 12 tools, and ./run.sh produce-variants),
+  each variant a full produce run with review frames and QA.
+
+## 1.19.0 — 2026-10-28
+- Brief soundtrack shortcut: `soundtrack` as a path string or a
+  dict (src + volume/start/fades/loudnorm) becomes a music track
+  after any explicit audio list.
+- Brief sections: `sections` (title + clips each) flattens to one
+  timeline and adds an auto title card at each section's start,
+  in final-timeline coordinates after crossfade overlaps. A brief
+  with both sections and clips is a structured error.
+
+## 1.18.0 — 2026-10-28
+- Producer review loop formalised in SKILL.md, written
+  agent-agnostically: brief -> produce -> review frames + qa ->
+  patch (brief or stored project) -> re-produce -> final check,
+  including how to judge each qa warning (warnings are not
+  errors; silent audio is expected for a music-less montage).
+
+## 1.17.0 — 2026-10-28
+- Producer QA in produce_video output: duration, resolution and
+  pix_fmt checks plus black-frame (blackdetect) and silence
+  (silencedetect) detection, reported as qa.warnings, not errors.
+  An image montage with no music track is correctly reported as
+  silent throughout.
+
+## 1.16.0 — 2026-10-28
+- Producer templates: brief-montage, brief-highlight,
+  brief-announcement and brief-showcase in examples/ (format, media,
+  title, Ken Burns where it fits). The montage template is rendered
+  in tests: square, 5.0s, yuv420p, 5 review frames.
+
+## 1.15.0 — Loop 4 round 1 (producer)
+- New: produce_video — a one-call producer. A short brief (format
+  preset, media paths, optional title/texts/audio) builds, validates
+  and renders a finished video and extracts review frames, so any
+  agent can produce a video in one step instead of assembling a full
+  project by hand. MCP tool produce_video + CLI ./run.sh produce.
+- New example: examples/producer-brief.json.
+
 ## 1.14.1 — 2026-10-28 (Loop 3, audit fix)
 - Fixed: a malformed MCP tools/call (missing required argument)
   raised KeyError and killed the server. The serve loop now returns

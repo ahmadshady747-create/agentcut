@@ -1,0 +1,15 @@
+{
+  "id": "template-announcement",
+  "title": "Announcement",
+  "format": "vertical",
+  "clips": [
+    {
+      "src": "data/test_media/poster.png",
+      "duration": 3
+    },
+    {
+      "src": "data/test_media/pattern.png",
+      "duration": 3
+    }
+  ]
+}

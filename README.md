@@ -150,3 +150,38 @@ Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution fra
 Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
 
 Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale.
+
+## Producer: one call, any agent
+
+AgentCut is built so that Muse, Claude, Cursor, or any other MCP
+client can act as a video producer, not just as a renderer. The
+producer call takes a short brief, not a full project:
+
+```sh
+./run.sh produce examples/producer-brief.json out.mp4
+```
+
+A brief needs only a format preset (`vertical`, `square` or
+`landscape`), a list of media paths, and optionally a title, texts
+or audio. Ready-made starting briefs live in `examples/`:
+`brief-montage` (square photo montage), `brief-highlight`
+(landscape video highlights), `brief-announcement` (vertical
+announcement) and `brief-showcase` (square product-style showcase).
+Copy one, swap in your own media paths, and produce. A brief
+also accepts a `soundtrack` shortcut (a path, or a dict with
+volume/fades) and `sections` — titled groups of clips that each
+get an auto title card at the section's start. Image clips default to 3s, video clips default to their
+full duration, and later clips crossfade by default. The call
+validates, renders, and returns review frames from the finished
+video, so the producing agent reviews its own frames, patches what
+is wrong, and re-produces. For all three shapes at once, use
+`./run.sh produce-variants <brief.json> <dir>` (MCP tool
+`produce_variants`): vertical, square and landscape renders of
+the same brief, each with its own review frames and `qa` block.
+The produce result also carries a `qa` block:
+duration/resolution/pix_fmt checks plus black-frame and silence
+detection, reported as warnings (a silent image montage, for
+example, is reported as silent throughout rather than failing).
+AgentCut itself does not generate
+footage, voices or music: the producing agent supplies local media,
+and AgentCut turns it into a finished, checked video.
