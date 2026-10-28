@@ -1,3 +1,50 @@
+## 1.14.1 — 2026-10-28 (Loop 3, audit fix)
+- Fixed: a malformed MCP tools/call (missing required argument)
+  raised KeyError and killed the server. The serve loop now returns
+  a structured INVALID_SCHEMA error and stays alive; regression
+  test feeds a bad get_job call followed by ping.
+
+## 1.14.0 — 2026-10-28 (Loop 3)
+- Faster large-image handling: image clips are pre-scaled to output
+  size (2x for Ken Burns, cover/contain aware) before the main
+  filter graph, so xfade chains decode small files; a failed
+  pre-scale falls back to the original file. Kane montage render
+  13.5s -> 10.1s, same 720x1280 25.5s yuv420p output.
+
+## 1.13.0 — 2026-10-28 (Loop 3)
+- Caption styling: project fields caption_color, caption_size and
+  caption_position apply as defaults to every caption (list captions
+  and SRT cues) that does not set its own value; captions now honour
+  position instead of always sitting bottom-centre.
+
+## 1.12.0 — 2026-10-28 (Loop 3)
+- Loudness normalisation: audio tracks accept loudnorm (true/false),
+  single-pass EBU R128-style normalisation to -16 LUFS before mixing.
+
+## 1.11.0 — 2026-10-28 (Loop 3)
+- Per-clip filters: clips accept brightness (-1..1), contrast
+  (0..2), saturation (0..3) and grayscale (true/false), rendered
+  via eq after scaling, for video, image and Ken Burns clips alike.
+
+## 1.10.0 — 2026-10-28 (Loop 3)
+- Transition duration: clips may set transition_duration (default
+  0.5s for xfade transitions, 0.3s for fade, max 2.0s, must be less
+  than both clip durations); timeline math follows it.
+- Text fade: texts/captions accept fade_in/fade_out seconds (sum must
+  be less than the text duration), rendered via a drawtext alpha
+  expression.
+
+## 1.9.0 — 2026-10-28 (Loop 3)
+- Atomic render outputs: ffmpeg writes to a temp file in the output
+  directory and it is moved into place only on success, so a failed
+  render never leaves a partial file and never overwrites a previous
+  good output at that path.
+
+## 1.8.0 — 2026-10-28 (Loop 3)
+- Public-repo polish: clone/quickstart section in README, GitHub
+  Actions CI running the full test suite plus a basic render smoke
+  test on every push and pull request (local file only, not pushed).
+
 ## 1.7.0 — 2026-10-28
 - Robustness: image clips are now probed at validation (unreadable files and video files passed as stills are structured errors, not render crashes); images larger than 2560px on the long side are downscaled before the main scale so 8K photos do not blow up memory/time; dimensions must be real integers (booleans/floats rejected with a clear message); empty text overlays are rejected; corrupt-video probe errors say so. Tests 22/22 after an audit-caught fix: the still/video check first used ffprobe duration, which wrongly rejects JPEG photos (image2 probes JPEG at 0.04s, png_pipe probes PNG at N/A); it now checks the video codec instead, with a JPEG regression test, and the Kane montage re-verified.
 

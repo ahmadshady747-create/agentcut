@@ -250,24 +250,54 @@ def validate_project(project):
             errors.append(err("INVALID_SCHEMA", "ken_burns must be 'none', 'zoom_in', 'zoom_out', 'pan_left' or 'pan_right'", field="clips.ken_burns", clip_id=cid))
         elif kb != "none" and kind != "image":
             errors.append(err("INVALID_SCHEMA", "ken_burns is only for image clips", field="clips.ken_burns", clip_id=cid))
+        for fname, lo, hi in (("brightness", -1.0, 1.0), ("contrast", 0.0, 2.0), ("saturation", 0.0, 3.0)):
+            if fname in clip:
+                try:
+                    fval = float(clip[fname])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"clip {fname} must be a number", field=f"clips.{fname}", clip_id=cid))
+                    continue
+                if not lo <= fval <= hi:
+                    errors.append(err("INVALID_SCHEMA", f"clip {fname} must be {lo}..{hi}", field=f"clips.{fname}", clip_id=cid))
+        if "grayscale" in clip and not isinstance(clip["grayscale"], bool):
+            errors.append(err("INVALID_SCHEMA", "clip grayscale must be true or false", field="clips.grayscale", clip_id=cid))
         transition = clip.get("transition", "none")
         allowed = ["none", "fade"] + list(XFADE_TRANSITIONS)
         if transition not in allowed:
             errors.append(err("INVALID_SCHEMA", f"transition must be one of {', '.join(allowed)}", field="clips.transition", clip_id=cid))
         elif transition in XFADE_TRANSITIONS and len(resolved) == 1:
             errors.append(err("INVALID_SCHEMA", f"{transition} on the first clip has nothing to transition from", field="clips.transition", clip_id=cid))
-        elif transition in XFADE_TRANSITIONS and resolved and len(resolved) >= 2:
-            # xfade overlaps the previous clip by 0.5s; both sides need room
-            if duration <= 0.6 or prev_duration is None or prev_duration <= 0.6:
-                errors.append(err("INVALID_SCHEMA", f"{transition} needs both clips longer than 0.6s", field="clips.transition", clip_id=cid))
+        td = None
+        if "transition_duration" in clip:
+            try:
+                td = float(clip["transition_duration"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "transition_duration must be a number", field="clips.transition_duration", clip_id=cid))
+                td = None
+            if td is not None and (td <= 0 or td > 2.0):
+                errors.append(err("INVALID_SCHEMA", "transition_duration must be > 0 and <= 2.0 seconds", field="clips.transition_duration", clip_id=cid))
+        if transition in XFADE_TRANSITIONS and len(resolved) >= 2:
+            if td is None:
+                td = 0.5
+            if prev_duration is None or td >= duration or td >= prev_duration:
+                errors.append(err("INVALID_SCHEMA", f"{transition} transition_duration {td}s must be less than both clip durations", field="clips.transition_duration", clip_id=cid))
+        elif transition == "fade":
+            if td is None:
+                td = 0.3
+            if td >= duration:
+                errors.append(err("INVALID_SCHEMA", f"fade transition_duration {td}s must be less than the clip duration", field="clips.transition_duration", clip_id=cid))
+        else:
+            td = 0.0
+        if resolved:
+            resolved[-1]["transition_duration"] = td
         # start offset in the final timeline (after xfade overlaps)
         if len(resolved) >= 2 and transition in XFADE_TRANSITIONS:
-            clip_starts.append(clip_starts[-1] + prev_duration - 0.5)
+            clip_starts.append(clip_starts[-1] + prev_duration - td)
         elif resolved:
             clip_starts.append((clip_starts[-1] + prev_duration) if clip_starts else 0.0)
         prev_duration = duration
-    overlaps = sum(1 for c in resolved[1:] if c.get("transition") in XFADE_TRANSITIONS)
-    total = total - 0.5 * overlaps
+    overlap_total = sum(float(c.get("transition_duration", 0.5)) for c in resolved[1:] if c.get("transition") in XFADE_TRANSITIONS)
+    total = total - overlap_total
     if total > MAX_DURATION:
         errors.append(err("DURATION_TOO_LONG", f"total duration {total:.2f}s exceeds {MAX_DURATION}s", field="clips"))
     for label, items in (("texts", project.get("texts") or []), ("captions", project.get("captions") or [])):
@@ -289,6 +319,21 @@ def validate_project(project):
                 continue
             if start < 0 or end <= start or end > total + 0.05:
                 errors.append(err("CLIP_OUT_OF_RANGE", f"{label} range {start}..{end} outside timeline {total:.2f}s", field=label))
+            fi = fo = 0.0
+            for fname in ("fade_in", "fade_out"):
+                try:
+                    fval = float(item.get(fname, 0))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"{label} {fname} must be a number", field=label))
+                    fval = 0.0
+                if fval < 0:
+                    errors.append(err("INVALID_SCHEMA", f"{label} {fname} must be >= 0", field=label))
+                if fname == "fade_in":
+                    fi = fval
+                else:
+                    fo = fval
+            if fi + fo >= (end - start):
+                errors.append(err("INVALID_SCHEMA", f"{label} fade_in + fade_out must be less than the text duration", field=label))
             color = item.get("color", "white")
             if not (isinstance(color, str) and (color in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", color))):
                 errors.append(err("INVALID_SCHEMA", "text color must be a #RRGGBB hex value or one of: " + ", ".join(sorted(TEXT_COLORS)), field=label + ".color"))
@@ -297,7 +342,26 @@ def validate_project(project):
             position = item.get("position")
             if position is not None and position not in TEXT_POSITIONS:
                 errors.append(err("INVALID_SCHEMA", "text position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field=label + ".position"))
-    merged_captions = list(project.get("captions") or [])
+    # Project-level caption defaults: colour/size/position applied to
+    # every caption (list captions and SRT cues) that does not set its
+    # own value. SRT files carry no styling, so this is how SRT
+    # captions get styled.
+    caption_color = project.get("caption_color")
+    if caption_color is not None and not (isinstance(caption_color, str) and (caption_color in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", caption_color))):
+        errors.append(err("INVALID_SCHEMA", "caption_color must be a #RRGGBB hex value or a named colour", field="caption_color"))
+    caption_size = project.get("caption_size")
+    if caption_size is not None:
+        try:
+            caption_size = float(caption_size)
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "caption_size must be a number", field="caption_size"))
+            caption_size = None
+        if caption_size is not None and not 12 <= caption_size <= 120:
+            errors.append(err("INVALID_SCHEMA", "caption_size must be 12..120", field="caption_size"))
+    caption_position = project.get("caption_position")
+    if caption_position is not None and caption_position not in TEXT_POSITIONS:
+        errors.append(err("INVALID_SCHEMA", "caption_position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field="caption_position"))
+    merged_captions = [dict(c) if isinstance(c, dict) else c for c in (project.get("captions") or [])]
     captions_file = project.get("captions_file")
     if captions_file is not None:
         if not isinstance(captions_file, str) or not captions_file:
@@ -316,6 +380,15 @@ def validate_project(project):
                         if cue["start"] < 0 or cue["end"] > total + 0.05:
                             errors.append(err("CLIP_OUT_OF_RANGE", f"SRT cue {cue['start']}..{cue['end']} outside timeline {total:.2f}s", field="captions_file"))
                     merged_captions.extend(file_cues)
+    for _cap in merged_captions:
+        if not isinstance(_cap, dict):
+            continue
+        if caption_color is not None:
+            _cap.setdefault("color", caption_color)
+        if caption_size is not None:
+            _cap.setdefault("size", caption_size)
+        if caption_position is not None:
+            _cap.setdefault("position", caption_position)
     for track in project.get("audio") or []:
         if not isinstance(track, dict) or not isinstance(track.get("src"), str):
             errors.append(err("INVALID_SCHEMA", "each audio track needs a src path", field="audio"))
@@ -332,6 +405,8 @@ def validate_project(project):
             continue
         if vol < 0 or vol > 2:
             errors.append(err("INVALID_SCHEMA", "audio volume must be 0..2", field="audio.volume"))
+        if "loudnorm" in track and not isinstance(track["loudnorm"], bool):
+            errors.append(err("INVALID_SCHEMA", "audio loudnorm must be true or false", field="audio.loudnorm"))
         try:
             start = float(track.get("start", 0))
         except (TypeError, ValueError):

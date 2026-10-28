@@ -219,7 +219,15 @@ def serve():
             result = {"tools": TOOLS}
         elif method == "tools/call":
             params = req.get("params", {})
-            result = call_tool(params.get("name"), params.get("arguments") or {})
+            try:
+                result = call_tool(params.get("name"), params.get("arguments") or {})
+            except (KeyError, TypeError, AttributeError, ValueError) as exc:
+                # A malformed tool call (e.g. a missing required
+                # argument) must return a structured error, never kill
+                # the server with a traceback: the client may still
+                # have more calls to make, and the server is long-lived.
+                result = _tool_error({"code": "INVALID_SCHEMA",
+                                      "message": f"missing or invalid tool argument: {exc}"})
         elif method == "ping":
             result = {}
         else:

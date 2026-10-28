@@ -8,6 +8,21 @@ It is an original design. It is not a CapCut clone, it contains no CapCut
 code, assets, templates or effects, and it does not depend on CapCut in
 any way.
 
+## Clone and quickstart (public repo)
+
+```sh
+git clone https://github.com/ahmadshady747-create/agentcut.git
+cd agentcut
+./run.sh validate examples/basic.json
+./run.sh render examples/basic.json out.mp4   # 360x640, 8.0s, from the
+                                              # synthetic media in data/test_media/
+./run.sh serve                              # MCP server on stdio
+```
+
+A fresh clone needs only Python 3.10+ and `ffmpeg`/`ffprobe` on PATH;
+there are no Python dependencies. The test suite runs in CI on every
+push and pull request (`.github/workflows/test.yml`).
+
 ## Run it
 
 ```sh
@@ -118,12 +133,20 @@ See `VERSION`. Changelog entries live in `STATE.md` round log.
 
 Crop-fill: a clip may set `fit` to `contain` (default, pad with black bars) or `cover` (scale up and centre-crop to fill the frame). Ken Burns implies cover.
 
-Transitions: `none`, `fade` (to/from black), and xfade transitions with 0.5s overlap and acrossfaded audio: `crossfade`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `slide_left`, `slide_right`, `slide_up`, `slide_down`.
+Transitions: `none`, `fade` (to/from black), and xfade transitions with acrossfaded audio (default 0.5s overlap; set `transition_duration` per incoming clip, max 2.0s, less than both clip durations): `crossfade`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `slide_left`, `slide_right`, `slide_up`, `slide_down`.
 
-Text styling: texts/captions accept `color` (#RRGGBB or a named colour) and `box` (true/false); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y.
+Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y.
+
+Loudness: audio tracks accept `loudnorm` (true/false), single-pass normalisation to -16 LUFS before mixing.
 
 Audio fades: tracks accept `fade_in`/`fade_out` in seconds (sum must be less than the timeline). Clip speed: video clips accept `speed` 0.25..4.0; effective duration is trim duration divided by speed.
 
+Per-clip filters: a clip may set `brightness` (-1..1), `contrast` (0..2), `saturation` (0..3) or `grayscale` (true/false).
+
+Caption styling: project fields `caption_color`, `caption_size` and `caption_position` are defaults for every caption (including SRT cues, which carry no styling of their own); a caption that sets its own value keeps it.
+
 Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution frame (default: middle of the timeline), or the `poster_frame` MCP tool.
+
+Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
 
 Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale.

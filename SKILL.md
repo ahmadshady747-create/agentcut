@@ -36,17 +36,29 @@ failure is a JSON object with `code` and `message`.
 - `output`: width 16..1920, height 16..1920, fps 1..60.
 - `clips`: non-empty, sequential. Video clips need `trim_in` and
   `trim_out` inside the source duration. Image clips need `duration`.
-  `transition` is `none`, `fade` (fade to/from black, 0.3s), or
-  `crossfade` (true xfade/acrossfade, 0.5s overlap; both clips must be
-  longer than 0.6s; text times are final-timeline coordinates).
+  `transition` is `none`, `fade` (fade to/from black), or an xfade
+  transition (`crossfade`, `wipe_*`, `slide_*`; overlap defaults to
+  0.5s, set `transition_duration` per incoming clip, max 2.0s, less
+  than both clip durations; text times are final-timeline
+  coordinates after overlaps).
 - `texts`: overlays with `text`, `start`, `end`, `size`, `x`
-  (pixel number or `center`), `y` (pixels).
-- `captions`: like texts, but always centred near the bottom.
+  (pixel number or `center`), `y` (pixels), optional `color`,
+  `box`, `position` preset, `fade_in`/`fade_out` seconds.
+- `captions`: like texts, but centred near the bottom by default.
   `captions_file` points at an SRT file whose cues are appended
-  to `captions` and validated against the timeline.
+  to `captions` and validated against the timeline. Project fields
+  `caption_color`, `caption_size`, `caption_position` are defaults
+  for every caption that does not set its own value.
 - `audio`: `kind` `voice` or `music`, `volume` 0..2, optional
-  `start` in seconds (default 0, must be before the timeline end).
-  Music is ducked to 30% of its volume when any voice track exists.
+  `start` in seconds (default 0, must be before the timeline end),
+  `fade_in`/`fade_out`, `loudnorm` (true/false, single-pass -16 LUFS).
+  When voice and music are both present, music is ducked with a real
+  sidechain compressor keyed off the voice mix.
+- Clips accept `brightness` (-1..1), `contrast` (0..2), `saturation`
+  (0..3), `grayscale` (true/false). Renders are atomic: a failed
+  render never leaves a partial file or overwrites a previous good
+  output. Image clips are pre-scaled to output size before the main
+  filter graph.
 - Total duration at most 600 seconds. All `src` paths are local files.
 
 ## Patching

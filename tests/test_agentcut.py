@@ -1,6 +1,7 @@
 """AgentCut tests: validation, real renders, preview, failure cases."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -408,6 +409,194 @@ class TestAgentCut(unittest.TestCase):
         self.assertTrue(ok, info)
         probe = ffprobe(out)
         self.assertAlmostEqual(float(probe["format"]["duration"]), 1.0, delta=0.5)
+
+    def test_atomic_render_failure_preserves_existing(self):
+        import subprocess as _sp
+        from unittest import mock
+        from agentcut.render import render_project as _rp
+        out = os.path.join(BASE, "data", "test_atomic.mp4")
+        with open(out, "wb") as fh:
+            fh.write(b"previous good output")
+        real_run = _sp.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "ffmpeg" and "-filter_complex" in cmd:
+                return _sp.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+            return real_run(cmd, **kwargs)
+
+        project = {
+            "id": "atomic", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [{"id": "i1", "kind": "image", "src": "data/test_media/poster.png", "duration": 1}],
+        }
+        with mock.patch("agentcut.render.subprocess.run", side_effect=_fake_run):
+            ok, info = _rp(project, out)
+        self.assertFalse(ok)
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(), b"previous good output")
+        leftovers = [f for f in os.listdir(os.path.join(BASE, "data"))
+                     if f.startswith(".agentcut-tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_transition_duration_and_text_fade(self):
+        import subprocess as _sp
+        project = {
+            "id": "tdur", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [
+                {"id": "v1", "kind": "video", "src": "data/test_media/clip1.mp4", "trim_in": 0, "trim_out": 3},
+                {"id": "v2", "kind": "video", "src": "data/test_media/clip2.mp4", "trim_in": 0, "trim_out": 3,
+                 "transition": "crossfade", "transition_duration": 1.0},
+            ],
+        }
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 5.0, places=2)
+        out = os.path.join(BASE, "data", "test_tdur.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 5.0, delta=0.5)
+        # Text fade: a fading text must change pixels between mid-fade
+        # and full opacity, and an over-long fade must be rejected.
+        tproject = {
+            "id": "tfade", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [{"id": "i1", "kind": "image", "src": "data/test_media/poster.png", "duration": 3}],
+            "texts": [{"text": "FADING TEXT HERE", "start": 0.2, "end": 2.8, "size": 64,
+                       "x": "center", "y": 300, "fade_in": 1.0, "fade_out": 1.0}],
+        }
+        errors, _ = validate_project(tproject)
+        self.assertEqual(errors, [])
+        tout = os.path.join(BASE, "data", "test_tfade.mp4")
+        ok, info = render_project(tproject, tout)
+        self.assertTrue(ok, info)
+        frames = []
+        for k, t in enumerate((0.7, 1.5)):
+            fp = os.path.join(BASE, "data", f"test_tfade_{k}.png")
+            _sp.run(["ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", tout,
+                     "-frames:v", "1", fp], capture_output=True, timeout=60)
+            with open(fp, "rb") as fh:
+                frames.append(fh.read())
+        self.assertNotEqual(frames[0], frames[1])
+        bad = dict(tproject)
+        bad["texts"] = [{"text": "X", "start": 0, "end": 1, "fade_in": 0.6, "fade_out": 0.6}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+
+    def test_per_clip_filters(self):
+        import subprocess as _sp
+        base = {
+            "id": "filt", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [{"id": "i1", "kind": "image", "src": "data/test_media/poster.png", "duration": 2}],
+        }
+        filt = dict(base)
+        filt["clips"] = [dict(base["clips"][0], grayscale=True, brightness=-0.3)]
+        errors, _ = validate_project(filt)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_filt.mp4")
+        ok, info = render_project(filt, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 2.0, delta=0.5)
+        # Grayscale of the blue poster must differ from the plain frame.
+        plain = os.path.join(BASE, "data", "test_plain.mp4")
+        ok, _ = render_project(base, plain)
+        self.assertTrue(ok)
+        frames = []
+        for src, k in ((plain, 0), (out, 1)):
+            fp = os.path.join(BASE, "data", f"test_filt_{k}.png")
+            _sp.run(["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", src,
+                     "-frames:v", "1", fp], capture_output=True, timeout=60)
+            with open(fp, "rb") as fh:
+                frames.append(fh.read())
+        self.assertNotEqual(frames[0], frames[1])
+        bad = dict(base)
+        bad["clips"] = [dict(base["clips"][0], brightness=2.0)]
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+
+    def test_loudnorm_track(self):
+        project = {
+            "id": "loud", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [{"id": "v1", "kind": "video", "src": "data/test_media/clip1.mp4", "trim_in": 0, "trim_out": 3}],
+            "audio": [{"src": "data/test_media/clip1.mp4", "kind": "music", "volume": 1.0, "loudnorm": True}],
+        }
+        errors, _ = validate_project(project)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_loud.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertIn("audio", {st["codec_type"] for st in probe["streams"]})
+        bad = dict(project)
+        bad["audio"] = [{"src": "data/test_media/clip1.mp4", "kind": "music", "loudnorm": "yes"}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+
+    def test_caption_styling(self):
+        with open(os.path.join(BASE, "examples", "srt.json")) as fh:
+            project = json.load(fh)
+        project["caption_color"] = "yellow"
+        project["caption_size"] = 48
+        project["caption_position"] = "top_center"
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [])
+        self.assertTrue(info["captions"])
+        self.assertEqual(info["captions"][0]["color"], "yellow")
+        self.assertEqual(info["captions"][0]["size"], 48)
+        self.assertEqual(info["captions"][0]["position"], "top_center")
+        out = os.path.join(BASE, "data", "test_srt_style.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 8.0, delta=0.5)
+        bad = dict(project)
+        bad["caption_color"] = "notacolor"
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+
+    def test_prescaled_large_image(self):
+        import subprocess as _sp
+        import tempfile as _tf
+        tmpdir = _tf.mkdtemp(prefix="agentcut-large-")
+        large = os.path.join(tmpdir, "large.png")
+        _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "color=c=blue:s=4000x3000", "-frames:v", "1", large],
+                capture_output=True, timeout=120)
+        project = {
+            "id": "large", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 24},
+            "clips": [{"id": "i1", "kind": "image", "src": large, "duration": 2, "fit": "cover"}],
+        }
+        errors, _ = validate_project(project)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_large.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 2.0, delta=0.5)
+        video = [st for st in probe["streams"] if st["codec_type"] == "video"][0]
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_server_survives_bad_tool_call(self):
+        import subprocess as _sp
+        lines = [
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}',
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_job","arguments":{"job_id":"wrong-key"}}}',
+            '{"jsonrpc":"2.0","id":3,"method":"ping"}',
+        ]
+        proc = _sp.run([sys.executable, "-m", "agentcut", "serve"],
+                       input="\n".join(lines) + "\n", capture_output=True, text=True,
+                       cwd=BASE, env={**os.environ, "PYTHONPATH": os.path.join(BASE, "src")},
+                       timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
+        self.assertIn('"id": 3', proc.stdout)
+        self.assertIn("INVALID_SCHEMA", proc.stdout)
 
     def test_probe_media(self):
         info = probe_media(os.path.join(BASE, "data", "test_media", "clip1.mp4"))
