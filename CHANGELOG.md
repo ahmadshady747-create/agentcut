@@ -1,3 +1,9 @@
+## 1.20.1 — 2026-10-28
+- Licence: AgentCut is now licensed under the Business Source License
+  1.1 (see LICENSE). Licensor Ahmad Mohammad; Change Date 2030-10-28;
+  Change License Apache License, Version 2.0; production use is
+  permitted except for a competing agent-first video editor service.
+
 ## 1.20.0 — 2026-10-28
 - Multi-format export: produce_variants renders one brief as
   vertical, square and landscape in one call (MCP tool

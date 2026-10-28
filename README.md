@@ -185,3 +185,12 @@ example, is reported as silent throughout rather than failing).
 AgentCut itself does not generate
 footage, voices or music: the producing agent supplies local media,
 and AgentCut turns it into a finished, checked video.
+
+## Licence
+
+AgentCut is licensed under the Business Source License 1.1 — see
+[LICENSE](LICENSE). In short: you may copy, modify and use it,
+including in production, except to provide a competing agent-first
+video editor service to third parties. On the Change Date
+(2030-10-28) this version converts to the Apache License, Version
+2.0. BSL 1.1 is not an Open Source licence.
