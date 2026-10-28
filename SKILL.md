@@ -159,3 +159,56 @@ the only source of truth it edits.
    audio streams, `yuv420p`. Only then deliver the MP4, with
    its duration, size and format. Do not deliver a video you
    have not frame-checked in its final form.
+
+## Overlays
+
+Use `overlays` for picture-in-picture: a second visual track above
+the main timeline. Give each overlay an id, kind, src, start and
+duration that fit inside the timeline, a size fraction, and a
+position or x/y. Check the render's frames at a second inside the
+overlay window to confirm placement; if validation reports an
+overlay error, follow its `fix` hint.
+
+## Overlay keyframes
+
+Animate an overlay with `keyframes` (time relative to the overlay
+start, plus x, y, scale or opacity). At least 2 keyframes, times
+strictly increasing, inside the overlay duration. Verify motion
+by extracting frames at two times inside the animation and
+checking the overlay's position, size or opacity in each.
+
+## Split, reverse, freeze, loop
+
+For a video clip, `reverse` plays it backwards, `freeze_at`
+holds one frame, and `loop_count` repeats the trimmed segment.
+Split a clip with the split_clip tool (project + clip id +
+seconds into the clip's rendered duration); the returned
+project has two clips in place of one and the same total
+duration. Verify a freeze by comparing frames at two times,
+a reverse by reversing twice and comparing with the original.
+
+## Agent experiment loop (safe patches)
+
+AgentCut is deterministic execution and verification; you, the
+agent, supply the intelligence. Work in this loop:
+
+1. Summarise first: call timeline_summary on the project
+   instead of re-reading the whole JSON.
+2. Snapshot before experimenting: snapshot_project, with a
+   label such as "before-title-change".
+3. Patch (patch_project validates before saving, so a bad
+   patch never corrupts the stored project), then preview or
+   render and review the frames and the qa warnings.
+4. If the result is worse, rollback_project to the snapshot
+   and try a different patch. The snapshot is kept, so
+   rollback is repeatable.
+5. For a produce brief, read the conformance block in the
+   produce result: it checks clips used, title present,
+   format, duration within target_duration, captions and
+   audio. A failed check tells you exactly what to fix in
+   the brief; do not deliver a video whose conformance
+   failed without saying so.
+
+Never ask AgentCut to generate, transcribe or synthesise:
+supply SRT captions, audio and media as local files, and let
+AgentCut edit and verify them.

@@ -12,15 +12,16 @@ import os
 import re
 import sys
 
-from .render import JobStore, poster_frame, preview_project, produce_variants, produce_video, render_project
+from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_variants, produce_video, render_project, split_clip, timeline_summary
 from .validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA = os.path.join(BASE, "data")
 PROJECTS = os.path.join(DATA, "projects")
+SNAPSHOTS = os.path.join(DATA, "snapshots")
 JOBS_DIR = os.path.join(DATA, "jobs")
 OUTPUTS = os.path.join(DATA, "outputs")
-for _d in (PROJECTS, JOBS_DIR, OUTPUTS):
+for _d in (PROJECTS, JOBS_DIR, OUTPUTS, SNAPSHOTS):
     os.makedirs(_d, exist_ok=True)
 
 JOBS = JobStore(JOBS_DIR)
@@ -46,6 +47,16 @@ def _load_project(pid):
         return None
     with open(path) as fh:
         return json.load(fh)
+
+
+def _snapshot_dir(pid):
+    d = os.path.join(SNAPSHOTS, pid)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _snapshot_path(pid, sid):
+    return os.path.join(_snapshot_dir(pid), f"{sid}.json")
 
 
 def _text(payload):
@@ -108,6 +119,35 @@ TOOLS = [
          "brief": {"type": "object"},
          "output_dir": {"type": "string"}},
          "required": ["brief", "output_dir"]}},
+    {"name": "split_clip",
+     "description": "Split one clip of a project dict into two at a time in seconds into that clip's rendered duration. Returns the new project dict; store it with create_project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "object"}, "clip_id": {"type": "string"},
+         "at": {"type": "number"}},
+         "required": ["project", "clip_id", "at"]}},
+    {"name": "timeline_summary",
+     "description": "Summarize a project timeline for agent reasoning: segments with start/end/kind/transition, texts, captions, audio tracks, overlays. Validates first; returns errors if invalid.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "object"}}, "required": ["project"]}},
+    {"name": "check_brief",
+     "description": "Check a produced project against its brief: clips used, title present, format, duration within target_duration, captions present, audio present. Deterministic verification only; generates nothing.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "object"}, "brief": {"type": "object"}},
+         "required": ["project", "brief"]}},
+    {"name": "snapshot_project",
+     "description": "Snapshot a stored project before experimenting: returns a snapshot id. Patch freely afterwards; rollback_project restores the snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "label": {"type": "string"}},
+         "required": ["id"]}},
+    {"name": "rollback_project",
+     "description": "Restore a stored project from one of its snapshots, discarding later patches. The snapshot itself is kept, so rollback is repeatable.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "snapshot_id": {"type": "string"}},
+         "required": ["id", "snapshot_id"]}},
+    {"name": "list_snapshots",
+     "description": "List snapshot ids for a stored project.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}}, "required": ["id"]}},
     {"name": "get_job",
      "description": "Poll a render or preview job by id.",
      "inputSchema": {"type": "object", "properties": {
@@ -201,6 +241,47 @@ def call_tool(name, args):
         info = dict(info)
         info.pop("project", None)
         return _text(info)
+    if name == "split_clip":
+        ok, info = split_clip(args["project"], args["clip_id"], args["at"])
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "timeline_summary":
+        ok, info = timeline_summary(args["project"])
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "check_brief":
+        return _text(check_brief_conformance(args["brief"], args["project"]))
+    if name == "snapshot_project":
+        project = _load_project(args["id"])
+        if project is None:
+            return _tool_error({"code": "PROJECT_NOT_FOUND", "message": args["id"]})
+        label = args.get("label")
+        if label and not _ID_RE.match(label):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "snapshot label must match [A-Za-z0-9_-]+"})
+        import uuid as _uuid
+        sid = label or _uuid.uuid4().hex[:12]
+        with open(_snapshot_path(args["id"], sid), "w") as fh:
+            json.dump(project, fh, indent=2)
+        return _text({"id": args["id"], "snapshot_id": sid, "saved": True})
+    if name == "rollback_project":
+        path = _snapshot_path(args["id"], args["snapshot_id"])
+        if not os.path.isfile(path):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": f"no snapshot {args['snapshot_id']} for project {args['id']}"})
+        with open(path) as fh:
+            project = json.load(fh)
+        errors, _info = validate_project(project)
+        if errors:
+            return _tool_error({"code": "INVALID_PROJECT", "errors": errors})
+        bad = _save_project(project)
+        if bad:
+            return _tool_error(bad)
+        return _text({"id": args["id"], "snapshot_id": args["snapshot_id"], "restored": True})
+    if name == "list_snapshots":
+        d = _snapshot_dir(args["id"])
+        ids = sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
+        return _text({"id": args["id"], "snapshots": ids})
     if name == "get_job":
         record = JOBS.get(args["id"])
         if record is None:

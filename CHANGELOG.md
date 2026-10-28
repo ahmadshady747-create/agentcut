@@ -1,3 +1,135 @@
+## 1.29.0 — Loop 5 integration round (agent depth, no in-tool AI)
+- Agent = intelligence, AgentCut = deterministic execution +
+  verification. Nothing in this round generates, recognises or
+  synthesises anything: no speech recognition, no TTS, no
+  generative media, no model downloads, no network AI services.
+  The agent supplies plans, SRT, audio and media as local files.
+- New: timeline_summary — segments with start/end/kind/
+  transition, texts, captions, audio, overlays — for agent
+  reasoning without re-reading a project. MCP tool
+  timeline_summary + CLI ./run.sh summary.
+- New: brief-conformance checking — clips used, title present,
+  format, duration within target_duration, captions present,
+  audio present. Produce results now carry a `conformance`
+  block; standalone MCP tool check_brief for hand-built
+  projects. Briefs may also set target_duration and overlays.
+- New: versioned snapshots — MCP tools snapshot_project,
+  rollback_project, list_snapshots. The experiment loop is:
+  snapshot, patch, preview/render, roll back on a bad result,
+  retry. patch_project already validates before saving, so a
+  failed patch never corrupts the stored project.
+- Produce feedback extended: produce results carry an overlay
+  summary (placement, keyframe count) and QA warnings for
+  invisible (opacity 0) or frame-dominating (size >= 0.9)
+  overlays, instead of failing silently.
+- New-feature validation errors carry field + clip id + a
+  concrete `fix` hint, audited by a test battery.
+
+## 1.28.0 — Loop 5 round 8 (3840 export, stabilisation)
+- Export cap raised: output width/height now 16..3840 (was
+  16..1920); the large-image guard rises with the output size
+  so a 3840 export does not throw away detail. Verified with a
+  real 3840x2160 yuv420p render.
+- New video clip `stabilize` (true/false): real two-pass
+  vidstab — a detect pass at the clip's final scale writes a
+  transform file, and the main render transforms with it. A
+  failed detect fails the render rather than silently shipping
+  an unstabilized clip. Stabilize does not combine with
+  freeze_at, loop_count, reverse, speed_curve, speed or fit
+  blur (rejected with a fix), because stabilisation needs the
+  clip's original frame order and timing.
+
+## 1.27.0 — Loop 5 round 7 (animated text, stroke)
+- New text fields: `animation` slide_in (from the left),
+  slide_out (to the right), slide_in_out, or pop (fontsize grows
+  from half size), plus `animation_duration` (default 1.0s, must
+  fit the text window; slide_in_out needs less than half).
+  Slide uses drawtext x with main-timeline time t; pop uses a
+  per-frame fontsize expression — both verified against this
+  FFmpeg build (fontsize expressions need quoting, fixed
+  in-round).
+- New text fields: `stroke` (outline width 0..10) and
+  `stroke_color` (named colour or #RRGGBB, default black) via
+  drawtext borderw/bordercolor.
+
+## 1.26.0 — Loop 5 round 6 (speed curves, audio denoise)
+- New: video clip `speed_curve` — segments with start, end and
+  speed that partition the trimmed source range (first start =
+  trim_in, last end = trim_out, contiguous, speeds 0.25..4.0).
+  Each segment is trimmed, retimed and concatenated; the clip
+  duration is the sum of segment durations divided by speed.
+  Speed curves do not combine with speed, freeze_at, loop_count,
+  reverse or fit blur (rejected with fixes). split_clip maps a
+  rendered split time back through the curve and splits the
+  curve itself, preserving the total.
+- New: `denoise` (true/false) on video clips and audio tracks —
+  FFmpeg afftdn FFT noise reduction on that audio.
+
+## 1.25.0 — Loop 5 round 5 (more transitions and effects)
+- New transitions (all plain FFmpeg xfade names, verified in this
+  build): dissolve, fade_black, fade_white, pixelize, radial,
+  circle_open, circle_close, smooth_left/right/up/down,
+  diag_tl/tr/bl/br, cover_left/right/up/down,
+  reveal_left/right/up/down, distance, rect_crop. They overlap
+  like crossfade and take transition_duration.
+- New per-clip and per-overlay effects under generic names:
+  blur (gblur sigma 0..20), sharpen (unsharp 0..5), vignette
+  (true/false), hue (degrees -180..180), pixelize (block size
+  2..64). Ranges are validated with a fix hint.
+
+## 1.24.0 — Loop 5 round 4 (chroma key, masks, blurred fit)
+- New: `chroma_key` on clips and overlays (colour name or
+  #RRGGBB, plus chroma_similarity/chroma_blend): the keyed colour
+  becomes transparent — over black for main clips, over the main
+  timeline for overlays.
+- New: `mask_shape` rect (mask_x/mask_y/mask_w/mask_h) or circle
+  (mask_x/mask_y centre, mask_r radius), plus mask_feather for a
+  soft edge. Masked main clips composite over black; mask
+  coordinates are frame pixels (output frame for clips, overlay
+  frame for overlays). Mask does not preserve chroma-key
+  transparency on one overlay (this FFmpeg build's geq has no
+  a(X,Y) function, verified), so avoid mask + chroma_key on one
+  overlay; mask + scale keyframes is rejected with a fix.
+- New: clip `fit: "blur"` — blurred, darkened background filling
+  the frame with the clip contained centred on top, for
+  mismatched aspect ratios. Ken Burns + blur and blur + chroma
+  are rejected with fixes. Blur clips skip the prescale step so
+  the background is not baked from a padded image.
+
+## 1.23.0 — Loop 5 round 3 (split / reverse / freeze / loop)
+- New clip fields for video clips: `reverse` (play backwards,
+  video + audio), `freeze_at` (hold the frame at that second for
+  the whole trim duration, silent), `loop_count` 2..8 (repeat the
+  trimmed segment, video + audio). Mutually exclusive combinations
+  are rejected with a `fix` hint.
+- New `split_clip`: split one clip into two at a time inside its
+  rendered duration (first part keeps the incoming transition,
+  second part continues with none, timeline total unchanged).
+  MCP tool split_clip (now 13 tools) + CLI ./run.sh split.
+  Splitting a clip with loop_count or reverse is rejected with a
+  fix, rather than silently producing a wrong split.
+
+## 1.22.0 — Loop 5 round 2 (overlay keyframes)
+- New: overlay `keyframes` animate position (x/y pixels, smooth
+  linear interpolation in main-timeline time), opacity (smooth via
+  geq alpha) and scale over time. Scale keyframes split the overlay
+  into <=0.5s fixed-scale segments, because FFmpeg crop/scale
+  dimensions are fixed at filter configuration time; position stays
+  smooth across segments. Keyframe times are relative to the
+  overlay start, missing fields inherit the previous keyframe or
+  the overlay base value, and errors carry a `fix` hint. Scale
+  keyframes on a looping video overlay are rejected with a fix
+  (shorten it, or drop scale keyframes).
+
+## 1.21.0 — Loop 5 round 1 (overlays)
+- New: project `overlays` — picture-in-picture video/image tracks
+  above the main timeline, with start, duration, size (fraction of
+  output width), position preset or x/y pixels, and opacity. Video
+  overlays loop when shown longer than their trimmed source.
+  Overlay audio is not mixed in v1; sound comes from project audio
+  tracks. Overlay errors carry a concrete `fix` hint.
+- Example: examples/overlay.json.
+
 ## 1.20.1 — 2026-10-28
 - Licence: AgentCut is now licensed under the Business Source License
   1.1 (see LICENSE). Licensor Ahmad Mohammad; Change Date 2030-10-28;

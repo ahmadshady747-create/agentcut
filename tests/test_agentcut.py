@@ -14,6 +14,15 @@ from agentcut.validate import probe_media, validate_project
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+
+def _crop_mean(path, t, x, y, w, h):
+    cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+           "-vf", f"crop={w}:{h}:{x}:{y}", "-frames:v", "1",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    data = subprocess.run(cmd, capture_output=True).stdout
+    n = len(data) // 3
+    return tuple(sum(data[i] for i in range(k, len(data), 3)) / n for k in range(3))
+
 def example():
     with open(os.path.join(BASE, "examples", "basic.json")) as fh:
         return json.load(fh)
@@ -269,7 +278,10 @@ class TestAgentCut(unittest.TestCase):
         errors, _ = validate_project(bad)
         self.assertTrue(any(e["code"] == "INVALID_SCHEMA" for e in errors))
         bad2 = json.loads(json.dumps(project))
-        bad2["clips"][1]["transition"] = "dissolve"
+        # "dissolve" used to be the invalid example here; since
+        # Loop 5 round 5 it is a real transition, so the invalid
+        # example is now a name no FFmpeg xfade transition has.
+        bad2["clips"][1]["transition"] = "sparkle_burst"
         errors, _ = validate_project(bad2)
         self.assertTrue(any(e["code"] == "INVALID_SCHEMA" for e in errors))
 
@@ -723,6 +735,493 @@ class TestAgentCut(unittest.TestCase):
             self.assertAlmostEqual(v["duration"], 5.0, delta=0.5)
             self.assertEqual(v["pix_fmt"], "yuv420p")
             self.assertTrue(os.path.isfile(v["output"]))
+
+    def test_overlay_image_renders_on_timeline(self):
+        # Solid red overlay, generated in-test so its presence in a
+        # frame is unambiguous (pure red where the base frame is black).
+        red = os.path.join(BASE, "data", "test_red.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=200x200", "-frames:v", "1", red],
+                       check=True)
+        base = {"id": "ov-base", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video",
+                           "src": "data/test_media/clip1.mp4",
+                           "trim_in": 0, "trim_out": 5}]}
+        project = dict(base)
+        project["id"] = "ov-test"
+        project["overlays"] = [{"id": "pip", "kind": "image", "src": red,
+                                "start": 2.0, "duration": 2.0, "size": 0.5,
+                                "position": "bottom_right"}]
+        errors, _ = validate_project(project)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_overlay.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 5.0, delta=0.5)
+
+        def crop_mean(t):
+            cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", out,
+                   "-vf", "crop=180:180:160:440", "-frames:v", "1",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            data = subprocess.run(cmd, capture_output=True).stdout
+            n = len(data) // 3
+            return tuple(sum(data[i] for i in range(k, len(data), 3)) / n
+                         for k in range(3))
+        r, g, b = crop_mean(3.0)
+        self.assertGreater(r, 200)
+        self.assertLess(g, 80)
+        self.assertLess(b, 80)
+        r0, _, _ = crop_mean(1.0)
+        self.assertLess(r0, 80)  # overlay not on screen before its start
+
+    def test_overlay_video_renders_and_errors_carry_fix(self):
+        project = {"id": "ov-video", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 24},
+                   "clips": [{"id": "a", "kind": "video",
+                              "src": "data/test_media/clip1.mp4",
+                              "trim_in": 0, "trim_out": 5}],
+                   "overlays": [{"id": "pip", "kind": "video",
+                                 "src": "data/test_media/clip2.mp4",
+                                 "trim_in": 0, "trim_out": 2,
+                                 "start": 1.0, "duration": 2.0,
+                                 "size": 0.4, "opacity": 0.8}]}
+        errors, _ = validate_project(project)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_overlay_video.mp4")
+        ok, info = render_project(project, out)
+        self.assertTrue(ok, info)
+        bad = dict(project)
+        bad["overlays"] = [{"id": "pip", "kind": "image",
+                            "src": "data/test_media/poster.png",
+                            "start": 99, "duration": 1.0}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e["code"] == "CLIP_OUT_OF_RANGE" for e in errors))
+        self.assertTrue(all("fix" in e for e in errors if e["code"] == "CLIP_OUT_OF_RANGE"))
+
+    def test_overlay_keyframes_position_opacity_scale(self):
+        red = os.path.join(BASE, "data", "test_red.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=200x200", "-frames:v", "1", red],
+                       check=True)
+        clips = [{"id": "a", "kind": "video",
+                  "src": "data/test_media/clip1.mp4",
+                  "trim_in": 0, "trim_out": 5}]
+
+        def render(ov, name):
+            project = {"id": name, "version": 1,
+                       "output": {"width": 360, "height": 640, "fps": 24},
+                       "clips": clips, "overlays": [ov]}
+            errors, _ = validate_project(project)
+            self.assertEqual(errors, [])
+            out = os.path.join(BASE, "data", name + ".mp4")
+            ok, info = render_project(project, out)
+            self.assertTrue(ok, info)
+            return out
+
+        # Position: x 0 -> 200 over 0..2s, y 0.
+        out = render({"id": "p", "kind": "image", "src": red, "start": 0,
+                      "duration": 4, "size": 0.25,
+                      "keyframes": [{"time": 0, "x": 0, "y": 0},
+                                    {"time": 2, "x": 200, "y": 0}]}, "test_kf_pos")
+        self.assertGreater(_crop_mean(out, 0.5, 60, 10, 10, 10)[0], 200)
+        self.assertLess(_crop_mean(out, 0.5, 210, 10, 10, 10)[0], 80)
+        self.assertLess(_crop_mean(out, 3.0, 60, 10, 10, 10)[0], 80)
+        self.assertGreater(_crop_mean(out, 3.0, 210, 10, 10, 10)[0], 200)
+        # Opacity: 0.2 -> 1.0 over 0..2s, top-left, fully inside crop.
+        out = render({"id": "o", "kind": "image", "src": red, "start": 0,
+                      "duration": 3, "size": 0.5, "position": "top_left",
+                      "keyframes": [{"time": 0, "opacity": 0.2},
+                                    {"time": 2, "opacity": 1.0}]}, "test_kf_op")
+        self.assertGreater(_crop_mean(out, 0.25, 30, 30, 50, 50)[0], 40)
+        self.assertLess(_crop_mean(out, 0.25, 30, 30, 50, 50)[0], 120)
+        self.assertGreater(_crop_mean(out, 2.5, 30, 30, 50, 50)[0], 200)
+        # Scale: 0.25 -> 0.5 over 0..2s, top-left (base x/y 20,20).
+        out = render({"id": "s", "kind": "image", "src": red, "start": 0,
+                      "duration": 3, "size": 0.25, "position": "top_left",
+                      "keyframes": [{"time": 0, "scale": 0.25},
+                                    {"time": 2, "scale": 0.5}]}, "test_kf_scale")
+        self.assertGreater(_crop_mean(out, 0.5, 100, 30, 10, 10)[0], 200)
+        self.assertLess(_crop_mean(out, 0.5, 150, 30, 10, 10)[0], 80)
+        self.assertGreater(_crop_mean(out, 2.5, 150, 30, 10, 10)[0], 200)
+        # Bad keyframe time carries a fix hint.
+        bad = {"id": "bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 24},
+               "clips": clips,
+               "overlays": [{"id": "p", "kind": "image", "src": red,
+                             "start": 0, "duration": 2,
+                             "keyframes": [{"time": 0, "x": 0},
+                                           {"time": 99, "x": 100}]}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e["code"] == "CLIP_OUT_OF_RANGE" for e in errors))
+        self.assertTrue(all("fix" in e for e in errors))
+
+    def test_reverse_freeze_loop_and_split(self):
+        clips = [{"id": "a", "kind": "video",
+                  "src": "data/test_media/clip1.mp4",
+                  "trim_in": 0, "trim_out": 5}]
+
+        def render(project, name):
+            out = os.path.join(BASE, "data", name + ".mp4")
+            ok, info = render_project(project, out)
+            self.assertTrue(ok, info)
+            return out
+
+        def psnr(a, b):
+            import re
+            out = subprocess.run(["ffmpeg", "-i", a, "-i", b,
+                                  "-filter_complex", "[0:v][1:v]psnr",
+                                  "-f", "null", "-"],
+                                 capture_output=True, text=True)
+            m = re.search(r"average:\s*(inf|[0-9.]+)", out.stderr)
+            return 999.0 if m and m.group(1) == "inf" else float(m.group(1))
+
+        def frame(mp4, t, name):
+            out = os.path.join(BASE, "data", name)
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(t),
+                            "-i", mp4, "-frames:v", "1", out], check=True)
+            return out
+        base = {"id": "rfl-base", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": clips}
+        base_out = render(base, "test_rfl_base")
+        # Loop: 5s clip x2 = 10s.
+        looped = dict(base); looped["id"] = "rfl-loop"
+        looped["clips"] = [{**clips[0], "loop_count": 2}]
+        errors, info = validate_project(looped)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 10.0, places=2)
+        loop_out = render(looped, "test_rfl_loop")
+        self.assertAlmostEqual(float(ffprobe(loop_out)["format"]["duration"]), 10.0, delta=0.5)
+        # Freeze: every frame equals the frame at freeze_at.
+        frozen = dict(base); frozen["id"] = "rfl-freeze"
+        frozen["clips"] = [{**clips[0], "freeze_at": 2.0}]
+        freeze_out = render(frozen, "test_rfl_freeze")
+        f1 = frame(freeze_out, 0.5, "fz05.png")
+        f2 = frame(freeze_out, 3.5, "fz35.png")
+        self.assertGreater(psnr(f1, f2), 40)
+        # Reverse: reversing twice returns to the original.
+        rev = dict(base); rev["id"] = "rfl-rev"
+        rev["clips"] = [{**clips[0], "reverse": True}]
+        rev_out = render(rev, "test_rfl_rev")
+        rev2 = {"id": "rfl-rev2", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video", "src": rev_out,
+                           "trim_in": 0, "trim_out": 5, "reverse": True}]}
+        rev2_out = render(rev2, "test_rfl_rev2")
+        self.assertGreater(psnr(frame(rev2_out, 2.0, "rr20.png"),
+                                frame(base_out, 2.0, "base20.png")), 30)
+        # Split: video clip 0..5 at 2s -> 0..2 and 2..5, total unchanged.
+        from agentcut.render import split_clip
+        ok, split = split_clip(base, "a", 2.0)
+        self.assertTrue(ok, split)
+        self.assertEqual([c["id"] for c in split["clips"]], ["a-a", "a-b"])
+        self.assertEqual((split["clips"][0]["trim_out"], split["clips"][1]["trim_in"]), (2.0, 2.0))
+        self.assertEqual(split["clips"][1]["transition"], "none")
+        errors, info = validate_project(split)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 5.0, places=2)
+        ok, bad = split_clip(base, "a", 99)
+        self.assertFalse(ok)
+        self.assertIn("fix", bad)
+
+    def test_chroma_mask_and_blur_fit(self):
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=green:s=200x200", "-vf",
+                        "drawbox=x=50:y=50:w=100:h=100:color=red:t=fill",
+                        "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_green.png")], check=True)
+        green = os.path.join(BASE, "data", "test_green.png")
+        clips = [{"id": "a", "kind": "video",
+                  "src": "data/test_media/clip1.mp4",
+                  "trim_in": 0, "trim_out": 5}]
+        base = {"id": "r4", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": clips}
+        # Chroma overlay: green removed (base black shows), red kept.
+        proj = dict(base); proj["id"] = "r4-chroma"
+        proj["overlays"] = [{"id": "gs", "kind": "image", "src": green,
+                             "start": 0, "duration": 3, "size": 0.5,
+                             "position": "top_left", "chroma_key": "green"}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_chroma.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        self.assertLess(_crop_mean(out, 1.0, 30, 30, 20, 20)[0], 80)
+        self.assertGreater(_crop_mean(out, 1.0, 100, 100, 20, 20)[0], 200)
+        # Rect mask on a main clip: inside shows content, outside black.
+        proj = dict(base); proj["id"] = "r4-mask"
+        proj["clips"] = [{**clips[0], "mask_shape": "rect",
+                          "mask_x": 100, "mask_y": 300,
+                          "mask_w": 160, "mask_h": 100}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_mask.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        inside = _crop_mean(out, 2.0, 180, 350, 20, 20)
+        self.assertGreater(sum(inside), 30)
+        self.assertLess(sum(_crop_mean(out, 2.0, 20, 20, 20, 20)), 30)
+        # Blurred-background fit: corners are blurred content, not black.
+        proj = dict(base); proj["id"] = "r4-blur"
+        proj["clips"] = [{**clips[0], "fit": "blur"}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_blur.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        self.assertGreater(sum(_crop_mean(out, 2.0, 10, 10, 20, 20)), 30)
+        # Bad mask shape carries a fix hint.
+        bad = dict(base); bad["id"] = "r4-bad"
+        bad["clips"] = [{**clips[0], "mask_shape": "triangle"}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any("fix" in e for e in errors))
+
+    def test_new_transitions_and_effects(self):
+        proj = {"id": "r5", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [
+                    {"id": "a", "kind": "video",
+                     "src": "data/test_media/clip1.mp4",
+                     "trim_in": 0, "trim_out": 3},
+                    {"id": "b", "kind": "video",
+                     "src": "data/test_media/clip2.mp4",
+                     "trim_in": 0, "trim_out": 3,
+                     "transition": "dissolve", "pixelize": 16,
+                     "blur": 2.0, "hue": 45},
+                    {"id": "c", "kind": "image",
+                     "src": "data/test_media/poster.png", "duration": 2,
+                     "transition": "circle_open", "vignette": True,
+                     "sharpen": 1.5}]}
+        errors, info = validate_project(proj)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 7.0, places=2)
+        out = os.path.join(BASE, "data", "test_transitions_effects.mp4")
+        ok, rinfo = render_project(proj, out)
+        self.assertTrue(ok, rinfo)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 7.0, delta=0.5)
+        video = [x for x in probe["streams"] if x["codec_type"] == "video"][0]
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        bad = dict(proj)
+        bad["clips"] = [{**proj["clips"][0], "blur": 99}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any("fix" in e for e in errors))
+        bad2 = dict(proj)
+        bad2["clips"] = [{**proj["clips"][1], "transition": "sparkle_burst"}]
+        errors, _ = validate_project(bad2)
+        self.assertTrue(errors)
+
+    def test_speed_curve_and_denoise(self):
+        proj = {"id": "r6", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video",
+                           "src": "data/test_media/clip1.mp4",
+                           "trim_in": 0, "trim_out": 5,
+                           "speed_curve": [{"start": 0, "end": 2.5, "speed": 2.0},
+                                           {"start": 2.5, "end": 5, "speed": 0.5}]}]}
+        errors, info = validate_project(proj)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 6.25, places=2)
+        out = os.path.join(BASE, "data", "test_curve.mp4")
+        ok, rinfo = render_project(proj, out)
+        self.assertTrue(ok, rinfo)
+        self.assertAlmostEqual(float(ffprobe(out)["format"]["duration"]), 6.25, delta=0.5)
+        from agentcut.render import split_clip
+        ok, split = split_clip(proj, "a", 3.0)
+        self.assertTrue(ok, split)
+        self.assertEqual(split["clips"][0]["trim_out"], 3.375)
+        self.assertEqual(split["clips"][1]["trim_in"], 3.375)
+        errors, info = validate_project(split)
+        self.assertEqual(errors, [])
+        self.assertAlmostEqual(info["total_duration"], 6.25, places=2)
+        # Denoise on a track renders; a gapped curve is rejected with fix.
+        proj2 = {"id": "r6-dn", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 24},
+                 "clips": [{"id": "a", "kind": "video",
+                            "src": "data/test_media/clip1.mp4",
+                            "trim_in": 0, "trim_out": 3}],
+                 "audio": [{"src": "data/test_media/clip2.mp4",
+                            "kind": "music", "volume": 0.8, "denoise": True}]}
+        errors, _ = validate_project(proj2)
+        self.assertEqual(errors, [])
+        out2 = os.path.join(BASE, "data", "test_denoise.mp4")
+        ok, rinfo = render_project(proj2, out2)
+        self.assertTrue(ok, rinfo)
+        bad = dict(proj)
+        bad["clips"] = [{**proj["clips"][0],
+                         "speed_curve": [{"start": 0, "end": 2, "speed": 1.0},
+                                         {"start": 3, "end": 5, "speed": 1.0}]}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any("fix" in e for e in errors))
+
+    def test_animated_text_and_stroke(self):
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640", "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_black.png")], check=True)
+        black = os.path.join(BASE, "data", "test_black.png")
+
+        def white_total(path, t):
+            cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                   "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            data = subprocess.run(cmd, capture_output=True).stdout
+            n = len(data) // 3
+            return sum(1 for i in range(n)
+                       if data[3 * i] > 200 and data[3 * i + 1] > 200 and data[3 * i + 2] > 200)
+
+        def white_strip(path, t, x, w):
+            cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+                   "-vf", f"crop={w}:60:{x}:300", "-frames:v", "1",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            data = subprocess.run(cmd, capture_output=True).stdout
+            n = len(data) // 3
+            return sum(1 for i in range(n)
+                       if data[3 * i] > 200 and data[3 * i + 1] > 200 and data[3 * i + 2] > 200)
+        base = {"id": "r7", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "image", "src": black, "duration": 3}]}
+        # Slide-in: text at the left early, centred late.
+        proj = dict(base); proj["id"] = "r7-slide"
+        proj["texts"] = [{"text": "HELLO", "start": 0, "end": 3, "size": 48,
+                          "x": "center", "y": 300, "animation": "slide_in",
+                          "animation_duration": 1.0,
+                          "stroke": 3, "stroke_color": "red"}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_slide.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        self.assertGreater(white_strip(out, 0.2, 0, 120), 100)
+        self.assertEqual(white_strip(out, 0.2, 120, 120), 0)
+        self.assertGreater(white_strip(out, 2.0, 120, 120), 500)
+        # Pop: small early, full size late.
+        proj = dict(base); proj["id"] = "r7-pop"
+        proj["texts"] = [{"text": "HELLO", "start": 0, "end": 3, "size": 48,
+                          "x": "center", "y": 300, "animation": "pop",
+                          "animation_duration": 1.0}]
+        out = os.path.join(BASE, "data", "test_pop.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        self.assertLess(white_total(out, 0.2), white_total(out, 2.0))
+        # Bad animation carries a fix hint.
+        bad = dict(base); bad["id"] = "r7-bad"
+        bad["texts"] = [{"text": "X", "start": 0, "end": 2,
+                         "animation": "spin"}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any("fix" in e for e in errors))
+
+    def test_export_cap_3840_and_stabilize(self):
+        proj = {"id": "r8-4k", "version": 1,
+                "output": {"width": 3840, "height": 2160, "fps": 24},
+                "clips": [{"id": "a", "kind": "video",
+                           "src": "data/test_media/clip1.mp4",
+                           "trim_in": 0, "trim_out": 2}]}
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_4k.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        video = [x for x in probe["streams"] if x["codec_type"] == "video"][0]
+        self.assertEqual((video["width"], video["height"]), (3840, 2160))
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        bad = dict(proj)
+        bad["output"] = {"width": 4000, "height": 2160, "fps": 24}
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e["code"] == "INVALID_DIMENSION" for e in errors))
+        proj2 = {"id": "r8-stab", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 24},
+                 "clips": [{"id": "a", "kind": "video",
+                            "src": "data/test_media/clip1.mp4",
+                            "trim_in": 0, "trim_out": 3, "stabilize": True}]}
+        errors, _ = validate_project(proj2)
+        self.assertEqual(errors, [])
+        out2 = os.path.join(BASE, "data", "test_stab.mp4")
+        ok, info = render_project(proj2, out2)
+        self.assertTrue(ok, info)
+        self.assertAlmostEqual(float(ffprobe(out2)["format"]["duration"]), 3.0, delta=0.5)
+
+    def test_agent_integration_summary_conformance_snapshots(self):
+        from agentcut.render import (check_brief_conformance,
+                                     produce_video, timeline_summary)
+        from agentcut.server import (call_tool, _load_project,
+                                     _save_project)
+        # Timeline summary: segments, texts, audio, overlays.
+        project = {"id": "int-sum", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 24},
+                   "clips": [{"id": "a", "kind": "video",
+                              "src": "data/test_media/clip1.mp4",
+                              "trim_in": 0, "trim_out": 3},
+                             {"id": "b", "kind": "image",
+                              "src": "data/test_media/poster.png", "duration": 2,
+                              "transition": "crossfade"}],
+                   "texts": [{"text": "Hi", "start": 0.5, "end": 2.0}],
+                   "overlays": [{"id": "pip", "kind": "image",
+                                 "src": "data/test_media/poster.png",
+                                 "start": 1.0, "duration": 2.0}]}
+        ok, summary = timeline_summary(project)
+        self.assertTrue(ok, summary)
+        self.assertAlmostEqual(summary["total_duration"], 4.5, places=2)
+        self.assertEqual([s["clip_id"] for s in summary["segments"]], ["a", "b"])
+        self.assertAlmostEqual(summary["segments"][1]["start"], 2.5, places=2)
+        self.assertEqual(len(summary["overlays"]), 1)
+        # Conformance: pass case, then a missing-clip failure.
+        good = {"id": "int-cb", "version": 1,
+                "output": {"width": 720, "height": 720, "fps": 24},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/poster.png", "duration": 3}],
+                "texts": [{"text": "T", "start": 0.5, "end": 3.0}]}
+        conf = check_brief_conformance(
+            {"format": "square", "title": "T",
+             "clips": [{"src": "data/test_media/poster.png"}]}, good)
+        self.assertTrue(conf["passed"], conf)
+        conf2 = check_brief_conformance(
+            {"format": "square", "title": "T",
+             "clips": [{"src": "data/test_media/clip1.mp4"}]}, good)
+        self.assertFalse(conf2["passed"])
+        self.assertTrue(any(c["name"] == "clips_used" and not c["passed"]
+                            for c in conf2["checks"]))
+        # Produce carries conformance + overlay warnings.
+        brief = {"id": "int-prod", "format": "square", "title": "T",
+                 "target_duration": 5.5,
+                 "clips": [{"src": "data/test_media/poster.png"},
+                           {"src": "data/test_media/pattern.png"}],
+                 "overlays": [{"id": "ghost", "kind": "image",
+                               "src": "data/test_media/poster.png",
+                               "start": 0.5, "duration": 1.0,
+                               "opacity": 0.0}]}
+        out = os.path.join(BASE, "data", "test_int_prod.mp4")
+        ok, info = produce_video(brief, out)
+        self.assertTrue(ok, info)
+        self.assertTrue(info["conformance"]["passed"], info["conformance"])
+        self.assertTrue(any("ghost" in w for w in info["qa"]["warnings"]))
+        self.assertEqual(info["overlays"][0]["id"], "ghost")
+        # Snapshots: patch, then roll back to the snapshot.
+        proj = {"id": "int-snap", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video",
+                           "src": "data/test_media/clip1.mp4",
+                           "trim_in": 0, "trim_out": 3}]}
+        self.assertIsNone(_save_project(proj))
+        snap = call_tool("snapshot_project", {"id": "int-snap", "label": "v1"})
+        self.assertNotIn("isError", snap)
+        call_tool("patch_project", {"id": "int-snap", "patch": {
+            "clips": [{"id": "a", "kind": "video",
+                       "src": "data/test_media/clip1.mp4",
+                       "trim_in": 0, "trim_out": 2}]}})
+        self.assertEqual(_load_project("int-snap")["clips"][0]["trim_out"], 2)
+        call_tool("rollback_project", {"id": "int-snap", "snapshot_id": "v1"})
+        self.assertEqual(_load_project("int-snap")["clips"][0]["trim_out"], 3)
+        # New-feature errors carry a fix hint (integration item a).
+        bad = dict(project)
+        bad["overlays"] = [{"id": "x", "kind": "image",
+                            "src": "data/test_media/poster.png",
+                            "start": 99, "duration": 1.0}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+        self.assertTrue(all("fix" in e and "field" in e for e in errors))
 
     def test_probe_media(self):
         info = probe_media(os.path.join(BASE, "data", "test_media", "clip1.mp4"))

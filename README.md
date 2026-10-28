@@ -194,3 +194,118 @@ including in production, except to provide a competing agent-first
 video editor service to third parties. On the Change Date
 (2030-10-28) this version converts to the Apache License, Version
 2.0. BSL 1.1 is not an Open Source licence.
+
+## Overlays (picture-in-picture)
+
+A project may carry an `overlays` list on top of the main timeline.
+Each overlay has an id, a kind (`video` or `image`), a local src, a
+start second and a duration inside the timeline, a size as a
+fraction of the output width (default 0.35), a position preset
+(`top_left`, `top_center`, `top_right`, `center`, `bottom_left`,
+`bottom_center`, `bottom_right`) or x/y pixel offsets, and an
+opacity 0..1. Video overlays trim like clips and loop when shown
+longer than their trimmed source. Overlay audio is not mixed in
+v1; use a project audio track for sound. See
+examples/overlay.json. Overlay validation errors carry a `fix`
+hint, so an agent can correct the project directly.
+
+## Overlay keyframes
+
+An overlay may carry `keyframes`: a list of at least 2 entries with
+a `time` in seconds since the overlay starts, plus any of `x`, `y`
+(pixels), `scale` (fraction of output width) and `opacity` (0..1).
+Values interpolate linearly between keyframes; a field a keyframe
+omits keeps the previous keyframe's value, or the overlay's base
+value. Position and opacity animate smoothly; scale animates
+through short fixed-scale segments (an FFmpeg limitation: a
+stream's frame size cannot change per frame). Scale keyframes on
+a looping video overlay are rejected — shorten the overlay to
+its trimmed source duration, or drop the scale keyframes.
+
+## Split, reverse, freeze, loop
+
+Video clips accept `reverse` (play backwards), `freeze_at` (a
+second inside the trim range; that frame holds for the whole
+trim duration, silently) and `loop_count` 2..8 (repeat the
+trimmed segment, video and audio). These three do not combine
+with each other or with `speed` on one clip; validation says so
+with a fix hint. `split_clip` (MCP tool, or `./run.sh split
+<json> <clip_id> <seconds>`) splits one clip at a time inside
+its rendered duration: the first part keeps the incoming
+transition, the second part continues with none, and the
+timeline total does not change. Store the returned project
+with create_project to keep the split.
+
+## Chroma key, masks, blurred fit
+
+Clips and overlays accept `chroma_key` (a colour name such as
+`green`, or a #RRGGBB value) with optional `chroma_similarity`
+and `chroma_blend`: the keyed colour becomes transparent.
+`mask_shape` is `rect` (mask_x, mask_y, mask_w, mask_h) or
+`circle` (mask_x, mask_y centre, mask_r radius), with an
+optional `mask_feather` in pixels for a soft edge; masked main
+clips show black outside the mask. A clip may use
+`fit: "blur"` instead of contain/cover: a blurred, darkened
+copy of the clip fills the frame behind the contained clip.
+Mask coordinates are frame pixels. Do not combine mask with
+chroma_key on one overlay (the mask replaces the keyed
+transparency there), and do not combine mask with scale
+keyframes (rejected with a fix).
+
+## More transitions and effects
+
+Besides crossfade, fade, wipe and slide, clips accept dissolve,
+fade_black, fade_white, pixelize, radial, circle_open,
+circle_close, smooth directions, diagonal directions, cover and
+reveal directions, distance and rect_crop — all as incoming
+transitions with an optional transition_duration. Clips and
+overlays accept generic effects: `blur` (sigma), `sharpen`,
+`vignette` (true/false), `hue` (degrees) and `pixelize` (block
+size). Effect ranges are validated with fix hints.
+
+## Speed curves and denoise
+
+A video clip may carry `speed_curve`: segments with `start`,
+`end` and `speed` that partition the trimmed source range
+exactly, with no gaps or overlaps. The clip duration is the
+sum of each segment's duration divided by its speed. A curve
+does not combine with `speed`, `freeze_at`, `loop_count`,
+`reverse` or blurred-background fit. `split_clip` on a curved
+clip maps the rendered split time back through the curve and
+splits the curve, keeping the total duration. Audio noise
+reduction is `denoise: true` on a video clip or an audio
+track (FFmpeg afftdn).
+
+## Animated text and stroke
+
+Texts (and captions) accept `animation`: `slide_in` (slides in
+from the left), `slide_out` (slides out to the right),
+`slide_in_out`, or `pop` (grows from half size to full size),
+with `animation_duration` in seconds (default 1.0, must fit
+the text window). `stroke` (0..10) and `stroke_color` add an
+outline around the text.
+
+## Export cap and stabilisation
+
+Outputs go up to 3840 wide (and tall). A video clip may set
+`stabilize: true` for real two-pass vidstab stabilisation:
+a detect pass at the clip's final scale, then a transform
+pass in the main render. Stabilisation does not combine
+with freeze, loop, reverse, speed changes or blurred fit
+on the same clip.
+
+## Agent integration
+
+AgentCut does not generate, transcribe or synthesise media:
+the producing agent supplies plans, captions, audio and media
+as local files, and AgentCut edits deterministically and
+verifies the result. Integration tools: `timeline_summary`
+(MCP tool, or `./run.sh summary <json>`) for reasoning about
+a timeline; `check_brief` for verifying a produced project
+against its brief (produce results also carry a
+`conformance` block, and briefs may set `target_duration`
+and `overlays`); and `snapshot_project` /
+`rollback_project` / `list_snapshots` for safe
+experimentation — snapshot, patch, preview, roll back on a
+bad result. Validation errors on new features carry a
+`fix` hint with the field and clip id.

@@ -1,0 +1,30 @@
+{
+  "id": "overlay-demo",
+  "version": 1,
+  "output": {
+    "width": 360,
+    "height": 640,
+    "fps": 24
+  },
+  "clips": [
+    {
+      "id": "a",
+      "kind": "video",
+      "src": "data/test_media/clip1.mp4",
+      "trim_in": 0,
+      "trim_out": 5
+    }
+  ],
+  "overlays": [
+    {
+      "id": "pip",
+      "kind": "image",
+      "src": "data/test_media/poster.png",
+      "start": 1.0,
+      "duration": 3.0,
+      "size": 0.4,
+      "position": "bottom_right",
+      "opacity": 0.9
+    }
+  ]
+}
