@@ -1,3 +1,20 @@
+## 1.32.1 — Percent-caption fix (found in production)
+- Text overlays (texts and SRT captions) now set drawtext
+  `expansion=none`. FFmpeg expands %{...} sequences in textfile
+  content too, so a stray % made the whole overlay render empty
+  while the render itself succeeded: found while producing the
+  island-short video, where the caption containing "80%" was
+  invisible at every time in its window while the other three
+  captions rendered, and reproduced minimally (a caption with
+  "80%" invisible, the same caption without % visible, %% no
+  help). Regression test test_percent_caption_renders covers it.
+  The review timecode drawtext keeps normal expansion because it
+  genuinely needs %{pts:hms}.
+- Known font limit, unchanged: "#" renders as a missing-glyph box
+  in both Noto Naskh Arabic and Noto Sans Arabic on this system,
+  so a title needing "#" should be written without it (e.g.
+  "اقتصاد القرد 2") until a font with # is chosen.
+
 ## 1.32.0 — Pro pack (easing, grading, ducking, chapters, delivery, review aids)
 - Easing keyframes: overlay keyframes accept `easing` — `linear`
   (default, the old behaviour), `ease_in` (u^2, slow start),

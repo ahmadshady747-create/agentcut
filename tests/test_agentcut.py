@@ -2005,6 +2005,37 @@ class TestAgentCut(unittest.TestCase):
             _shutil.rmtree(_td, ignore_errors=True)
         self.assertIn("drawtext", " ".join(argv))
 
+    def test_percent_caption_renders(self):
+        # Regression (found in the island-short production 2026-10-28):
+        # drawtext expands %{...} in textfile content too, so a stray %
+        # made the whole overlay render empty (a caption with "80%"
+        # was invisible; the same caption without % was visible; %%
+        # did not help). Text overlays now set expansion=none, so a
+        # literal % must render like any other character.
+        from agentcut.render import render_project
+        srt = os.path.join(BASE, "data", "test_percent.srt")
+        with open(srt, "w", encoding="utf-8") as fh:
+            fh.write("1\n00:00:00,000 --> 00:00:03,000\n"
+                     "Air is 80% here\n")
+        project = {"id": "percent-test", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 12},
+                   "clips": [{"id": "a", "kind": "image",
+                              "src": os.path.join(BASE, "data", "test_media", "pattern.png"),
+                              "duration": 3}],
+                   "captions_file": srt}
+        out = os.path.join(BASE, "data", "test_percent.mp4")
+        ok, rinfo = render_project(project, out)
+        self.assertTrue(ok, rinfo)
+        _w, _h, px = _frame_png(out, 1.5,
+                                os.path.join(BASE, "data", "test_percent_frame.png"))
+        bright = 0
+        for y in range(500, 580, 2):
+            for x in range(0, 360, 2):
+                r, g, b = px(x, y)[:3]
+                if r > 180 and g > 180 and b > 180:
+                    bright += 1
+        self.assertGreater(bright, 50)
+
 
 if __name__ == "__main__":
     unittest.main()

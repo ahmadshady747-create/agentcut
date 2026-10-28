@@ -24,6 +24,13 @@ from .validate import (GRADE_PRESETS, XFADE_TRANSITIONS, find_font,
 # colon or percent in text= breaks FFmpeg's filter parser no matter how
 # it is backslash-escaped (verified 2026-10-28: single and double
 # backslash both failed); a text file carries the exact characters.
+# Textfile alone does NOT save a literal percent: drawtext expands
+# %{...} sequences in textfile content too, and a stray % makes the
+# whole overlay render empty (verified 2026-10-28: a caption with
+# "80%" rendered nothing, the same caption without % rendered fine,
+# and %% did not help). Text overlays therefore also set
+# expansion=none; the review timecode drawtext below keeps normal
+# expansion because it genuinely needs %{pts:hms}.
 
 
 POS_MAP = {
@@ -845,7 +852,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         filters.append(
             f"[{vcur}]drawtext=fontfile={item_font}:textfile={text_path}:"
             f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}:"
-            f"x='{x_out}':y={y_expr}:"
+            f"x='{x_out}':y={y_expr}:expansion=none:"
             f"enable='between(t,{start},{end})'[vout{overlay_index}]")
         vcur = f"vout{overlay_index}"
         overlay_index += 1
