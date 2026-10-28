@@ -1,3 +1,69 @@
+## 1.30.0 — Loop 6 round 4 (optional overlay audio mixing)
+- Post-audit test fix (no behaviour change): test_continuous_keyframe_scaling now generates its own green test image instead of relying on a file created by a later test, which made it fail in clean copies.
+- Overlay videos may set `volume` (0..2, default 0.0 muted, so
+  every existing project renders exactly as before). When set,
+  the overlay's audio is mixed into the final amix at the
+  overlay's start, for its shown duration: looping overlays
+  loop their trimmed source audio, others are trimmed to the
+  shown duration, so audio never outlives the overlay on
+  screen. It is not ducked; it sits alongside the main mix.
+- Validation rejects volume above zero on an image overlay or
+  a silent video (detected via ffprobe) with the overlay id
+  and a fix hint. Proven by a volumedetect test: silence
+  before and after the overlay window, audible audio inside
+  it, at the right times.
+
+## 1.29.3 — Loop 6 round 3 (continuous keyframe scaling)
+- Scale keyframes no longer split overlays into <=0.5s
+  fixed-scale segments: one scale filter with eval=frame
+  interpolates width/height linearly on frame time t, rounded
+  to even numbers (trunc(.../2)*2). Proven by a test that
+  distinguishes the two: overlay edges at t=1.0 and t=1.1
+  differ (the old segmentation gave identical edges), plus a
+  combined scale + position keyframes render.
+- Two FFmpeg behaviours found and documented while proving it:
+  scale eval=frame DOES vary per frame (showinfo: 72, 98, 126,
+  ... px), but encoding its output directly hides the variation
+  (ffmpeg auto-scales back to the encoder's first-frame size)
+  — test it through the overlay filter or via showinfo, never
+  through a direct encode; and a format filter AFTER a varying
+  scale pins the stream to its first frame's size, so the
+  format conversion now sits BEFORE the scale.
+- Honest limit found in-round: colorkey fails while filtering
+  when its input frame size changes every frame, so
+  chroma_key + scale keyframes is now rejected in validation
+  with a fix hint, like mask + scale keyframes before it,
+  instead of rendering broken. Mask-only and chroma-only
+  scaling paths are unaffected.
+
+## 1.29.2 — Loop 6 round 2 (mask + chroma key intersection)
+- Fixed: mask + chroma_key on one clip or overlay no longer
+  replaces keyed transparency. The keyed alpha is taken apart
+  (alphaextract, exact frame size), multiplied by the mask factor
+  (and by the opacity factor when opacity keyframes vary) in a
+  gray geq using lum(X,Y) — this build's geq has no a(X,Y), so
+  the fix deliberately never uses it — and merged back
+  (alphamerge). Keyed colour stays transparent inside the mask,
+  everything outside the mask stays hidden. The same path also
+  fixes chroma_key + opacity keyframes, which previously
+  destroyed keying. Mask-only and chroma-only paths are
+  unchanged. Proven by a pixel test: overlay red inside the
+  mask, keyed green inside the mask showing the timeline, red
+  outside the mask hidden, and the same for a main clip (the
+  previously failing case: masked-out red showed red).
+
+## 1.29.1 — Loop 6 round 1 (detached process jobs)
+- Jobs are detached processes, not server threads: render/preview
+  jobs now run as `agentcut worker` subprocesses (Popen with
+  start_new_session=True, no stdio inheritance), so closing the
+  client's stdio connection can no longer kill a queued job.
+- Job state is atomic JSON on disk (data/jobs, runtime data only,
+  never synced): written at queue, start, completion and failure
+  via temp-file + rename. get_job reads disk state, so a NEW MCP
+  connection can poll jobs from earlier sessions; a job whose
+  worker died without finishing reports failed instead of staying
+  "running" forever. Outputs stay atomic (temp file then move).
+
 ## 1.29.0 — Loop 5 integration round (agent depth, no in-tool AI)
 - Agent = intelligence, AgentCut = deterministic execution +
   verification. Nothing in this round generates, recognises or

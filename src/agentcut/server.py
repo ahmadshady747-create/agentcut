@@ -95,11 +95,11 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "object"}}, "required": ["project"]}},
     {"name": "preview_project",
-     "description": "Render a low-resolution proxy of a stored project and extract frames plus a contact sheet. Returns a job id; poll with get_job.",
+     "description": "Render a low-resolution proxy of a stored project and extract frames plus a contact sheet. Returns a job id; poll with get_job. The job runs as a detached process and survives the client closing stdio.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
     {"name": "render_project",
-     "description": "Start an async final render of a stored project. Returns a job id; poll with get_job.",
+     "description": "Start an async final render of a stored project. Returns a job id; poll with get_job. The job runs as a detached process and survives the client closing stdio; a new connection can poll it.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
     {"name": "poster_frame",
@@ -149,7 +149,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
     {"name": "get_job",
-     "description": "Poll a render or preview job by id.",
+     "description": "Poll a render or preview job by id. Job state lives on disk, so this works from a new connection for jobs launched in earlier sessions; a job whose worker died without finishing reports failed.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
 ]

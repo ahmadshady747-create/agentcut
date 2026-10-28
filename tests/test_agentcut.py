@@ -2,9 +2,11 @@
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -22,6 +24,63 @@ def _crop_mean(path, t, x, y, w, h):
     data = subprocess.run(cmd, capture_output=True).stdout
     n = len(data) // 3
     return tuple(sum(data[i] for i in range(k, len(data), 3)) / n for k in range(3))
+
+def _png_px(path):
+    """Pixel reader for an ffmpeg PNG frame (stdlib only)."""
+    data = open(path, "rb").read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, w, h, ctype = 8, b"", 0, 0, 0
+    while pos < len(data):
+        ln, typ = struct.unpack(">I4s", data[pos:pos + 8])
+        pos += 8
+        chunk = data[pos:pos + ln]
+        pos += ln + 4
+        if typ == b"IHDR":
+            w, h, _depth, ctype = struct.unpack(">IIBB", chunk[:10])
+        elif typ == b"IDAT":
+            idat += chunk
+    raw = zlib.decompress(idat)
+    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+    stride = w * ch
+    rows, prev, p = [], bytearray(stride), 0
+    for _y in range(h):
+        f = raw[p]
+        p += 1
+        line = bytearray(raw[p:p + stride])
+        p += stride
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pr) & 255
+        rows.append(line)
+        prev = line
+
+    def px(x, y):
+        row = rows[y]
+        return tuple(row[x * ch:(x + 1) * ch])
+
+    return w, h, px
+
+
+def _frame_png(path, t, out):
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", path,
+                    "-frames:v", "1", out], check=True)
+    return _png_px(out)
+
 
 def example():
     with open(os.path.join(BASE, "examples", "basic.json")) as fh:
@@ -610,6 +669,68 @@ class TestAgentCut(unittest.TestCase):
         self.assertIn('"id": 3', proc.stdout)
         self.assertIn("INVALID_SCHEMA", proc.stdout)
 
+    def test_detached_job_survives_session_close(self):
+        import subprocess as _sp
+        import time as _time
+        env = {**os.environ, "PYTHONPATH": os.path.join(BASE, "src")}
+
+        def _start():
+            return _sp.Popen([sys.executable, "-m", "agentcut", "serve"],
+                             stdin=_sp.PIPE, stdout=_sp.PIPE, text=True,
+                             cwd=BASE, env=env)
+
+        def _init(proc):
+            proc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize",'
+                             '"params":{"protocolVersion":"2024-11-05","capabilities":{},'
+                             '"clientInfo":{"name":"t","version":"1"}}}\n')
+            proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            self.assertIn('"id": 1', line)
+
+        def _call(proc, rid, name, args):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid,
+                                         "method": "tools/call",
+                                         "params": {"name": name, "arguments": args}}) + "\n")
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                self.assertTrue(line, "server closed stdout early")
+                d = json.loads(line)
+                if d.get("id") == rid:
+                    return json.loads(d["result"]["content"][0]["text"])
+
+        proc = _start()
+        try:
+            _init(proc)
+            _call(proc, 2, "create_project", {"project": example()})
+            res = _call(proc, 3, "render_project", {"id": "basic"})
+            job_id = res["job_id"]
+        finally:
+            # Close the session hard: the detached worker must survive.
+            proc.stdin.close()
+            proc.wait(timeout=15)
+        out_path = os.path.join(BASE, "data", "outputs", job_id, "output.mp4")
+        proc2 = _start()
+        try:
+            _init(proc2)
+            status = None
+            payload = None
+            deadline = _time.time() + 120
+            while _time.time() < deadline:
+                payload = _call(proc2, 10, "get_job", {"id": job_id})
+                status = payload["status"]
+                if status in ("done", "failed"):
+                    break
+                _time.sleep(0.5)
+            self.assertEqual(status, "done", payload)
+        finally:
+            proc2.stdin.close()
+            proc2.wait(timeout=15)
+        self.assertTrue(os.path.isfile(out_path), payload)
+        probe = ffprobe(out_path)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 8.0, delta=0.5)
+
     def test_produce_video_montage(self):
         from agentcut.render import produce_video
         brief = {
@@ -978,6 +1099,257 @@ class TestAgentCut(unittest.TestCase):
         bad["clips"] = [{**clips[0], "mask_shape": "triangle"}]
         errors, _ = validate_project(bad)
         self.assertTrue(any("fix" in e for e in errors))
+
+    def test_continuous_keyframe_scaling(self):
+        # Loop 6 round 3: scale keyframes must vary PER FRAME via
+        # scale eval=frame, not in <=0.5s steps. At t=1.0 and t=1.1
+        # the old segmentation would show the SAME width (both in
+        # the [1.0, 1.5) segment at the segment-start scale); the
+        # new path must show a wider overlay at t=1.1 than at t=1.0.
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=blue:s=360x640:r=24:d=4",
+                        os.path.join(BASE, "data", "test_blue4.mp4")], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=200x200", "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_red200.png")], check=True)
+        blue = os.path.join(BASE, "data", "test_blue4.mp4")
+        red = os.path.join(BASE, "data", "test_red200.png")
+        proj = {"id": "r6-scale", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video", "src": blue,
+                           "trim_in": 0, "trim_out": 4}],
+                "overlays": [{"id": "sc", "kind": "image", "src": red,
+                              "start": 0, "duration": 4, "size": 0.35,
+                              "position": "top_left",
+                              "keyframes": [{"time": 0, "scale": 0.2,
+                                             "x": 20, "y": 20},
+                                            {"time": 4, "scale": 0.8,
+                                             "x": 20, "y": 20}]}]}
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_scale_keys.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 4.0, delta=0.5)
+
+        def right_edge(t):
+            _w, _h, px = _frame_png(out, t, os.path.join(BASE, "data", "test_scale_frame.png"))
+            edge = None
+            for x in range(20, 340):
+                r, g, b = px(x, 50)[:3]
+                if r > 200 and b < 100:
+                    edge = x
+            return edge
+
+        e10 = right_edge(1.0)
+        e11 = right_edge(1.1)
+        # scale(1.0) = 0.35 -> width 126 -> edge ~146;
+        # scale(1.1) = 0.365 -> width 130 -> edge ~150.
+        self.assertIsNotNone(e10)
+        self.assertIsNotNone(e11)
+        self.assertGreater(e11, e10)
+        self.assertTrue(138 <= e10 <= 154, e10)
+        self.assertTrue(142 <= e11 <= 158, e11)
+        # Combined scale + position keyframes still work together.
+        proj2 = {"id": "r6-scale-pos", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 24},
+                 "clips": [{"id": "a", "kind": "video", "src": blue,
+                            "trim_in": 0, "trim_out": 4}],
+                 "overlays": [{"id": "sc", "kind": "image", "src": red,
+                               "start": 0, "duration": 4, "size": 0.35,
+                               "keyframes": [{"time": 0, "scale": 0.3,
+                                              "x": 20, "y": 20},
+                                             {"time": 4, "scale": 0.6,
+                                              "x": 200, "y": 20}]}]}
+        errors, _ = validate_project(proj2)
+        self.assertEqual(errors, [])
+        out2 = os.path.join(BASE, "data", "test_scale_pos.mp4")
+        ok, info = render_project(proj2, out2)
+        self.assertTrue(ok, info)
+        early = _crop_mean(out2, 0.1, 250, 50, 10, 10)
+        late = _crop_mean(out2, 3.9, 250, 50, 10, 10)
+        self.assertGreater(early[2], 150)  # blue: overlay not there yet
+        self.assertGreater(late[0], 200)   # red: overlay moved there
+
+        # Scale-varying + chroma is REJECTED with a fix, not
+        # rendered broken: colorkey fails while filtering when its
+        # input frame size changes every frame (verified on this
+        # FFmpeg build in Loop 6 round 3).
+        # Generate the green test image here: this test runs
+        # alphabetically BEFORE test_mask_chroma_key_intersection,
+        # which also creates it, so relying on that file made this
+        # test fail in a clean copy (parent audit, Loop 6).
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=green:s=200x200", "-vf",
+                        "drawbox=x=50:y=50:w=100:h=100:color=red:t=fill",
+                        "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_green2.png")], check=True)
+        proj3 = {"id": "r6-scale-chroma", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 24},
+                 "clips": [{"id": "a", "kind": "video", "src": blue,
+                            "trim_in": 0, "trim_out": 4}],
+                 "overlays": [{"id": "sc", "kind": "image",
+                               "src": os.path.join(BASE, "data", "test_green2.png"),
+                               "start": 0, "duration": 4, "size": 0.35,
+                               "chroma_key": "green",
+                               "keyframes": [{"time": 0, "scale": 0.2,
+                                              "x": 20, "y": 20},
+                                             {"time": 4, "scale": 0.8,
+                                              "x": 20, "y": 20}]}]}
+        errors, _ = validate_project(proj3)
+        self.assertTrue(errors)
+        self.assertTrue(any("chroma_key" in e.get("field", "") and "fix" in e
+                            for e in errors))
+
+    def test_overlay_audio_mixing(self):
+        # Loop 6 round 4: an overlay video with volume set mixes
+        # its audio in exactly during its window, and nowhere else.
+        import re as _re
+        base = {"id": "r6-ov-audio", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/poster.png", "duration": 2.5},
+                          {"id": "b", "kind": "image",
+                           "src": "data/test_media/pattern.png", "duration": 2.5}]}
+        proj = dict(base)
+        proj["overlays"] = [{"id": "snd", "kind": "video",
+                             "src": "data/test_media/clip1.mp4",
+                             "trim_in": 0, "trim_out": 5,
+                             "start": 1.0, "duration": 2.0, "size": 0.3,
+                             "position": "top_left", "volume": 0.8}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_overlay_audio.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertIn("audio", {st["codec_type"] for st in probe["streams"]})
+
+        def mean_volume(start, end):
+            proc = subprocess.run(["ffmpeg", "-v", "info", "-i", out,
+                                   "-af", f"atrim=start={start}:end={end},volumedetect",
+                                   "-f", "null", "-"],
+                                  capture_output=True, text=True)
+            m = _re.search(r"mean_volume: (-?\d+\.?\d*|-inf)", proc.stderr)
+            self.assertIsNotNone(m, proc.stderr[-500:])
+            return -999.0 if m.group(1) == "-inf" else float(m.group(1))
+
+        self.assertLess(mean_volume(0, 0.9), -70)
+        self.assertGreater(mean_volume(1.2, 2.8), -40)
+        self.assertLess(mean_volume(3.2, 4.9), -70)
+        # Validation: volume on an image overlay is rejected.
+        bad = dict(base)
+        bad["overlays"] = [{"id": "pic", "kind": "image",
+                            "src": "data/test_media/poster.png",
+                            "start": 0, "duration": 2, "volume": 0.8}]
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e.get("field") == "overlays.volume"
+                            and "fix" in e and e.get("clip_id") == "pic"
+                            for e in errors))
+        # Validation: volume on a silent video is rejected too.
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=blue:s=360x640:r=24:d=3",
+                        os.path.join(BASE, "data", "test_silent.mp4")], check=True)
+        bad2 = dict(base)
+        bad2["overlays"] = [{"id": "sil", "kind": "video",
+                             "src": os.path.join(BASE, "data", "test_silent.mp4"),
+                             "start": 0, "duration": 2, "volume": 0.8}]
+        errors, _ = validate_project(bad2)
+        self.assertTrue(any(e.get("field") == "overlays.volume" and "fix" in e
+                            for e in errors))
+        # Volume 0 (and omitted volume) on an image overlay is fine.
+        ok_proj = dict(base)
+        ok_proj["overlays"] = [{"id": "pic", "kind": "image",
+                                "src": "data/test_media/poster.png",
+                                "start": 0, "duration": 2, "volume": 0.0}]
+        errors, _ = validate_project(ok_proj)
+        self.assertEqual(errors, [])
+
+    def test_mask_chroma_key_intersection(self):
+        # Loop 6 round 2: mask x chroma_key must INTERSECT, not
+        # replace. Main timeline is solid blue, so keyed-out green
+        # and masked-out content both read as blue, kept red as red.
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=blue:s=360x640:r=24:d=5",
+                        os.path.join(BASE, "data", "test_blue.mp4")], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=green:s=200x200", "-vf",
+                        "drawbox=x=50:y=50:w=100:h=100:color=red:t=fill",
+                        "-frames:v", "1",
+                        os.path.join(BASE, "data", "test_green2.png")], check=True)
+        blue = os.path.join(BASE, "data", "test_blue.mp4")
+        green = os.path.join(BASE, "data", "test_green2.png")
+        base = {"id": "r6-mask", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "video", "src": blue,
+                           "trim_in": 0, "trim_out": 5}]}
+        # Overlay: 200x200 source scaled to 180x180 at (20, 20);
+        # circle mask centre (90, 90) r=60 in overlay coordinates.
+        proj = dict(base); proj["id"] = "r6-mask-ov"
+        proj["overlays"] = [{"id": "gs", "kind": "image", "src": green,
+                             "start": 0, "duration": 3, "size": 0.5,
+                             "position": "top_left", "chroma_key": "green",
+                             "mask_shape": "circle", "mask_x": 90,
+                             "mask_y": 90, "mask_r": 60}]
+        errors, _ = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(BASE, "data", "test_mask_chroma_ov.mp4")
+        ok, info = render_project(proj, out)
+        self.assertTrue(ok, info)
+        # Red inside the mask stays red.
+        self.assertGreater(_crop_mean(out, 1.0, 91, 91, 20, 20)[0], 200)
+        # Green inside the mask stays keyed out (blue shows through).
+        gi = _crop_mean(out, 1.0, 91, 46, 20, 20)
+        self.assertGreater(gi[2], 150)
+        self.assertLess(gi[1], 100)
+        # Red outside the mask is hidden (blue shows through).
+        # Point chosen well outside the circle: the previous crop
+        # straddled the circle edge and mixed red with blue.
+        ro = _crop_mean(out, 1.0, 148, 62, 10, 10)
+        self.assertGreater(ro[2], 150)
+        self.assertLess(ro[0], 100)
+        # Green outside the mask is hidden too.
+        go = _crop_mean(out, 1.0, 28, 28, 20, 20)
+        self.assertGreater(go[2], 150)
+        # Same overlay with opacity keyframes: keying must survive.
+        proj2 = dict(base); proj2["id"] = "r6-mask-ov-op"
+        proj2["overlays"] = [{**proj["overlays"][0],
+                              "keyframes": [{"time": 0, "opacity": 0.2,
+                                             "x": 20, "y": 20},
+                                            {"time": 3, "opacity": 1.0,
+                                             "x": 20, "y": 20}]}]
+        errors, _ = validate_project(proj2)
+        self.assertEqual(errors, [])
+        out2 = os.path.join(BASE, "data", "test_mask_chroma_ov_op.mp4")
+        ok, info = render_project(proj2, out2)
+        self.assertTrue(ok, info)
+        self.assertGreater(_crop_mean(out2, 2.9, 91, 91, 20, 20)[0], 200)
+        gi2 = _crop_mean(out2, 2.9, 91, 46, 20, 20)
+        self.assertGreater(gi2[2], 200)
+        self.assertLess(gi2[1], 50)
+        # Main clip: green+red video, circle mask, chroma key.
+        # Masked-out red was the failing case before the fix (it
+        # showed red); now it must composite over black.
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=green:s=200x200:r=24:d=3,drawbox=x=20:y=90:w=160:h=20:color=red:t=fill",
+                        os.path.join(BASE, "data", "test_greenred.mp4")], check=True)
+        proj3 = {"id": "r6-mask-clip", "version": 1,
+                 "output": {"width": 200, "height": 200, "fps": 24},
+                 "clips": [{"id": "a", "kind": "video",
+                            "src": os.path.join(BASE, "data", "test_greenred.mp4"),
+                            "trim_in": 0, "trim_out": 3,
+                            "chroma_key": "green", "mask_shape": "circle",
+                            "mask_x": 100, "mask_y": 100, "mask_r": 50}]}
+        errors, _ = validate_project(proj3)
+        self.assertEqual(errors, [])
+        out3 = os.path.join(BASE, "data", "test_mask_chroma_clip.mp4")
+        ok, info = render_project(proj3, out3)
+        self.assertTrue(ok, info)
+        self.assertGreater(_crop_mean(out3, 1.0, 95, 95, 10, 10)[0], 200)
+        self.assertLess(sum(_crop_mean(out3, 1.0, 95, 60, 10, 10)), 30)
+        self.assertLess(sum(_crop_mean(out3, 1.0, 25, 95, 10, 10)), 30)
+        self.assertLess(sum(_crop_mean(out3, 1.0, 25, 25, 10, 10)), 30)
 
     def test_new_transitions_and_effects(self):
         proj = {"id": "r5", "version": 1,

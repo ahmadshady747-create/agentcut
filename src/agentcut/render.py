@@ -12,8 +12,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
-import threading
 import uuid
 
 from .validate import XFADE_TRANSITIONS, find_font, probe_media, validate_project
@@ -76,13 +76,12 @@ def _effect_chain(obj):
     return ("," + ",".join(parts)) if parts else ""
 
 
-def _mask_geq(mask):
-    """geq filter that keeps only the mask region, softly if feathered.
+def _mask_factor_expr(mask):
+    """Mask value as a 0..1 expression in pixel coordinates X, Y.
 
     Coordinates are pixels in the frame the filter sees (output frame
-    for clips, overlay frame for overlays). The alpha expression
-    multiplies by the incoming alpha, so chroma-key transparency
-    survives the mask.
+    for clips, overlay frame for overlays). Feathering softens the
+    edge linearly over the feather width.
     """
     f = int(mask.get("feather", 0))
     if mask["shape"] == "rect":
@@ -94,14 +93,24 @@ def _mask_geq(mask):
         else:
             fx = f"gte(X,{x0})*lte(X,{x1})"
             fy = f"gte(Y,{y0})*lte(Y,{y1})"
-        alpha = f"({fx})*({fy})*255"
-    else:
-        cx, cy, r = int(mask["mask_x"]), int(mask["mask_y"]), int(mask["mask_r"])
-        if f > 0:
-            alpha = f"clip(({r}+{f}-hypot(X-{cx},Y-{cy}))/{f},0,1)*255"
-        else:
-            alpha = f"if(lt(hypot(X-{cx},Y-{cy}),{r}),1,0)*255"
-    return (f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}'")
+        return f"({fx})*({fy})"
+    cx, cy, r = int(mask["mask_x"]), int(mask["mask_y"]), int(mask["mask_r"])
+    if f > 0:
+        return f"clip(({r}+{f}-hypot(X-{cx},Y-{cy}))/{f},0,1)"
+    return f"if(lt(hypot(X-{cx},Y-{cy}),{r}),1,0)"
+
+
+def _mask_geq(mask):
+    """geq filter that keeps only the mask region, softly if feathered.
+
+    This SETS the alpha channel to the mask value: it does not
+    multiply by any incoming alpha (this build's geq has no a(X,Y)
+    function, verified in Loop 5). Mask + chroma-key intersection is
+    therefore done elsewhere, via alphaextract (see _alpha_intersect
+    usage in the clip and overlay chains), never via this filter.
+    """
+    return (f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='({_mask_factor_expr(mask)})*255'")
 
 
 def _scale_part(fit, width, height):
@@ -174,36 +183,30 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
     for track in audio_tracks:
         argv += ["-i", track["src"]]
     overlays = info.get("overlays", []) or []
-    # Overlay segments: normally one per overlay. An overlay whose
-    # scale keyframes vary is split into short segments (<=0.5s,
-    # capped at 40) because FFmpeg crop/scale dimensions are fixed
-    # at filter configuration time — a single stream cannot change
-    # its frame size per frame. Each segment is a separate input
-    # with a fixed scale interpolated at the segment start; position
-    # stays smooth because the overlay x/y expressions use main
-    # timeline time, and opacity stays smooth via geq (see below).
-    overlay_segments = []  # (overlay, seg_start, seg_end, input_index)
+    # Overlay segments: exactly one per overlay (Loop 6 round 3).
+    # Scale keyframes used to split an overlay into <=0.5s
+    # fixed-scale segments; they now use scale eval=frame, which
+    # evaluates width/height per frame (verified via showinfo:
+    # 50, 52, 54, 56... px across frames, and via overlay edges
+    # growing smoothly). Note for future readers: do NOT test
+    # eval=frame by encoding its output directly — ffmpeg
+    # auto-inserts a scale back to the encoder's first-frame size,
+    # which hides the variation. Test it through the overlay
+    # filter (which accepts per-frame sizes) or via showinfo.
+    overlay_segments = []  # (overlay, seg_start, seg_end, video_index, audio_index|None)
     for ov in overlays:
-        kfs = ov.get("keyframes_resolved")
-        scales_vary = bool(kfs) and len({f["scale"] for f in kfs}) > 1
-        if scales_vary:
-            bounds = sorted({f["time"] for f in kfs} | {float(ov["duration"])})
-            segs = []
-            for a, b in zip(bounds, bounds[1:]):
-                steps = max(1, int(-(-(b - a) // 0.5)))
-                for k in range(steps):
-                    segs.append((a + (b - a) * k / steps, a + (b - a) * (k + 1) / steps))
-            if len(segs) > 40:
-                dur = float(ov["duration"])
-                segs = [(dur * k / 40, dur * (k + 1) / 40) for k in range(40)]
-        else:
-            segs = [(0.0, float(ov["duration"]))]
-        for seg_start, seg_end in segs:
-            idx = _input_count(argv)
-            if ov["kind"] == "image":
-                argv += ["-loop", "1", "-t", str(seg_end - seg_start)]
+        seg_start, seg_end = 0.0, float(ov["duration"])
+        idx = _input_count(argv)
+        if ov["kind"] == "image":
+            argv += ["-loop", "1", "-t", str(seg_end - seg_start)]
+        argv += ["-i", ov["src"]]
+        audio_idx = None
+        if ov["kind"] == "video" and float(ov.get("volume") or 0.0) > 0:
+            # A second input for the same file, so its audio stream
+            # can be mixed independently of its video stream.
+            audio_idx = _input_count(argv)
             argv += ["-i", ov["src"]]
-            overlay_segments.append((ov, seg_start, seg_end, idx))
+        overlay_segments.append((ov, seg_start, seg_end, idx, audio_idx))
     filters = []
     # Per-clip video and audio. vlabels[i] is the label the chain
     # must use for clip i (v{i}, or vout{i} when chroma-keyed).
@@ -370,10 +373,15 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
                 fades.append(f"fade=t=out:st={dur - ftd:.3f}:d={ftd:.3f}")
         if fades:
             vf += "," + ",".join(fades)
-        if clip.get("mask"):
+        both_mc = bool(clip.get("mask")) and bool(clip.get("chroma_key_hex"))
+        if clip.get("mask") and not both_mc:
             # Geq only changes alpha, and yuv420p has no alpha, so a
             # masked main clip must be composited over black below;
-            # the chain stays rgba here on purpose.
+            # the chain stays rgba here on purpose. When chroma key
+            # is also present the mask is applied AFTER keying via
+            # the alpha-intersection below, never here: applying the
+            # mask first would be undone by colorkey, which resets
+            # non-keyed alpha to opaque.
             vf += ",format=rgba," + _mask_geq(clip["mask"])
         filters.append(f"{vf}[v{i}]")
         vlabel = f"v{i}"
@@ -393,10 +401,26 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
                 f"[v{i}]format=rgba,"
                 f"colorkey=0x{clip['chroma_key_hex']}:similarity={sim}:blend={blend},"
                 f"format=yuva420p[vck{i}]")
+            keyed_label = f"vck{i}"
+            if both_mc:
+                # Alpha intersection (Loop 6 round 2): the keyed
+                # alpha times the mask factor. alphaextract gives a
+                # gray stream at exactly this frame size, so no
+                # dimension guessing is involved; geq's lum(X,Y)
+                # works on gray streams on this build even though
+                # a(X,Y) does not exist. Final alpha is 0 for keyed
+                # colour inside the mask, 0 outside the mask, and
+                # opaque only for kept content inside the mask.
+                filters.append(f"[vck{i}]split=2[vckrgb{i}][vckkey{i}]")
+                filters.append(
+                    f"[vckkey{i}]alphaextract,"
+                    f"geq=lum='lum(X,Y)*({_mask_factor_expr(clip['mask'])})'[vckam{i}]")
+                filters.append(f"[vckrgb{i}][vckam{i}]alphamerge[vckm{i}]")
+                keyed_label = f"vckm{i}"
             filters.append(
                 f"color=c=black:s={width}x{height}:r={fps}:d={dur}[bgc{i}]")
             filters.append(
-                f"[bgc{i}][vck{i}]overlay=0:0,format=yuv420p[vout{i}]")
+                f"[bgc{i}][{keyed_label}]overlay=0:0,format=yuv420p[vout{i}]")
             vlabel = f"vout{i}"
         vlabels.append(vlabel)
         probe = clip.get("probe") or {}
@@ -477,9 +501,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
     # output width, delayed to its timeline start, and composited
     # with overlay= only while it is on screen (enable between
     # start and end, eof_action=pass so the main timeline continues
-    # after the overlay stream ends). Overlay audio is not mixed in
-    # v1: an overlay is a visual track; sound comes from project
-    # audio tracks, which the agent can align with the same start.
+    # after the overlay stream ends). Overlay audio is mixed only
+    # when the overlay sets volume > 0 (default 0.0, muted, for
+    # backward compatibility); see the audio section below.
     OVERLAY_POS = {
         "top_left": ("20", "20"),
         "top_center": ("(main_w-overlay_w)/2", "20"),
@@ -490,7 +514,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         "bottom_right": ("main_w-overlay_w-20", "main_h-overlay_h-20"),
     }
     vcur = vcur_chain
-    for si, (ov, seg_start, seg_end, idx) in enumerate(overlay_segments):
+    for si, (ov, seg_start, seg_end, idx, _audio_idx) in enumerate(overlay_segments):
         ostart = float(ov["start"])
         odur = float(ov["duration"])
         kfs = ov.get("keyframes_resolved")
@@ -498,9 +522,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
         abs_end = ostart + seg_end
         if ov["kind"] == "video":
             if kfs and len({f["scale"] for f in kfs}) > 1:
-                # Segmented scale keyframes: this segment shows one
-                # slice of the trimmed source (looping excluded by
-                # validation for this combination).
+                # Scale keyframes show the trimmed source limited to
+                # the overlay duration (looping excluded by
+                # validation for this combination); the scale itself
+                # now varies per frame via eval=frame below.
                 s_in = float(ov["trim_in"]) + seg_start
                 s_out = float(ov["trim_in"]) + seg_end
             else:
@@ -520,31 +545,90 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
             if _iw and _ih and max(_iw, _ih) > _guard:
                 chain += f",scale={_guard}:{_guard}:force_original_aspect_ratio=decrease"
         if kfs and len({f["scale"] for f in kfs}) > 1:
-            seg_scale = _interp_value([(f["time"], f["scale"]) for f in kfs], seg_start)
+            # Continuous scaling (Loop 6 round 3): one scale filter
+            # with eval=frame, width/height interpolated linearly on
+            # frame time t (overlay-relative: the chain resets PTS
+            # before this point), rounded to even numbers with
+            # trunc(.../2)*2 to keep chroma formats valid. The
+            # overlay filter accepts per-frame sizes, so the
+            # varying stream flows through untouched — BUT only if
+            # format=rgba comes BEFORE the scale: a format filter
+            # after a varying scale pins the stream to its first
+            # frame's size (verified: edges stuck at the t=0 size
+            # with format after, growing smoothly with format
+            # before). The source size is constant, so format
+            # before the scale pins nothing.
+            w_expr = _interp_expr([(f["time"], f["scale"]) for f in kfs], "t")
+            _probe = ov.get("probe") or {}
+            _iw, _ih = _probe.get("width"), _probe.get("height")
+            if _iw and _ih:
+                h_expr = f"trunc(({w_expr})*{width}*{_ih}/{_iw}/2)*2"
+            else:
+                h_expr = f"trunc(({w_expr})*{width}/2)*2"
+            chain += (f",format=rgba,"
+                      f"scale=w='trunc(({w_expr})*{width}/2)*2':"
+                      f"h='{h_expr}':eval=frame")
         else:
-            seg_scale = float(ov["size"])
-        ow = _even(seg_scale * width)
-        chain += f",scale={ow}:-2,format=rgba"
+            ow = _even(float(ov["size"]) * width)
+            chain += f",scale={ow}:-2,format=rgba"
         if ov.get("chroma_key_hex"):
             sim = float(ov.get("chroma_similarity", 0.3))
             blend = float(ov.get("chroma_blend", 0.1))
             chain += (f",colorkey=0x{ov['chroma_key_hex']}:similarity={sim}:blend={blend}")
-        if ov.get("mask"):
-            chain += "," + _mask_geq(ov["mask"])
-        chain += _effect_chain(ov)
-        if kfs and len({f["opacity"] for f in kfs}) > 1:
-            # Smooth opacity via geq: N counts frames of this segment
-            # stream (fps-normalised), so overlay time is
-            # seg_start + N/fps. Verified against FFmpeg: geq's T
-            # does not track segment time, N does.
-            op_expr = _interp_expr([(f["time"], f["opacity"]) for f in kfs],
-                                   f"({seg_start!r}+N/{fps})")
-            chain += (f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                      f"a='255*({op_expr})'")
-        elif float(ov.get("opacity", 1.0)) < 1.0:
-            chain += f",colorchannelmixer=aa={float(ov['opacity'])}"
-        chain += f",setpts=PTS+{abs_start}/TB[ov{si}]"
-        filters.append(chain)
+        op_vary = bool(kfs) and len({f["opacity"] for f in kfs}) > 1
+        # Alpha intersection (Loop 6 round 2): when chroma key meets
+        # a mask (or varying opacity), the old chain replaced the
+        # alpha channel — first the mask geq, then the opacity geq —
+        # so keyed colour reappeared inside the mask and opacity
+        # keyframes destroyed keying. Instead, take the keyed alpha
+        # apart (alphaextract, exact frame size, no guessing),
+        # multiply it by the mask factor and/or the opacity factor
+        # in a gray geq (lum(X,Y) works on this build; a(X,Y) does
+        # not), and merge it back (alphamerge). Final alpha is then
+        # keyed-alpha x mask x opacity, exactly the intersection.
+        if ov.get("chroma_key_hex") and (ov.get("mask") or op_vary):
+            filters.append(chain + f"[ovk{si}]")
+            filters.append(f"[ovk{si}]split=2[ovrgb{si}][ovkeya{si}]")
+            factors = []
+            if ov.get("mask"):
+                factors.append(f"({_mask_factor_expr(ov['mask'])})")
+            if op_vary:
+                op_expr = _interp_expr([(f["time"], f["opacity"]) for f in kfs],
+                                       f"({seg_start!r}+N/{fps})")
+                factors.append(f"({op_expr})")
+            alpha_expr = "lum(X,Y)" + "".join(f"*{f}" for f in factors)
+            filters.append(
+                f"[ovkeya{si}]alphaextract,"
+                f"geq=lum='{alpha_expr}'[ovam{si}]")
+            filters.append(f"[ovrgb{si}][ovam{si}]alphamerge[ovfin{si}]")
+            cur = f"ovfin{si}"
+            eff = _effect_chain(ov)
+            if eff:
+                filters.append(f"[ovfin{si}]{eff}[ove{si}]")
+                cur = f"ove{si}"
+            if not op_vary and float(ov.get("opacity", 1.0)) < 1.0:
+                # Constant opacity multiplies alpha (safe, unlike geq).
+                filters.append(
+                    f"[{cur}]colorchannelmixer=aa={float(ov['opacity'])}[ovop{si}]")
+                cur = f"ovop{si}"
+            filters.append(f"[{cur}]setpts=PTS+{abs_start}/TB[ov{si}]")
+        else:
+            if ov.get("mask"):
+                chain += "," + _mask_geq(ov["mask"])
+            chain += _effect_chain(ov)
+            if op_vary:
+                # Smooth opacity via geq: N counts frames of this segment
+                # stream (fps-normalised), so overlay time is
+                # seg_start + N/fps. Verified against FFmpeg: geq's T
+                # does not track segment time, N does.
+                op_expr = _interp_expr([(f["time"], f["opacity"]) for f in kfs],
+                                       f"({seg_start!r}+N/{fps})")
+                chain += (f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                          f"a='255*({op_expr})'")
+            elif float(ov.get("opacity", 1.0)) < 1.0:
+                chain += f",colorchannelmixer=aa={float(ov['opacity'])}"
+            chain += f",setpts=PTS+{abs_start}/TB[ov{si}]"
+            filters.append(chain)
         if kfs:
             # Smooth position: overlay x/y expressions use main
             # timeline time t (verified: overlay honours t).
@@ -687,6 +771,37 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0):
     else:
         for j in range(len(audio_tracks)):
             mix_inputs.append(f"[t{j}]")
+    # Overlay audio (Loop 6 round 4): a sounding overlay is mixed
+    # in at its timeline start, for its shown duration, at its
+    # volume. It is not ducked: it sits alongside the main mix
+    # like a sound effect. Looping overlays loop their trimmed
+    # source audio; otherwise the audio is trimmed to exactly the
+    # shown duration, so it never outlives the overlay on screen.
+    for si, (ov, seg_start, seg_end, idx, audio_idx) in enumerate(overlay_segments):
+        if audio_idx is None:
+            continue
+        ovol = float(ov.get("volume") or 0.0)
+        ostart = float(ov["start"])
+        odur = float(ov["duration"])
+        tin = float(ov["trim_in"])
+        tout = float(ov["trim_out"])
+        src_dur = tout - tin
+        if odur > src_dur + 0.01:
+            samples = max(1, int(round(src_dur * 48000)))
+            pre = (f"atrim=start={tin}:end={tout},asetpts=PTS-STARTPTS,"
+                   f"aresample=48000,aloop=loop=-1:size={samples}:start=0,"
+                   f"atrim=end={odur},asetpts=PTS-STARTPTS")
+        else:
+            pre = (f"atrim=start={tin}:end={tin + odur},"
+                   f"asetpts=PTS-STARTPTS,aresample=48000")
+        start_ms = int(round(ostart * 1000))
+        filters.append(
+            f"[{audio_idx}:a]{pre},"
+            f"aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"adelay={start_ms}|{start_ms},apad=whole_dur={total},"
+            f"atrim=end={total},asetpts=PTS-STARTPTS,"
+            f"volume={ovol}[ova{si}]")
+        mix_inputs.append(f"[ova{si}]")
     if len(mix_inputs) == 1:
         aout = acur_chain
     else:
@@ -1496,8 +1611,27 @@ def split_clip(project, clip_id, at):
     return True, new_project
 
 
+def _pid_alive(pid):
+    """True if a pid exists (a worker that died leaves no process)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class JobStore:
-    """Async render/preview jobs stored as JSON files under a directory."""
+    """Async render/preview jobs stored as JSON files under a directory.
+
+    Jobs run as detached subprocesses (Loop 6 round 1), not as threads
+    of the server: a client may close stdio right after queueing a
+    job and the worker keeps running. Job state lives on disk, so a
+    NEW server connection can poll jobs from earlier sessions.
+    """
 
     def __init__(self, directory):
         self.directory = directory
@@ -1510,8 +1644,7 @@ class JobStore:
         job_id = uuid.uuid4().hex[:12]
         record = {"id": job_id, "kind": kind, "status": "queued",
                   "project": project, "output": None, "error": None}
-        with open(self._path(job_id), "w") as fh:
-            json.dump(record, fh)
+        self._write(record)
         return job_id
 
     def get(self, job_id):
@@ -1519,11 +1652,27 @@ class JobStore:
         if not os.path.isfile(path):
             return None
         with open(path) as fh:
-            return json.load(fh)
+            record = json.load(fh)
+        # A worker that died without writing a final state would
+        # otherwise leave a job stuck in "running" forever. Its pid
+        # is gone, so the job is failed, not running.
+        if (record.get("status") in ("queued", "running")
+                and record.get("pid")
+                and not _pid_alive(record["pid"])):
+            record["status"] = "failed"
+            record["error"] = {"code": "RENDER_FAILED",
+                               "message": "job worker exited before completing"}
+            self._write(record)
+        return record
 
     def _write(self, record):
-        with open(self._path(record["id"]), "w") as fh:
+        # Atomic state file: write beside the target, then rename, so
+        # a reader never sees a half-written job record.
+        path = self._path(record["id"])
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
             json.dump(record, fh)
+        os.replace(tmp, path)
 
     def run_async(self, job_id, out_dir):
         record = self.get(job_id)
@@ -1531,21 +1680,48 @@ class JobStore:
             return
         record["status"] = "running"
         self._write(record)
+        # Detached worker: a new session, no stdio inheritance, so
+        # closing the client's stdio pipe cannot kill it. It runs
+        # `agentcut worker` from this same source tree (PYTHONPATH
+        # pointed at src/) with the spawning server's working
+        # directory, so relative media paths resolve identically.
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "agentcut", "worker",
+             self.directory, job_id, out_dir],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            close_fds=True, cwd=os.getcwd(), env=env)
+        record["pid"] = proc.pid
+        self._write(record)
 
-        def _work():
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-                if record["kind"] == "preview":
-                    ok, info = preview_project(record["project"], out_dir)
-                else:
-                    out_path = os.path.join(out_dir, "output.mp4")
-                    ok, info = render_project(record["project"], out_path)
-                record["status"] = "done" if ok else "failed"
-                record["output"] = info if ok else None
-                record["error"] = None if ok else info
-            except Exception as exc:  # never leave a job stuck in running
-                record["status"] = "failed"
-                record["error"] = {"code": "RENDER_FAILED", "message": str(exc)}
-            self._write(record)
 
-        threading.Thread(target=_work, daemon=True).start()
+def run_job_worker(jobs_dir, job_id, out_dir):
+    """Detached worker entry point: run one job and write its state.
+
+    Reads the job record from disk (never from the spawning server's
+    memory), runs the render or preview, and writes the final state
+    atomically. Returns True on a completed job, False otherwise.
+    """
+    store = JobStore(jobs_dir)
+    record = store.get(job_id)
+    if record is None:
+        return False
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        if record["kind"] == "preview":
+            ok, info = preview_project(record["project"], out_dir)
+        else:
+            out_path = os.path.join(out_dir, "output.mp4")
+            ok, info = render_project(record["project"], out_path)
+        record["status"] = "done" if ok else "failed"
+        record["output"] = info if ok else None
+        record["error"] = None if ok else info
+    except Exception as exc:  # never leave a job stuck in running
+        record["status"] = "failed"
+        record["error"] = {"code": "RENDER_FAILED", "message": str(exc)}
+        ok = False
+    store._write(record)
+    return ok

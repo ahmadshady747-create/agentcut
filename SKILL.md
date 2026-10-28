@@ -25,7 +25,7 @@ failure is a JSON object with `code` and `message`.
   render is not.
 - Call `preview_project`, look at the returned frames and contact
   sheet, and only then call `render_project` for the final MP4.
-- Poll `get_job` until status is `done` or `failed`. Never present a
+- Poll `get_job` until status is `done` or `failed`. Jobs are detached processes: closing stdio cannot kill them, and a new connection can poll them. Never present a
   queued or running job as a finished video.
 - After `done`, verify the output with the probe data in the job
   result: duration, width, height, video and audio streams.
@@ -165,9 +165,12 @@ the only source of truth it edits.
 Use `overlays` for picture-in-picture: a second visual track above
 the main timeline. Give each overlay an id, kind, src, start and
 duration that fit inside the timeline, a size fraction, and a
-position or x/y. Check the render's frames at a second inside the
-overlay window to confirm placement; if validation reports an
-overlay error, follow its `fix` hint.
+position or x/y. A video overlay may set `volume` (default 0.0
+muted) to mix its audio in during its window; volume on an image
+or silent overlay is a validation error. Check the render's
+frames at a second inside the overlay window to confirm
+placement; if validation reports an overlay error, follow its
+`fix` hint.
 
 ## Overlay keyframes
 

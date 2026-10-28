@@ -111,6 +111,8 @@ Rules, enforced by validation before any render:
 - `render_project` — start an async render job.
 - `get_job` — poll a render/preview job: queued, running, done, failed,
   with output path and ffprobe info on success, or a structured error.
+  Jobs run as detached processes and survive the client closing
+  stdio; a new connection can poll jobs from earlier sessions.
 
 Every error is a JSON object with `code` and `message`, plus `field`
 and `clip_id` when they apply. Error codes: `INVALID_SCHEMA`,
@@ -204,8 +206,11 @@ fraction of the output width (default 0.35), a position preset
 (`top_left`, `top_center`, `top_right`, `center`, `bottom_left`,
 `bottom_center`, `bottom_right`) or x/y pixel offsets, and an
 opacity 0..1. Video overlays trim like clips and loop when shown
-longer than their trimmed source. Overlay audio is not mixed in
-v1; use a project audio track for sound. See
+longer than their trimmed source. An overlay video may also set
+`volume` (0..2, default 0.0 muted): its audio is then mixed in
+at the overlay's start, for its shown duration, alongside the
+project audio tracks. Volume above zero on an image overlay or
+a silent video is a validation error with a fix hint. See
 examples/overlay.json. Overlay validation errors carry a `fix`
 hint, so an agent can correct the project directly.
 
@@ -216,11 +221,15 @@ a `time` in seconds since the overlay starts, plus any of `x`, `y`
 (pixels), `scale` (fraction of output width) and `opacity` (0..1).
 Values interpolate linearly between keyframes; a field a keyframe
 omits keeps the previous keyframe's value, or the overlay's base
-value. Position and opacity animate smoothly; scale animates
-through short fixed-scale segments (an FFmpeg limitation: a
-stream's frame size cannot change per frame). Scale keyframes on
-a looping video overlay are rejected — shorten the overlay to
-its trimmed source duration, or drop the scale keyframes.
+value. Position, opacity and scale all animate smoothly per
+frame (scale uses FFmpeg scale eval=frame; note that a format
+filter after a varying scale pins the stream to its first
+frame's size, so the format conversion sits before the scale).
+Scale keyframes on a looping video overlay are rejected —
+shorten the overlay to its trimmed source duration, or drop the
+scale keyframes — and so is chroma_key with scale keyframes,
+because colorkey cannot handle per-frame size changes on this
+FFmpeg build.
 
 ## Split, reverse, freeze, loop
 
@@ -247,9 +256,10 @@ optional `mask_feather` in pixels for a soft edge; masked main
 clips show black outside the mask. A clip may use
 `fit: "blur"` instead of contain/cover: a blurred, darkened
 copy of the clip fills the frame behind the contained clip.
-Mask coordinates are frame pixels. Do not combine mask with
-chroma_key on one overlay (the mask replaces the keyed
-transparency there), and do not combine mask with scale
+Mask coordinates are frame pixels. Mask and chroma_key now
+intersect on clips and overlays: the keyed colour stays
+transparent inside the mask, and everything outside the mask
+stays hidden. Do not combine mask with scale
 keyframes (rejected with a fix).
 
 ## More transitions and effects

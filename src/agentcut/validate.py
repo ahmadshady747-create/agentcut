@@ -711,6 +711,27 @@ def validate_project(project):
                               fix="set opacity between 0 and 1"))
             continue
         rov["opacity"] = opacity
+        # Overlay audio (Loop 6 round 4): optional, default muted
+        # so every existing project keeps its old behaviour. A
+        # volume above zero needs a video overlay whose file
+        # actually has an audio stream (ffprobe), images and
+        # silent videos included in the rejection.
+        vol = ov.get("volume", 0.0)
+        try:
+            vol = float(vol)
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "overlay volume must be a number", field="overlays.volume", clip_id=oid,
+                              fix="set volume to a number between 0 (muted) and 2, or omit it"))
+            continue
+        if not 0.0 <= vol <= 2.0:
+            errors.append(err("INVALID_SCHEMA", "overlay volume must be 0..2", field="overlays.volume", clip_id=oid,
+                              fix="set volume between 0 (muted) and 2"))
+            continue
+        if vol > 0 and (kind != "video" or not info_p.get("has_audio")):
+            errors.append(err("INVALID_SCHEMA", "overlay volume needs a video overlay with an audio stream", field="overlays.volume", clip_id=oid,
+                              fix="use a video file with sound for this overlay, or remove volume to keep it muted"))
+            continue
+        rov["volume"] = vol
         position = ov.get("position", "bottom_right")
         if position not in TEXT_POSITIONS:
             errors.append(err("INVALID_SCHEMA", "overlay position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field="overlays.position", clip_id=oid,
@@ -844,6 +865,15 @@ def validate_project(project):
                         if "mask" in rov and len({f["scale"] for f in filled}) > 1:
                             errors.append(err("INVALID_SCHEMA", "mask cannot combine with scale keyframes (mask coordinates are in fixed overlay-frame pixels)", field="overlays.mask_shape", clip_id=oid,
                                               fix="remove scale keyframes, or remove the mask, on this overlay"))
+                        if rov.get("chroma_key_hex") and len({f["scale"] for f in filled}) > 1:
+                            # Verified on this FFmpeg build (Loop 6
+                            # round 3): colorkey fails while filtering
+                            # when its input frame size changes every
+                            # frame, so a varying scale cannot be
+                            # keyed. Reject loudly, never render a
+                            # broken or half-keyed overlay.
+                            errors.append(err("INVALID_SCHEMA", "chroma_key cannot combine with scale keyframes (colorkey cannot handle per-frame size changes on this FFmpeg build)", field="overlays.chroma_key", clip_id=oid,
+                                              fix="remove chroma_key, or use a constant overlay size (drop scale keyframes), on this overlay"))
         resolved_overlays.append(rov)
     for label, items in (("texts", project.get("texts") or []), ("captions", project.get("captions") or [])):
         if not isinstance(items, list):

@@ -2,7 +2,7 @@
 import json
 import sys
 
-from .render import poster_frame, preview_project, produce_variants, produce_video, render_project, split_clip, timeline_summary
+from .render import poster_frame, preview_project, produce_variants, produce_video, render_project, run_job_worker, split_clip, timeline_summary
 from .server import serve
 from .validate import probe_media, validate_project
 
@@ -52,11 +52,16 @@ def main(argv):
         ok, info = split_clip(_load(argv[1]), argv[2], float(argv[3]))
         print(json.dumps(info, indent=2, default=str))
         return 0 if ok else 1
+    if argv[0] == "worker" and len(argv) == 4:
+        # Detached job worker (internal): run one queued job from its
+        # disk state file and write the final state back to disk.
+        # Started by JobStore.run_async, never by hand in normal use.
+        return 0 if run_job_worker(argv[1], argv[2], argv[3]) else 1
     if argv[0] == "probe" and len(argv) == 2:
         info = probe_media(argv[1])
         print(json.dumps(info, indent=2, default=str) if info else "cannot probe")
         return 0 if info else 1
-    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>]")
+    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|worker <jobs_dir> <job_id> <out_dir>]")
     return 2
 
 
