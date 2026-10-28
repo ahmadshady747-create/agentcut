@@ -1,0 +1,19 @@
+{
+  "id": "kenburns",
+  "title": "Ken Burns test",
+  "version": 1,
+  "output": {
+    "width": 360,
+    "height": 640,
+    "fps": 24
+  },
+  "clips": [
+    {
+      "id": "k1",
+      "kind": "image",
+      "src": "data/test_media/pattern.png",
+      "duration": 3,
+      "ken_burns": "zoom_in"
+    }
+  ]
+}

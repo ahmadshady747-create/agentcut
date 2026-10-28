@@ -1,0 +1,27 @@
+{
+  "id": "wipe",
+  "title": "Wipe transition test",
+  "version": 1,
+  "output": {
+    "width": 360,
+    "height": 640,
+    "fps": 24
+  },
+  "clips": [
+    {
+      "id": "w1",
+      "kind": "video",
+      "src": "data/test_media/clip1.mp4",
+      "trim_in": 0,
+      "trim_out": 3
+    },
+    {
+      "id": "w2",
+      "kind": "video",
+      "src": "data/test_media/clip2.mp4",
+      "trim_in": 0,
+      "trim_out": 3,
+      "transition": "wipe_left"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+1
+00:00:00,500 --> 00:00:02,500
+First caption from SRT.
+
+2
+00:00:03,500 --> 00:00:06,500
+Second caption from SRT.

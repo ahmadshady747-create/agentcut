@@ -1,0 +1,1 @@
+{"clips":[{"id":"c1","kind":"video","src":"data/test_media/clip1.mp4","trim_in":0,"trim_out":3},{"id":"c2","kind":"video","src":"data/test_media/clip2.mp4","transition":"crossfade","trim_in":0,"trim_out":3}],"id":"crossfade","output":{"fps":24,"height":640,"width":360},"title":"AgentCut crossfade test","version":1}

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/*
+!data/test_media/
+backups/
+*.mp4
+out.mp4
