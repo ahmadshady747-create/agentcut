@@ -125,7 +125,7 @@ does not reorder on its own.
 - This is an original tool. It contains no CapCut code, assets or
   effects, and it does not import or export CapCut drafts in v1.
 
-Ken Burns: an image clip may set `ken_burns` to `zoom_in`, `zoom_out`, `pan_left` or `pan_right`. It is rejected on video clips.
+Ken Burns: an image clip may set `ken_burns` to `zoom_in`, `zoom_out`, `pan_left` or `pan_right`. It is rejected on video clips. Since 1.37.2 the range is a gentle 12% drift (1.00->1.12, pans at a constant 1.12x) on a smoothstep ease — not a dramatic zoom — because the old 50% range read as vibration and grotesque zoom in the 1.37.0 rhythm proof.
 
 Crop-fill: clip `fit` is `contain` (default) or `cover` (fill the frame, centre-cropped).
 
@@ -344,6 +344,14 @@ AgentCut edit and verify them.
   `punch_in` on a clip is true (mid-clip, 1.20x) or
   `{at, factor}` with factor 1.18..1.25 and `at` inside the
   clip — a centre scale jump at a frame boundary, no gap.
+  Since 1.37.2 punch_in WINS over Ken Burns and never stacks
+  with it: a punched clip is static until its punch time,
+  then holds its punch factor, so the factor is the TOTAL
+  scale (max 1.25x). A clip with both an explicit
+  `ken_burns` and `punch_in` warns as
+  `punch_in_overrides_ken_burns` (warnings only);
+  `timeline_summary` reports such clips as
+  `effective_ken_burns: "none (punch_in)"`.
 - Static shots: a still longer than 4.5s with no ken_burns,
   punch_in, default motion or animated overlay warns as
   `static_shot_warning` in validate warnings, the timeline

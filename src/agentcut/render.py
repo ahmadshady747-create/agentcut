@@ -603,7 +603,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                       f"force_original_aspect_ratio=decrease,"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                       f"fps={fps},format=yuv420p")
-        elif clip.get("ken_burns") not in (None, "none") or effective_ken_burns(clip, i, project) not in (None, "none"):
+        elif effective_ken_burns(clip, i, project) not in (None, "none"):
+            # v1.37.2: the branch is driven by the EFFECTIVE motion
+            # alone. A clip with punch_in has effective motion
+            # "none" (punch wins over Ken Burns), so it falls
+            # through to the still-image branch below and the
+            # punch post-scale is its only motion — never stacked.
             kb = effective_ken_burns(clip, i, project)
             frames = max(1, int(round(dur * fps)))
             # Pre-scale to 2x output (cropped to a centred 2x frame) so
@@ -611,18 +616,28 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             pre = (f"{downscale}scale={2 * width}:{2 * height}:"
                    f"force_original_aspect_ratio=increase,"
                    f"crop={2 * width}:{2 * height}")
+            # Gentle drift (v1.37.2, intentional change): the old
+            # 1.0->1.5 zoom (50%) read as vibration and grotesque
+            # zoom in the 1.37.0 rhythm proof, especially stacked
+            # with punch-in (up to 1.8x). Ken Burns is now a
+            # subtle 12% drift, eased with a smoothstep curve
+            # (slow start, faster middle, slow landing) instead of
+            # a mechanical linear ramp, so motion starts and lands
+            # softly. s is the smoothstep of the frame progress.
+            _p = f"on/{frames}"
+            _s = f"({_p})*({_p})*(3-2*({_p}))"
             if kb == "zoom_in":
-                z = f"1+0.5*on/{frames}"
+                z = f"1+0.12*{_s}"
                 x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
             elif kb == "zoom_out":
-                z = f"1.5-0.5*on/{frames}"
+                z = f"1.12-0.12*{_s}"
                 x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
             elif kb == "pan_left":
-                z = "1.3"
-                x_expr, y_expr = f"(iw-iw/zoom)*on/{frames}", "(ih-ih/zoom)/2"
+                z = "1.12"
+                x_expr, y_expr = f"(iw-iw/zoom)*{_s}", "(ih-ih/zoom)/2"
             else:  # pan_right
-                z = "1.3"
-                x_expr, y_expr = f"(iw-iw/zoom)*(1-on/{frames})", "(ih-ih/zoom)/2"
+                z = "1.12"
+                x_expr, y_expr = f"(iw-iw/zoom)*(1-{_s})", "(ih-ih/zoom)/2"
             vf = (f"[{i}:v]{pre},zoompan=z='{z}':x='{x_expr}':y='{y_expr}':"
                   f"d={frames}:s={width}x{height}:fps={fps},"
                   f"setpts=PTS-STARTPTS,format=yuv420p")
@@ -761,15 +776,21 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             vlabel = f"vout{i}"
         vlabels.append(vlabel)
         if clip.get("punch_at") is not None:
-            # Punch-in (v1.37.0): a frame-boundary scale jump
-            # toward the panel centre at punch_at (clip-local
-            # seconds), with no gap — the same stream, scaled up
-            # by punch_factor after that time and cropped back to
-            # the constant output size. scale eval=frame makes
-            # the size time-varying, crop pins the output size,
-            # so concat/xfade downstream always see a constant
-            # frame size. Dimensions are truncated to even, as
-            # yuv420p requires.
+            # Punch-in (v1.37.0, redefined v1.37.2): a
+            # frame-boundary scale jump toward the panel centre
+            # at punch_at (clip-local seconds), with no gap — the
+            # same stream, scaled up by punch_factor after that
+            # time and cropped back to the constant output size.
+            # scale eval=frame makes the size time-varying, crop
+            # pins the output size, so concat/xfade downstream
+            # always see a constant frame size. Dimensions are
+            # truncated to even, as yuv420p requires. v1.37.2
+            # rule: punch_factor is the TOTAL scale, never a
+            # multiplier on Ken Burns — a punched clip never
+            # also zooms (effective_ken_burns returns "none" for
+            # it), so the stream entering this filter is
+            # un-zoomed: 1.0x before punch_at, punch_factor
+            # after, held to clip end.
             _pa = float(clip["punch_at"])
             _pf = float(clip.get("punch_factor", 1.20))
             _sw = (f"trunc(if(lt(t,{_pa!r}),{width},{width}*{_pf})/2)*2")
@@ -2610,7 +2631,10 @@ def timeline_summary(project):
         # punch-in and element SFX, so the agent can reason from
         # the summary instead of re-reading the project.
         _eff = effective_ken_burns(clip, i, project)
-        if _eff != clip.get("ken_burns", "none"):
+        if clip.get("punch_at") is not None:
+            # v1.37.2: punch wins over Ken Burns, recorded plainly.
+            seg["effective_ken_burns"] = "none (punch_in)"
+        elif _eff != clip.get("ken_burns", "none"):
             seg["effective_ken_burns"] = _eff
         if clip.get("punch_at") is not None:
             seg["punch_at"] = clip["punch_at"]

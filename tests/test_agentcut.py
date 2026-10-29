@@ -3461,6 +3461,157 @@ class TestAgentCut(unittest.TestCase):
         self.assertEqual(info["clips"][0]["punch_at"], 2.0)
         self.assertEqual(info["clips"][0]["punch_factor"], 1.20)
 
+    def test_loop1372_gentle_ken_burns_range_and_smoothstep(self):
+        # 1.37.2 motion comfort: Ken Burns is a gentle 12% drift
+        # (was 50%), eased with a smoothstep curve. A centred
+        # red box on a big white source measures the scale
+        # directly: zoom_in starts near 1.00x and lands near
+        # 1.12x, and the per-quarter scale steps are smaller at
+        # the ends than in the middle (smoothstep), not equal
+        # (linear). Quarter means over 5 frames each average
+        # out resampling noise.
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-kb1372-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=white:s=1440x2560",
+                            "-vf", "drawbox=x=420:y=980:w=600:h=600:"
+                            "color=red:t=fill",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "kb", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 10},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 4, "ken_burns": "zoom_in"}]}
+            out = os.path.join(tmp, "kb.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+
+            def _q(frames):
+                return sum(_red_bbox_width(out, f / 10.0)
+                           for f in frames) / len(frames)
+            q1 = _q([1, 2, 3, 4, 5])
+            q2 = _q([11, 12, 13, 14, 15])
+            q3 = _q([21, 22, 23, 24, 25])
+            q4 = _q([31, 32, 33, 34, 35])
+            # Base box is 300px at 1.00x (600px source at half
+            # scale); gentle range lands near 336px, never 450px.
+            self.assertAlmostEqual(q1, 300, delta=8)
+            self.assertAlmostEqual(q4, 336, delta=12)
+            self.assertLess(q4, 400, "zoom must stay gentle, not 1.5x")
+            # Smoothstep: middle step bigger than both end steps.
+            self.assertLess(q2 - q1, q3 - q2, "ease-in: early < middle")
+            self.assertLess(q4 - q3, q3 - q2, "ease-out: late < middle")
+            # zoom_out mirrors: starts near 336, lands near 300.
+            p["clips"][0]["ken_burns"] = "zoom_out"
+            out2 = os.path.join(tmp, "kbo.mp4")
+            ok, info = render_project(p, out2)
+            self.assertTrue(ok, info)
+            self.assertAlmostEqual(_red_bbox_width(out2, 0.1), 336,
+                                   delta=12)
+            self.assertAlmostEqual(_red_bbox_width(out2, 3.9), 300,
+                                   delta=8)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop1372_punch_does_not_stack(self):
+        # 1.37.2: punch_in is an ABSOLUTE total scale. A clip
+        # with BOTH ken_burns zoom_in and punch_in renders
+        # punch-only motion: still 1.00x before the punch, exactly
+        # the punch factor after — never factor x Ken Burns
+        # (the 1.37.0 stacking that reached 1.8x by clip end).
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-pch1372-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=white:s=1440x2560",
+                            "-vf", "drawbox=x=420:y=980:w=600:h=600:"
+                            "color=red:t=fill",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "p", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 10},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 4, "ken_burns": "zoom_in",
+                            "punch_in": {"at": 2, "factor": 1.20}}]}
+            out = os.path.join(tmp, "pch.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            before = _red_bbox_width(out, 1.0)
+            after = _red_bbox_width(out, 3.0)
+            # Before the punch the clip is still (1.00x), not
+            # mid-zoom (~337px under the old stacking); after,
+            # exactly 1.20x, not 1.20 x 1.375 = 1.65x (~495px).
+            self.assertAlmostEqual(before, 300, delta=8)
+            self.assertAlmostEqual(after, 360, delta=10)
+            self.assertAlmostEqual(after / before, 1.20, delta=0.06)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop1372_punch_boundary_step(self):
+        # 1.37.2: a punched clip (1.20x) into a Ken Burns clip
+        # steps at most 0.25x at the cut (here ~0.20x: 1.20 ->
+        # 1.00), versus 0.3x and up to 0.8x under the old
+        # stacking (a punched clip ended at ~1.8x).
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-bnd1372-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=white:s=1440x2560",
+                            "-vf", "drawbox=x=420:y=980:w=600:h=600:"
+                            "color=red:t=fill",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "b", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 10},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 2,
+                            "punch_in": {"at": 1, "factor": 1.20}},
+                           {"id": "c", "kind": "image", "src": bg,
+                            "duration": 2, "ken_burns": "zoom_in"}]}
+            out = os.path.join(tmp, "bnd.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            last_a = _red_bbox_width(out, 1.9)
+            first_b = _red_bbox_width(out, 2.0)
+            self.assertAlmostEqual(last_a, 360, delta=12)
+            self.assertAlmostEqual(first_b, 300, delta=8)
+            self.assertLessEqual(abs(last_a - first_b) / 300.0, 0.25)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop1372_punch_overrides_ken_burns_warning(self):
+        # 1.37.2: explicit ken_burns + punch_in warns (warnings
+        # only) and the summary records "none (punch_in)".
+        # Default motion + punch does NOT warn: punch winning
+        # over a default is the designed rule, not a conflict.
+        from agentcut.render import timeline_summary
+
+        def _codes(p):
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            return [w.get("code") for w in info.get("warnings", [])]
+        base = {"id": "w", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_red.png", "duration": 6,
+                           "ken_burns": "zoom_in",
+                           "punch_in": True}]}
+        self.assertIn("punch_in_overrides_ken_burns", _codes(base))
+        ok, summ = timeline_summary(base)
+        self.assertTrue(ok, summ)
+        self.assertEqual(summ["segments"][0]["effective_ken_burns"],
+                         "none (punch_in)")
+        p2 = {"id": "w", "version": 1, "default_image_motion": True,
+              "output": {"width": 360, "height": 640, "fps": 30},
+              "clips": [{"id": "a", "kind": "image",
+                         "src": "data/test_red.png", "duration": 6,
+                         "punch_in": True}]}
+        self.assertNotIn("punch_in_overrides_ken_burns", _codes(p2))
+        ok, summ = timeline_summary(p2)
+        self.assertEqual(summ["segments"][0]["effective_ken_burns"],
+                         "none (punch_in)")
+
 
 if __name__ == "__main__":
     unittest.main()

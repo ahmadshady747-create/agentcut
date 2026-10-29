@@ -1,3 +1,58 @@
+## 1.37.2 — Motion comfort: gentle Ken Burns, eased curve, punch never stacks
+
+User defect report on the 1.37.0 rhythm proof video
+(strange vibration, exaggerated zoom, uneasy feeling),
+diagnosed from the proof project and the render code:
+every clip zoomed continuously AND jumped mid-clip, because
+Ken Burns ran 1.0->1.5 (50%) and punch_in MULTIPLIED on top
+of it (a zoom_in clip at ~1.25x at mid-clip jumped to ~1.50x
+and kept zooming to 1.5 x 1.2 = 1.8x by clip end, so the
+character's face became grotesquely large and cropped);
+and clip 0 of the expression cut ended at ~1.8x while clip
+1 (same scene, zoom_out) started at 1.5x — an instant 0.3x
+drop exactly at a cut meant to read as one continuous
+scene. The per-frame integer crop of zoompan over a huge
+0.5x range added resampling shimmer during the zoom.
+- Ken Burns range is now a gentle 12% drift, globally
+  (same code path for explicit and default motion): zoom_in
+  1.00->1.12, zoom_out 1.12->1.00, pans at a constant 1.12x.
+  Intentional change: Ken Burns is now a subtle drift, not
+  a dramatic zoom. Per-frame scale steps are ~4x smaller,
+  which also calms the zoompan shimmer.
+- The zoom/pan progression is now a smoothstep ease (slow
+  start, faster middle, slow landing) instead of a linear
+  ramp, so motion starts and lands softly.
+- punch_in is redefined as an ABSOLUTE total scale, never
+  a multiplier on Ken Burns: when a clip has punch_in,
+  Ken Burns does NOT also apply to it (punch is that
+  clip's motion: static until punch time, jump to the
+  factor, hold to clip end). The worst same-scene boundary
+  step is now punch_factor minus the next clip's Ken Burns
+  start (1.00 or 1.12) — at most 0.25x, typically 0.13x —
+  versus 0.3x-0.8x before. Residual, stated honestly: a
+  same-scene cut still resets scale at the cut (that is
+  normal editing), but the mid-clip double-motion jolt and
+  the 1.8x blow-up are gone. `timeline_summary` records
+  punched clips as `effective_ken_burns: "none (punch_in)"`.
+- New warning (warnings only): a clip that sets BOTH an
+  explicit ken_burns and punch_in warns as
+  `punch_in_overrides_ken_burns`, so old projects degrade
+  visibly, not silently. Default motion + punch does not
+  warn: punch winning over a default is the designed rule.
+- No other behaviour changes: the 1.37.1 SFX audio chain
+  is untouched (the SFX-with-motion regression test still
+  passes), as are captions, scrims, dressing, presets,
+  ducking, grading and jobs.
+- Tests: 4 new test_loop1372_* (gentle range + smoothstep
+  shape from measured red-box widths, punch-does-not-stack,
+  boundary step <= 0.25x, punch-overrides warning +
+  summary); v1 rhythm proof re-rendered with fixed motion
+  as ~/workspace/rhythm-proof-v2/ (same panels, voice,
+  captions, SFX and expression cut; punch clips use
+  fit="cover" in the v2 project ONLY to preserve v1's
+  cover framing, since v1's Ken Burns branch cover-cropped
+  regardless of fit).
+
 ## 1.37.1 — SFX scheduling fix (built-in gating, no atrim after adelay)
 
 Defect found by the coordinator's joint-proof verification,

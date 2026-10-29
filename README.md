@@ -106,7 +106,11 @@ Rules, enforced by validation before any render:
 - Image clips may set `"ken_burns"` to `zoom_in`, `zoom_out`,
   `pan_left` or `pan_right` (default `none`). It is image-only;
   on a video clip, or with an unknown value, validation fails
-  with a structured error.
+  with a structured error. Since 1.37.2 Ken Burns is a gentle
+  12% drift (zoom 1.00->1.12 or 1.12->1.00, pans at a constant
+  1.12x), eased with a smoothstep curve — the old 50% zoom
+  read as vibration and grotesque zoom in the 1.37.0 rhythm
+  proof, especially stacked with punch-in.
 - Transition `"fade"` means fade to/from black at clip boundaries
   (0.3s). Transition `"crossfade"` is a true crossfade: video via
   xfade and audio via acrossfade, 0.5s overlap, so a 3s + 3s timeline
@@ -359,8 +363,17 @@ two stills; a punch-in on a panel; an Arabic active caption.
   clip index) unless a clip sets its own `ken_burns`; clips
   accept `punch_in` (true, or `{at, factor}` with factor
   1.18..1.25) for a centre punch at a frame boundary.
-  `timeline_summary` shows `effective_ken_burns`,
-  `punch_at` / `punch_factor` and `sfx` per segment.
+  Since 1.37.2 punch_in WINS over Ken Burns and never stacks
+  with it: a punched clip is static until its punch time,
+  then holds its punch factor to clip end, so the punch
+  factor is the TOTAL scale (max 1.25x, never 1.8x).
+  `timeline_summary` shows `effective_ken_burns` (a punched
+  clip reports `none (punch_in)`), `punch_at` / `punch_factor`
+  and `sfx` per segment. A clip that sets BOTH an explicit
+  `ken_burns` and `punch_in` warns (`punch_in_overrides_
+  ken_burns`, warnings only); default motion + punch does
+  not warn, because punch winning over a default is the
+  designed rule.
   A still longer than 4.5s with no motion of any kind
   warns (`static_shot_warning`, warnings only).
 - Active captions: a caption with `word_timings` (one

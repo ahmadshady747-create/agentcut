@@ -446,14 +446,22 @@ def _validate_punch_in(clip, duration, errors, cid, resolved_entry):
 
 
 def effective_ken_burns(clip, index, project):
-    """Ken Burns motion actually applied to a clip (v1.37.0).
+    """Ken Burns motion actually applied to a clip (v1.37.2).
 
-    An explicit ken_burns wins. Otherwise, when the project sets
-    default_image_motion, image clips (except blurred-background
-    ones, whose blur chain cannot also zoom) get smooth alternating
-    motion by clip index: even indices zoom_in, odd indices
-    zoom_out. Video clips never get default motion. Returns the
-    motion name or "none"."""
+    Punch-in wins over Ken Burns, always: a clip with punch_in
+    (raw field) or a resolved punch_at never also zooms, because
+    stacking a punch multiplier on a zooming clip blew the scale
+    up to 1.8x in the 1.37.0 rhythm proof and read as vibration
+    and grotesque zoom. A punched clip is static until its punch
+    time, then holds its punch factor — punch IS that clip's
+    motion. Otherwise, an explicit ken_burns wins; and when the
+    project sets default_image_motion, image clips (except
+    blurred-background ones, whose blur chain cannot also zoom)
+    get smooth alternating motion by clip index: even indices
+    zoom_in, odd indices zoom_out. Video clips never get default
+    motion. Returns the motion name or "none"."""
+    if clip.get("punch_in") is not None or clip.get("punch_at") is not None:
+        return "none"
     kb = clip.get("ken_burns", "none")
     if kb not in (None, "none"):
         return kb
@@ -2178,6 +2186,24 @@ def validate_project(project):
     # its window — will read as a frozen frame. Each warning names
     # the clip, so the agent can add motion or accept it.
     try:
+        # Punch-over-Ken-Burns warnings (v1.37.2, warnings only):
+        # a clip that sets BOTH an explicit ken_burns and punch_in
+        # renders punch-only motion — Ken Burns is skipped, not
+        # stacked — so the project degrades visibly, not silently.
+        # Default motion + punch does NOT warn: punch winning over
+        # a default is the designed rule, not a user conflict.
+        _raw_clips = project.get("clips") or []
+        for _ci, _clip in enumerate(info["clips"]):
+            _raw = _raw_clips[_ci] if _ci < len(_raw_clips) else {}
+            if _raw.get("ken_burns") not in (None, "none") \
+                    and _clip.get("punch_at") is not None:
+                info["warnings"].append({
+                    "code": "punch_in_overrides_ken_burns",
+                    "message": (f"image clip '{_clip['id']}' sets both ken_burns "
+                                f"('{_raw.get('ken_burns')}') and punch_in; punch_in wins "
+                                f"and ken_burns is skipped — remove ken_burns to silence "
+                                f"this warning"),
+                    "clip_id": _clip["id"]})
         _starts = info.get("clip_starts") or []
         for _ci, _clip in enumerate(info["clips"]):
             if _clip.get("kind") != "image":
