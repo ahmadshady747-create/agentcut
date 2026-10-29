@@ -1,3 +1,135 @@
+## 1.37.1 — SFX scheduling fix (built-in gating, no atrim after adelay)
+
+Defect found by the coordinator's joint-proof verification,
+NOT by the 1.37.0 suite (its SFX timing tests never combined
+SFX with default_image_motion): when a project set
+default_image_motion=true, EVERY SFX — clip, text, caption,
+overlay — played from t=0 and its scheduled window was
+silent. Root cause, pinned by ashowinfo frame inspection on
+this FFmpeg build: adelay's delay exists only as leading
+silence frames, and atrim after adelay DISCARDS those silence
+frames; amix then mixes by arrival order, so the audio lands
+at position 0. The failure was nondeterministic for lavfi
+built-ins (7/8 broken in an isolated reproduction) and
+deterministic for file inputs (12/12 broken). The filter
+graph itself looked correct in both cases, which is why
+graph inspection alone never caught it.
+- Built-in SFX are now full-timeline gated aevalsrc sources
+  (expression zero outside [start, start+duration), phase
+  re-based to (t - start) inside) with NO adelay, apad,
+  atrim or asetpts: timing is carried by the samples, so no
+  timestamp re-basing can move it. Proven 12/12 in the
+  isolated zoompan graph and 6/6 on the r11 repro.
+- File-path SFX, audio tracks and overlay audio now use
+  adelay ALONE (no apad/atrim/asetpts after it): adelay's
+  silence frames are the delay, the clip-silence chain
+  guarantees the mix length, and -t truncates any stream
+  that runs past the timeline. The same atrim hazard
+  affected tracks/overlay audio with a non-zero start under
+  a Ken Burns graph, so they got the same one-pattern fix.
+- Regression test test_loop1371_sfx_timing_with_default_
+  motion: volumedetect windows (silence before, energy
+  inside) with motion on and off for clip SFX, text SFX,
+  caption SFX, several SFX sharing one start time, file
+  SFX, and an audio track start — it fails on 1.37.0 code
+  (motion-on clip pre window -21.0 dB) and passes on
+  1.37.1. No other behaviour changed; full suite green in
+  the main tree and in a fresh copy (see STATE.md audit).
+
+## 1.37.0 — Visual rhythm, part 1 (procedural SFX + auto-binding, micro-motion + punch-in, active word-highlight captions)
+
+Coordinator order 2026-10-29, part 1 of 2. All deterministic,
+stdlib + FFmpeg only, no new dependencies, no in-tool AI:
+AgentCut still only consumes files and timings the agent
+supplies. Tests 94/86+8 new (see STATE.md audit) in the main
+tree and in a fresh copy. Example: examples/visual-rhythm.json.
+Proof frames: proofs-1.37.0/ (motion first/last, punch
+before/after, active Arabic word 1/2/4).
+- Built-in procedural SFX + auto-binding: six named sounds
+  generated at render time from lavfi aevalsrc inputs — no
+  pre-generated files. pop (soft fast 900 Hz burst, 0.30s),
+  whoosh (rising air sweep, 1.00s), cash and chime (the same
+  clean metallic ring, 1.20s, by design: both words name the
+  same money/key-number sound), click (light 2.5 kHz click,
+  0.12s), ding (bright 1760 Hz alert, 0.90s), thud (deep
+  falling low pulse, 0.70s). Any text, caption, clip
+  (transition) or overlay may set `sfx` (a built-in name or
+  a local audio file path) and optional `sfx_volume`
+  (0..2, default 0.35); render.py schedules it at the exact
+  element start (text start, clip timeline start — the
+  transition start for xfade clips — overlay start) and
+  mixes it into the final audio, so the agent never computes
+  adelay by hand. SFX work with no other audio: the clip
+  silence chain guarantees a valid audio stream. Unknown
+  names are structured errors listing the valid names;
+  volume range and file existence/audio-stream are
+  validated. Implementation note, verified the hard way:
+  adelay does NOT shift aevalsrc filter-source frames on
+  this FFmpeg build (energy landed at 0s, not at the delay),
+  while the same aevalsrc as a lavfi input delays correctly
+  — built-ins therefore enter as lavfi inputs, the same
+  pattern audio tracks already use. Render packs collect
+  and rewrite file-path SFX like any other media file.
+- Auto micro-motion + punch-in: project-level
+  `default_image_motion` (true/false, default off) gives
+  every image clip without an explicit ken_burns smooth
+  alternating motion by clip index (even zoom_in, odd
+  zoom_out); blurred-background clips are excluded (their
+  blur chain cannot also zoom) and video clips never get
+  default motion. `timeline_summary` reports the motion
+  actually applied as `effective_ken_burns` when it differs
+  from the clip's own field, and produce briefs pass the
+  switch and per-clip `punch_in`/`sfx` through. Clips
+  (image or video) may set `punch_in`: true (mid-clip,
+  1.20x) or {at, factor} with at strictly inside the
+  rendered clip duration and factor 1.18..1.25 — a
+  frame-boundary scale jump toward the panel centre via
+  scale eval=frame cropped back to the constant output
+  size, so concat/xfade downstream always see a constant
+  frame size and there is no gap. Measured on a centred
+  red square: 100px -> 122px at factor 1.22.
+- Static-shot warning (warnings only, never blocking):
+  `static_shot_warning` in validate info["warnings"],
+  timeline_summary and produce QA for any still-image clip
+  longer than 4.5s with no ken_burns, no punch_in, no
+  animated overlay (keyframes) overlapping its window, and
+  no default motion active. Each warning names the clip.
+- Active word-highlight captions (per-word mode SHIPPED,
+  not the chunk fallback): a caption may carry
+  `word_timings` — one {word, start, end} per caption word,
+  in absolute timeline seconds, in order, non-overlapping,
+  inside the caption window, whose words must equal the
+  caption words — plus optional `highlight_color` (default
+  yellow) and `highlight_mode` ("word" default, or "chunk").
+  Rendered in short chunks of 2–4 words (greedy groups of
+  3, tail rebalanced so no chunk is a single word). In word
+  mode each word is drawn twice at the same measured x —
+  once in the base colour for the whole chunk window, once
+  in the highlight colour (with box + shadow) for just that
+  word's window — so the highlight can never drift off its
+  word. Word widths are measured, not estimated: each word
+  is rendered alone by FFmpeg and its ink box read back via
+  cropdetect (stdlib + FFmpeg only), with the 0.6 x size
+  estimate as fallback if measurement fails. Arabic joining
+  is safe by construction (joining happens inside a word,
+  never across the space between words), RTL chunks render
+  in reverse visual order, and the 1.33.0 BiDi transform
+  still applies per word. Frame-verified at 720 wide:
+  هذا yellow at word 1, اختبار yellow at word 2, للكلمات
+  yellow at word 4, other words white, letters joined,
+  spacing natural. A chunk wider than the frame warns
+  (`active_chunk_overflow_warning`): at 360 wide the same
+  4-word Arabic chunk clips at the edges, which the warning
+  flags honestly — use a smaller size or a wider frame for
+  long active chunks. In chunk mode each chunk renders as
+  one caption in the highlight colour for its window.
+  word_timings cannot combine with reveal, animation or
+  fades, and is captions-only (texts with word_timings are
+  a structured error). INTENTIONAL appearance change: none
+  for existing projects — every new field defaults off or
+  absent, and single-line captions without word_timings
+  render exactly as before.
+
 ## 1.36.0 — Text & graphics polish (wrapped captions, shadows, scrims, overlay dressing, rounded text boxes)
 
 User order 2026-10-29: improve the writing and the drawing

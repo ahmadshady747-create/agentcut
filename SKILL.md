@@ -320,3 +320,46 @@ AgentCut edit and verify them.
   block a render. Boxes are estimates (see CHANGELOG), so
   treat a warning as "check this frame", not as proof of a
   visible collision.
+
+## Visual rhythm, part 1 (1.37.0)
+
+- SFX: put `sfx` on a text, caption, clip or overlay and
+  AgentCut fires it at that element's start — never compute
+  an adelay yourself. Built-ins: `pop` (text/badge
+  appearance), `whoosh` (transitions, slide texts), `cash`
+  and `chime` (the same metallic ring, for money figures
+  and key numbers), `click` (labels, scene switches),
+  `ding` (titles), `thud` (explosive entrances). Or give a
+  local audio file path. `sfx_volume` defaults to 0.35
+  (0..2). SFX alone still produce a valid audio stream.
+  1.37.1: timing holds with `default_image_motion` on and
+  off (built-ins are time-gated; file SFX use adelay
+  alone) — the 1.37.0 code played every SFX from t=0
+  under motion because atrim after adelay discarded the
+  delay silence.
+- Micro-motion: `default_image_motion: true` on the project
+  animates stills automatically (zoom_in on even clip
+  indices, zoom_out on odd ones); a clip's own `ken_burns`
+  always wins, and blurred-fit stills are excluded.
+  `punch_in` on a clip is true (mid-clip, 1.20x) or
+  `{at, factor}` with factor 1.18..1.25 and `at` inside the
+  clip — a centre scale jump at a frame boundary, no gap.
+- Static shots: a still longer than 4.5s with no ken_burns,
+  punch_in, default motion or animated overlay warns as
+  `static_shot_warning` in validate warnings, the timeline
+  summary and produce QA. Warnings only — add motion or
+  accept the frozen frame.
+- Active captions: a caption's `word_timings` must list
+  every caption word once, in order, with absolute
+  start/end inside the caption window (AgentCut computes
+  nothing here — timings come from transcription). It
+  renders in 2–4 word chunks with the current word in
+  `highlight_color` (default yellow); `highlight_mode:
+  "chunk"` highlights the whole active chunk instead.
+  Per-word mode is the shipped behaviour: widths are
+  measured with FFmpeg, so the highlight covers its word
+  exactly, Arabic letters stay joined and RTL order holds.
+  word_timings cannot combine with reveal, animation or
+  fades. A chunk wider than the frame warns
+  (`active_chunk_overflow_warning`) — shrink the size or
+  widen the frame for long active chunks.

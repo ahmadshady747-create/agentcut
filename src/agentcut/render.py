@@ -16,9 +16,10 @@ import sys
 import tempfile
 import uuid
 
-from .validate import (GRADE_PRESETS, XFADE_TRANSITIONS, find_font,
-                       find_font_for_text, probe_media, validate_project,
-                       wrap_caption_lines)
+from .validate import (GRADE_PRESETS, SFX_NAMES, XFADE_TRANSITIONS,
+                       chunk_word_timings, effective_ken_burns, find_font,
+                       find_font_for_text, probe_media, resolve_path,
+                       validate_project, wrap_caption_lines)
 
 
 # Text overlays use drawtext textfile=, not text=. A literal apostrophe,
@@ -47,6 +48,75 @@ POS_MAP = {
 
 def _even(n):
     return int(n) if int(n) % 2 == 0 else int(n) - 1
+
+
+# --- Built-in procedural SFX (v1.37.0, timing fixed v1.37.1) ------
+# Deterministic lavfi sources, generated at render time as lavfi
+# inputs (not filter sources — see the SFX block in
+# build_ffmpeg_args): no pre-generated files, no new dependencies. Each entry is
+# (aevalsrc expression, duration seconds). Expressions use t in
+# seconds; all peak near full scale before the sfx_volume scale
+# (default 0.35, about -9 dB) so they sit under voice/music rather
+# than over them. "cash" and "chime" share one source on purpose:
+# the same clean metallic ring, under both names (see SFX_NAMES).
+#
+# v1.37.1 timing: built-ins are NOT delayed with adelay. They are
+# generated as full-timeline sources whose expression is gated to
+# the scheduled window (see _gated_sfx_expression). Root cause of
+# the 1.37.0 defect, pinned by frame-level inspection (ashowinfo)
+# on this FFmpeg build: adelay's delay exists only as leading
+# silence frames (audio at pts = start, silence at pts 0..start),
+# and atrim after adelay DISCARDS those silence frames — after
+# adelay+atrim only one NOPTS silence frame plus the audio frames
+# (still stamped pts = start) reach amix, and amix mixes by
+# arrival order, so the audio lands at position 0. With plain
+# stills this usually happened not to matter (the silence frames
+# survived often enough); with a Ken Burns graph it broke on most
+# runs (7/8 in an isolated reproduction), and for file inputs it
+# broke deterministically (12/12). Dropping atrim (and the
+# apad/asetpts that only made sense with it) removes the hazard
+# for file SFX, tracks and overlay audio too; for built-ins the
+# gate removes the delay from timestamps altogether, so timing is
+# carried by the samples themselves and cannot be re-based away.
+SFX_SOURCES = {
+    # Soft fast burst: 900 Hz sine, gone in ~0.3s.
+    "pop": ("sin(2*PI*900*t)*exp(-18*t)", 0.30),
+    # Air sweep: a rising chirp (300 Hz -> ~2.1 kHz over 1s) that
+    # swells in and decays out.
+    "whoosh": ("sin(2*PI*(300*t+900*t*t))*(1-exp(-8*t))*exp(-2.5*t)", 1.00),
+    # Clean metallic ring: inharmonic partials, slow decay.
+    "cash": ("sin(2*PI*1568*t)*exp(-2.5*t)+0.6*sin(2*PI*2093*t)*exp(-3*t)"
+             "+0.4*sin(2*PI*2637*t)*exp(-4*t)", 1.20),
+    "chime": ("sin(2*PI*1568*t)*exp(-2.5*t)+0.6*sin(2*PI*2093*t)*exp(-3*t)"
+              "+0.4*sin(2*PI*2637*t)*exp(-4*t)", 1.20),
+    # Light mechanical click: 2.5 kHz, gone in ~0.1s.
+    "click": ("sin(2*PI*2500*t)*exp(-120*t)", 0.12),
+    # Bright alert tone: 1760 Hz + octave, ~0.9s decay.
+    "ding": ("sin(2*PI*1760*t)*exp(-4*t)+0.5*sin(2*PI*3520*t)*exp(-6*t)", 0.90),
+    # Deep pulse: a falling low sine (70 Hz -> ~45 Hz), ~0.7s.
+    "thud": ("sin(2*PI*(70*t-20*t*t))*exp(-6*t)+0.5*sin(2*PI*55*t)*exp(-8*t)", 0.70),
+}
+
+
+def _gated_sfx_expression(expr, start, duration):
+    """Full-timeline aevalsrc expression for one built-in SFX.
+
+    The expression is zero outside [start, start+duration) and,
+    inside the window, the original expression with its time
+    variable re-based to (t - start), so the SFX sounds exactly
+    as it did at t=0 in 1.37.0. aevalsrc's t is the timeline
+    clock for a source that starts at 0, so the gate is
+    deterministic and immune to any timestamp re-basing
+    downstream: even if a filter shifted the stream's pts, the
+    samples themselves are silent outside the window. The
+    expression must be single-quoted in the aevalsrc option
+    (aevalsrc='...') because its if() commas would otherwise be
+    parsed as filter-option separators. Only standalone t is
+    replaced (regex \\bt\\b): no SFX expression contains another
+    t-bearing word, and 'exp'/'sin'/'PI' are untouched."""
+    inner = re.sub(r"\bt\b", f"(t-{start!r})", expr)
+    return (f"if(lt(t,{start!r}),0,"
+            f"if(lt(t,{start + duration!r}),{inner},0))")
 
 
 # --- Arabic BiDi display transform (v1.33.0) -------------------------
@@ -324,6 +394,72 @@ def _ffmetadata_escape(text):
             .replace("#", "\\#").replace("=", "\\="))
 
 
+def _measure_word_ink(word, font, size, text_dir, cache):
+    """True ink width (px) of one word at one size/font (v1.37.0).
+
+    Rendered with FFmpeg alone (no new dependency): the word is
+    drawn white on black at a known x, and cropdetect reports the
+    ink bounding box. The width is the ink width, not the font's
+    advance — the active-caption layout below positions words by
+    ink widths plus a fixed space, and every copy of a word (base
+    and highlight) shares the same computed x, so the highlight
+    always covers its word exactly even if inter-word gaps are
+    approximate. Returns None when measurement fails; the caller
+    then falls back to the 0.6 x size per character estimate."""
+    key = (word, font, size)
+    if key in cache:
+        return cache[key]
+    width = None
+    try:
+        import re as _re
+        word_path = os.path.join(text_dir, f"word_{len(cache)}.txt")
+        with open(word_path, "w", encoding="utf-8") as fh:
+            fh.write(bidi_display_text(str(word)))
+        canvas_w = 2400
+        canvas_h = max(300, int(size) * 4)
+        png_path = os.path.join(text_dir, f"word_{len(cache)}.png")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", f"color=c=black:s={canvas_w}x{canvas_h}",
+             "-vf", (f"drawtext=fontfile={font}:textfile={word_path}:"
+                     f"fontsize={size}:fontcolor=white:x=50:y={canvas_h // 3}:"
+                     f"expansion=none"),
+             "-frames:v", "1", png_path],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0 and os.path.isfile(png_path):
+            proc2 = subprocess.run(
+                ["ffmpeg", "-v", "info", "-i", png_path,
+                 "-vf", "cropdetect=limit=24:round=0:reset=0",
+                 "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60)
+            crops = _re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)",
+                                proc2.stderr or "")
+            if crops:
+                width = int(crops[-1][0])
+    except Exception:
+        width = None
+    cache[key] = width
+    return width
+
+
+def _active_caption_y(item, size, height):
+    """Single-line y for an active caption chunk (v1.37.0).
+
+    Mirrors the normal caption bands numerically: top bands at
+    40, bottom bands just above the frame bottom, centre centred,
+    and the no-position default at height-120 (the old caption
+    default). Active chunks are single-line by design, so one y
+    serves the whole chunk."""
+    pos = item.get("position")
+    if pos in ("top_left", "top_center", "top_right"):
+        return 40.0
+    if pos in ("bottom_left", "bottom_center", "bottom_right"):
+        return float(height - 40 - size * 1.4)
+    if pos == "center":
+        return float((height - size * 1.4) / 2)
+    return float(height - 120)
+
+
 def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                       metadata_path=None, guides=False,
                       review_timecode=False):
@@ -343,8 +479,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     total = info["total_duration"]
     argv = ["ffmpeg", "-y", "-v", "error"]
     # Inputs: clips first, then audio tracks.
-    for clip in clips:
-        if clip["kind"] == "image" and clip.get("ken_burns") not in (None, "none"):
+    for _ci, clip in enumerate(clips):
+        if clip["kind"] == "image" and effective_ken_burns(clip, _ci, project) not in (None, "none"):
             # Ken Burns uses zoompan on a SINGLE input frame: zoompan
             # itself generates d output frames. A looped input would
             # make zoompan emit d frames per input frame and blow up
@@ -467,8 +603,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                       f"force_original_aspect_ratio=decrease,"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                       f"fps={fps},format=yuv420p")
-        elif clip.get("ken_burns") not in (None, "none"):
-            kb = clip["ken_burns"]
+        elif clip.get("ken_burns") not in (None, "none") or effective_ken_burns(clip, i, project) not in (None, "none"):
+            kb = effective_ken_burns(clip, i, project)
             frames = max(1, int(round(dur * fps)))
             # Pre-scale to 2x output (cropped to a centred 2x frame) so
             # zoompan always crops from more pixels than it outputs.
@@ -624,6 +760,25 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 f"[bgc{i}][{keyed_label}]overlay=0:0,format=yuv420p[vout{i}]")
             vlabel = f"vout{i}"
         vlabels.append(vlabel)
+        if clip.get("punch_at") is not None:
+            # Punch-in (v1.37.0): a frame-boundary scale jump
+            # toward the panel centre at punch_at (clip-local
+            # seconds), with no gap — the same stream, scaled up
+            # by punch_factor after that time and cropped back to
+            # the constant output size. scale eval=frame makes
+            # the size time-varying, crop pins the output size,
+            # so concat/xfade downstream always see a constant
+            # frame size. Dimensions are truncated to even, as
+            # yuv420p requires.
+            _pa = float(clip["punch_at"])
+            _pf = float(clip.get("punch_factor", 1.20))
+            _sw = (f"trunc(if(lt(t,{_pa!r}),{width},{width}*{_pf})/2)*2")
+            _sh = (f"trunc(if(lt(t,{_pa!r}),{height},{height}*{_pf})/2)*2")
+            filters.append(
+                f"[{vlabel}]scale=w='{_sw}':h='{_sh}':eval=frame,"
+                f"crop={width}:{height}:(iw-ow)/2:(ih-oh)/2,"
+                f"fps={fps},format=yuv420p[vp{i}]")
+            vlabels[-1] = f"vp{i}"
         probe = clip.get("probe") or {}
         dn = ",afftdn" if clip.get("denoise") else ""
         if clip["kind"] == "video" and probe.get("has_audio") and clip.get("freeze_at") is None and clip.get("speed_curve"):
@@ -942,6 +1097,83 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     render_items = []
     for _item, _is_cap in ([(t, False) for t in (project.get("texts") or [])]
                            + [(c, True) for c in merged_captions]):
+        # Active word-timed captions (v1.37.0): the agent supplies
+        # per-word timings; AgentCut renders short chunks (2–4
+        # words) with the current word highlighted. Chunk mode
+        # renders each chunk as one caption in the highlight
+        # colour. Word mode renders every word twice — once in
+        # the base colour for the whole chunk window, once in the
+        # highlight colour for just that word's window, both at
+        # the same measured x — so the highlight can never drift
+        # off its word. Arabic joining is safe by construction:
+        # joining happens inside a word, never across the space
+        # between words, so per-word drawtext shapes each word
+        # exactly as it shapes inside a sentence.
+        if _is_cap and _item.get("word_timings"):
+            _wt = _item["word_timings"]
+            _chunks = chunk_word_timings(_wt)
+            _size = float(_item.get("size", 36))
+            _cap_y = _active_caption_y(_item, _size, height)
+            if _item.get("highlight_mode", "word") == "chunk":
+                for _ch in _chunks:
+                    _sub = dict(_item)
+                    _sub["text"] = " ".join(w["word"] for w in _ch)
+                    _sub["start"] = float(_ch[0]["start"])
+                    _sub["end"] = float(_ch[-1]["end"])
+                    _sub["color"] = _item.get("highlight_color", "yellow")
+                    _sub.pop("word_timings", None)
+                    render_items.append((_sub, True))
+                continue
+            _word_cache = {}
+            _space_w = _size * 0.30
+            for _ch in _chunks:
+                _cstart = float(_ch[0]["start"])
+                _cend = float(_ch[-1]["end"])
+                _widths = []
+                for _w in _ch:
+                    _font_w = find_font_for_text(str(_w["word"]))
+                    _mw = _measure_word_ink(str(_w["word"]), _font_w, _size,
+                                            text_dir, _word_cache) \
+                        if _font_w else None
+                    _widths.append(float(_mw) if _mw else
+                                   max(10.0, len(str(_w["word"])) * _size * 0.6))
+                _total_w = sum(_widths) + _space_w * (len(_ch) - 1)
+                _left = (width - _total_w) / 2
+                _is_rtl = bool(_ARABIC_RE.search(" ".join(w["word"] for w in _ch)))
+                _xs = {}
+                for _li, _w in enumerate(_ch):
+                    _vis = (len(_ch) - 1 - _li) if _is_rtl else _li
+                    _x = _left
+                    for _vj in range(_vis):
+                        _src_li = (len(_ch) - 1 - _vj) if _is_rtl else _vj
+                        _x += _widths[_src_li] + _space_w
+                    _xs[_li] = int(round(_x))
+                _base_color = _item.get("color", "white")
+                _hi_color = _item.get("highlight_color", "yellow")
+                for _li, _w in enumerate(_ch):
+                    _base = dict(_item)
+                    _base.update({"text": str(_w["word"]), "start": _cstart,
+                                  "end": _cend, "x": _xs[_li], "y": _cap_y,
+                                  "color": _base_color, "box": False,
+                                  "shadow_x": 2, "shadow_y": 2})
+                    _base.pop("word_timings", None)
+                    _base.pop("position", None)
+                    for _k in ("box_radius", "box_color", "box_opacity", "box_padding"):
+                        _base.pop(_k, None)
+                    render_items.append((_base, False))
+                for _li, _w in enumerate(_ch):
+                    _hi = dict(_item)
+                    _hi.update({"text": str(_w["word"]),
+                                "start": float(_w["start"]),
+                                "end": float(_w["end"]), "x": _xs[_li],
+                                "y": _cap_y, "color": _hi_color, "box": True,
+                                "shadow_x": 2, "shadow_y": 2})
+                    _hi.pop("word_timings", None)
+                    _hi.pop("position", None)
+                    for _k in ("box_radius", "box_color", "box_opacity", "box_padding"):
+                        _hi.pop(_k, None)
+                    render_items.append((_hi, False))
+            continue
         if _item.get("reveal") == "word":
             words = str(_item["text"]).split()
             if len(words) > 1:
@@ -1248,11 +1480,17 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             lt = info.get("loudness_target", -16.0)
             loudnorm_part = f",loudnorm=I={lt}:TP=-1.5:LRA=11"
         dn_part = ",afftdn" if track.get("denoise") else ""
+        # v1.37.1: NO apad/atrim/asetpts after adelay (see the SFX
+        # note above — atrim after adelay discards the delay
+        # silence and the track lands at 0). adelay's own silence
+        # frames carry the delay as samples; the clip-silence
+        # chain guarantees the mix is `total` long and -t
+        # truncates any track that runs past it. afade windows
+        # still align: after adelay, frame pts are timeline pts.
         filters.append(
             f"[{base + j}:a]aresample=48000,"
             f"aformat=sample_rates=48000:channel_layouts=stereo,"
-            f"adelay={start_ms}|{start_ms},apad=whole_dur={total},"
-            f"atrim=end={total},asetpts=PTS-STARTPTS,"
+            f"adelay={start_ms}|{start_ms},"
             f"volume={vol}{fade_parts}{loudnorm_part}{dn_part}[t{j}]")
     if duck:
         # Deterministic ducking: one volume-automation filter per
@@ -1326,13 +1564,81 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             pre = (f"atrim=start={tin}:end={tin + odur},"
                    f"asetpts=PTS-STARTPTS,aresample=48000")
         start_ms = int(round(ostart * 1000))
+        # v1.37.1: NO apad/atrim/asetpts after adelay, for the same
+        # reason as audio tracks (see the SFX note above).
         filters.append(
             f"[{audio_idx}:a]{pre},"
             f"aformat=sample_rates=48000:channel_layouts=stereo,"
-            f"adelay={start_ms}|{start_ms},apad=whole_dur={total},"
-            f"atrim=end={total},asetpts=PTS-STARTPTS,"
+            f"adelay={start_ms}|{start_ms},"
             f"volume={ovol}[ova{si}]")
         mix_inputs.append(f"[ova{si}]")
+    # Procedural SFX (v1.37.0, timing fixed v1.37.1): each
+    # element's sfx fires at its element start — text/caption
+    # start, clip (transition) start, overlay start — mixed into
+    # the final audio by the agent's field alone. Built-ins are
+    # gated full-timeline lavfi inputs (no adelay at all); file
+    # paths become extra inputs appended here (after the
+    # metadata input, so no earlier index shifts) with adelay
+    # alone. SFX mix even when the project has no other audio:
+    # the clip-silence chain in mix_inputs guarantees a valid
+    # audio stream.
+    sfx_entries = []
+    _clip_starts = info.get("clip_starts") or []
+    for _ci, _clip in enumerate(clips):
+        if _clip.get("sfx"):
+            _st = _clip_starts[_ci] if _ci < len(_clip_starts) else 0.0
+            sfx_entries.append((_st, _clip["sfx"],
+                                float(_clip.get("sfx_volume", 0.35))))
+    for _item in (project.get("texts") or []):
+        if isinstance(_item, dict) and _item.get("sfx"):
+            sfx_entries.append((float(_item.get("start", 0)), _item["sfx"],
+                                float(_item.get("sfx_volume", 0.35))))
+    for _cap in merged_captions:
+        if isinstance(_cap, dict) and _cap.get("sfx"):
+            sfx_entries.append((float(_cap.get("start", 0)), _cap["sfx"],
+                                float(_cap.get("sfx_volume", 0.35))))
+    for _ov in overlays:
+        if _ov.get("sfx"):
+            sfx_entries.append((float(_ov["start"]), _ov["sfx"],
+                                float(_ov.get("sfx_volume", 0.35))))
+    for _si, (_st, _name, _vol) in enumerate(sfx_entries):
+        _ms = int(round(float(_st) * 1000))
+        if _name in SFX_SOURCES:
+            # Built-ins (v1.37.1): full-timeline gated lavfi
+            # INPUTS, not adelay-delayed short sources. The input
+            # is appended here, after the metadata input, so no
+            # earlier input index shifts. The gated expression
+            # (single-quoted: its if() commas are not option
+            # separators) is silent outside the window, so no
+            # adelay, apad, atrim or asetpts is needed or wanted
+            # — see the root-cause note at SFX_SOURCES. The
+            # source duration is the whole timeline, so the
+            # stream is exactly `total` long.
+            _expr, _dur = SFX_SOURCES[_name]
+            _gated = _gated_sfx_expression(_expr, float(_st), _dur)
+            _sfx_idx = _input_count(argv)
+            argv += ["-f", "lavfi", "-i",
+                     f"aevalsrc='{_gated}':duration={total}:sample_rate=48000"]
+            filters.append(
+                f"[{_sfx_idx}:a]pan=stereo|c0=c0|c1=c0,aresample=48000,"
+                f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"volume={_vol}[sfx{_si}]")
+        else:
+            # File SFX (v1.37.1): adelay alone. Its leading
+            # silence frames ARE the delay; atrim after adelay
+            # discards them (verified by ashowinfo) and amix
+            # then mixes the audio at position 0. The
+            # clip-silence chain guarantees the mix length and
+            # -t truncates any file that runs past `total`, so
+            # no pad/trim is needed here either.
+            _sfx_path = resolve_path(_name)
+            _sfx_idx = _input_count(argv)
+            argv += ["-i", _sfx_path]
+            filters.append(
+                f"[{_sfx_idx}:a]aresample=48000,"
+                f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"volume={_vol},adelay={_ms}|{_ms}[sfx{_si}]")
+        mix_inputs.append(f"[sfx{_si}]")
     if len(mix_inputs) == 1:
         aout = acur_chain
     else:
@@ -1456,19 +1762,19 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     # A failed pre-scale falls back to the original file, so this can
     # never break a render that would otherwise work.
     prescale_dir = None
-    image_clips = [c for c in info["clips"] if c["kind"] == "image"]
+    image_clips = [(ci, c) for ci, c in enumerate(info["clips"]) if c["kind"] == "image"]
     if image_clips:
         prescale_dir = tempfile.mkdtemp(prefix="agentcut-prescale-")
         tw = _even(info["width"] * scale_factor)
         th = _even(info["height"] * scale_factor)
-        for ci, clip in enumerate(image_clips):
+        for ci, clip in image_clips:
             if clip.get("fit") == "blur":
                 # Blurred-background clips need the unpadded source
                 # in the main graph (background cover + foreground
                 # contain); a contain prescale would bake black bars
                 # into the background.
                 continue
-            if clip.get("ken_burns") not in (None, "none"):
+            if effective_ken_burns(clip, ci, project) not in (None, "none"):
                 pw, ph = 2 * tw, 2 * th
                 vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
                       f"crop={pw}:{ph}")
@@ -1966,7 +2272,7 @@ def produce_video(brief, output_path, review_dir=None):
             clip["transition"] = item.get("transition", "crossfade")
         for key in ("ken_burns", "fit", "speed", "brightness", "contrast",
                     "saturation", "grayscale", "transition_duration",
-                    "grade", "lut"):
+                    "grade", "lut", "punch_in", "sfx", "sfx_volume"):
             if key in item:
                 clip[key] = item[key]
         clips.append(clip)
@@ -2070,6 +2376,8 @@ def produce_video(brief, output_path, review_dir=None):
         project["timecode"] = brief["timecode"]
     if brief.get("overlays"):
         project["overlays"] = brief["overlays"]
+    if brief.get("default_image_motion") is not None:
+        project["default_image_motion"] = brief["default_image_motion"]
     if brief.get("caption_color") is not None:
         project["caption_color"] = brief["caption_color"]
     if brief.get("caption_size") is not None:
@@ -2297,6 +2605,18 @@ def timeline_summary(project):
                       "loop_count", "ken_burns", "fit", "stabilize"):
             if fname in clip:
                 seg[fname] = clip[fname]
+        # v1.37.0: the motion actually applied (default motion
+        # fills in for clips without an explicit ken_burns),
+        # punch-in and element SFX, so the agent can reason from
+        # the summary instead of re-reading the project.
+        _eff = effective_ken_burns(clip, i, project)
+        if _eff != clip.get("ken_burns", "none"):
+            seg["effective_ken_burns"] = _eff
+        if clip.get("punch_at") is not None:
+            seg["punch_at"] = clip["punch_at"]
+            seg["punch_factor"] = clip.get("punch_factor", 1.20)
+        if clip.get("sfx"):
+            seg["sfx"] = clip["sfx"]
         segments.append(seg)
     texts = [{"text": t["text"], "start": float(t.get("start", 0)),
               "end": float(t.get("end", info["total_duration"]))}
@@ -2323,7 +2643,8 @@ def timeline_summary(project):
                   "audio": audio, "overlays": overlays,
                   "chapters": info.get("chapters", []),
                   "warnings": info.get("warnings", []),
-                  "ducking": info.get("ducking")}
+                  "ducking": info.get("ducking"),
+                  "default_image_motion": bool(project.get("default_image_motion"))}
 
 
 def check_brief_conformance(brief, project, actual_duration=None):

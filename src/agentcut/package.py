@@ -103,10 +103,12 @@ def _collect_files(project, info):
 
     Sources: validated clips (resolved srcs + LUTs), validated
     overlays (resolved srcs), validated audio tracks (resolved
-    srcs), and the captions SRT file. Anything else in a project
+    srcs), file-path SFX on clips/texts/captions/overlays, and
+    the captions SRT file. Anything else in a project
     (texts, chapters, ducking windows, presets) is data, not a
     file reference, and is carried by project.json itself.
     """
+    from .validate import SFX_NAMES
     files = {}
     for clip in info.get("clips") or []:
         files[clip["src"]] = clip["src"]
@@ -116,6 +118,15 @@ def _collect_files(project, info):
         files[ov["src"]] = ov["src"]
     for track in info.get("audio") or []:
         files[track["src"]] = track["src"]
+    for _holder in (list(project.get("clips") or [])
+                    + list(project.get("texts") or [])
+                    + list(info.get("captions") or [])
+                    + list(project.get("overlays") or [])):
+        _sfx = _holder.get("sfx") if isinstance(_holder, dict) else None
+        if isinstance(_sfx, str) and _sfx not in SFX_NAMES:
+            _resolved = resolve_path(_sfx)
+            if os.path.isfile(_resolved):
+                files[_resolved] = _resolved
     captions_file = project.get("captions_file")
     if captions_file:
         files[resolve_path(captions_file)] = resolve_path(captions_file)
@@ -151,12 +162,19 @@ def package_project(project, outdir):
             clip["src"] = _rewrite(clip["src"])
         if isinstance(clip, dict) and clip.get("lut"):
             clip["lut"] = _rewrite(clip["lut"])
+        if isinstance(clip, dict) and isinstance(clip.get("sfx"), str) and resolve_path(clip["sfx"]) in media_map:
+            clip["sfx"] = _rewrite(clip["sfx"])
     for ov in packed.get("overlays") or []:
         if isinstance(ov, dict) and ov.get("src"):
             ov["src"] = _rewrite(ov["src"])
+        if isinstance(ov, dict) and isinstance(ov.get("sfx"), str) and resolve_path(ov["sfx"]) in media_map:
+            ov["sfx"] = _rewrite(ov["sfx"])
     for track in packed.get("audio") or []:
         if isinstance(track, dict) and track.get("src"):
             track["src"] = _rewrite(track["src"])
+    for _item in (packed.get("texts") or []) + (packed.get("captions") or []):
+        if isinstance(_item, dict) and isinstance(_item.get("sfx"), str) and resolve_path(_item["sfx"]) in media_map:
+            _item["sfx"] = _rewrite(_item["sfx"])
     if packed.get("captions_file"):
         packed["captions_file"] = _rewrite(packed["captions_file"])
 

@@ -178,7 +178,7 @@ Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution fra
 
 Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
 
-Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text's estimated width exceeds the frame, or a caption holds a single word wider than the frame (wrappable captions wrap instead of warning; split the text or shrink it). Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
+Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text's estimated width exceeds the frame, or a caption holds a single word wider than the frame (wrappable captions wrap instead of warning; split the text or shrink it). New in 1.37.0: `static_shot_warning` for a still longer than 4.5s with no motion of any kind, and `active_chunk_overflow_warning` for an active-caption chunk wider than the frame. Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
 
 ## Producer: one call, any agent
 
@@ -335,6 +335,43 @@ overlay, in one render. Overlay dressing: overlays accept
 shadow (`shadow_dx`/`shadow_dy` -100..100, `shadow_blur`
 0..30, `shadow_opacity` 0..1) — the shadow is active only
 when an offset or a blur is set. All dressing defaults off.
+
+## Visual rhythm, part 1 (1.37.0)
+
+See `examples/visual-rhythm.json`: procedural SFX bound to a
+title, a transition and an overlay; default micro-motion on
+two stills; a punch-in on a panel; an Arabic active caption.
+- SFX: texts, captions, clips and overlays accept `sfx` —
+  one of `pop`, `whoosh`, `cash`, `chime` (same ring as
+  cash), `click`, `ding`, `thud` — or a local audio file
+  path, plus optional `sfx_volume` (0..2, default 0.35).
+  The sound fires at the element's start automatically and
+  mixes into the final audio, even with no other audio.
+  Unknown names, bad volumes and missing files are
+  structured validation errors. 1.37.1 fix: built-ins are
+  time-gated full-timeline sources and file SFX use adelay
+  alone, so timing holds with `default_image_motion` on
+  and off — the 1.37.0 code played every SFX from t=0
+  under motion because atrim after adelay discarded the
+  delay silence (see CHANGELOG).
+- Micro-motion: project `default_image_motion: true`
+  auto-animates stills (alternating zoom_in / zoom_out by
+  clip index) unless a clip sets its own `ken_burns`; clips
+  accept `punch_in` (true, or `{at, factor}` with factor
+  1.18..1.25) for a centre punch at a frame boundary.
+  `timeline_summary` shows `effective_ken_burns`,
+  `punch_at` / `punch_factor` and `sfx` per segment.
+  A still longer than 4.5s with no motion of any kind
+  warns (`static_shot_warning`, warnings only).
+- Active captions: a caption with `word_timings` (one
+  `{word, start, end}` per word, absolute seconds, matching
+  the caption words) renders in 2–4 word chunks with the
+  current word highlighted (`highlight_color`, default
+  yellow; `highlight_mode: "chunk"` highlights the whole
+  active chunk instead). Word widths are measured by
+  FFmpeg at render time, so the highlight sits exactly on
+  its word; Arabic joining and RTL order are preserved.
+  Over-wide chunks warn instead of silently clipping.
 
 ## Export cap and stabilisation
 

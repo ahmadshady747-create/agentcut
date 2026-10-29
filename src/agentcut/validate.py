@@ -89,6 +89,14 @@ GRADE_PRESETS = {
 TEXT_POSITIONS = {"top_left", "top_center", "top_right", "center",
                   "bottom_left", "bottom_center", "bottom_right"}
 
+# Built-in procedural SFX (v1.37.0): generated deterministically at
+# render time from FFmpeg lavfi sources (see SFX_SOURCES in
+# render.py). No pre-generated files, no new dependencies. "cash"
+# and "chime" deliberately map to the same clean metallic ring:
+# both names are kept because agents use both words for money
+# figures and key numbers, and they should sound identical.
+SFX_NAMES = ("pop", "whoosh", "cash", "chime", "click", "ding", "thud")
+
 # Font files by script (searched in every font directory, in order).
 # DejaVu has no Arabic glyphs, so Arabic texts previously rendered
 # as missing glyphs. Noto Naskh Arabic is the preferred Arabic font
@@ -357,6 +365,203 @@ def _validate_effects(obj, errors, oid, field_prefix):
     if "vignette" in obj and not isinstance(obj["vignette"], bool):
         errors.append(err("INVALID_SCHEMA", "vignette must be true or false", field=field_prefix + ".vignette", clip_id=oid,
                           fix="set vignette to true for a darkened-corner effect, or remove it"))
+
+
+def _validate_sfx(obj, errors, oid, field_prefix):
+    """Validate an element's sfx / sfx_volume fields (v1.37.0).
+
+    sfx is a built-in name (SFX_NAMES) or a local audio file path
+    (resolved like any media path; it must exist and probe with an
+    audio stream). sfx_volume is 0..2, default 0.35 at render time.
+    An unknown name is a structured error listing the valid names,
+    never a silent fallback to another sound."""
+    sfx = obj.get("sfx")
+    if sfx is not None:
+        if not isinstance(sfx, str) or not sfx:
+            errors.append(err("INVALID_SCHEMA", "sfx must be a built-in name or a local audio file path", field=field_prefix + ".sfx", clip_id=oid,
+                              fix="set sfx to one of: " + ", ".join(SFX_NAMES) + ", or to a local audio file path"))
+        elif sfx not in SFX_NAMES:
+            resolved_sfx = resolve_path(sfx)
+            if not os.path.isfile(resolved_sfx):
+                errors.append(err("INVALID_SCHEMA", "unknown sfx '" + sfx + "'; valid built-in names are: " + ", ".join(SFX_NAMES) + " (or a local audio file path)", field=field_prefix + ".sfx", clip_id=oid,
+                                  fix="set sfx to one of: " + ", ".join(SFX_NAMES) + ", or fix the audio file path"))
+            else:
+                _sp = probe_media(resolved_sfx)
+                if _sp is None or not _sp.get("has_audio"):
+                    errors.append(err("INVALID_SCHEMA", f"sfx file has no audio stream: {resolved_sfx}", field=field_prefix + ".sfx", clip_id=oid,
+                                      fix="use an audio file for sfx, or a built-in name: " + ", ".join(SFX_NAMES)))
+    if "sfx_volume" in obj:
+        try:
+            _sv = float(obj["sfx_volume"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "sfx_volume must be a number", field=field_prefix + ".sfx_volume", clip_id=oid,
+                              fix="set sfx_volume between 0 (silent) and 2, or remove it for the 0.35 default"))
+            _sv = None
+        if _sv is not None and not 0.0 <= _sv <= 2.0:
+            errors.append(err("INVALID_SCHEMA", "sfx_volume must be 0..2", field=field_prefix + ".sfx_volume", clip_id=oid,
+                              fix="set sfx_volume between 0 (silent) and 2, e.g. 0.35"))
+
+
+def _validate_punch_in(clip, duration, errors, cid, resolved_entry):
+    """Validate a clip's punch_in field (v1.37.0) and resolve it
+    onto the resolved clip entry as punch_at / punch_factor.
+
+    punch_in is true (mid-clip, 1.20x) or {"at": seconds into the
+    clip, "factor": 1.18..1.25}. "at" is in rendered-clip seconds
+    (after trim/speed), strictly inside the clip, so the punch is
+    a frame-boundary scale jump with content on both sides and
+    no gap. Out-of-range values are structured errors."""
+    punch = clip.get("punch_in")
+    if punch is None:
+        return
+    if punch is True:
+        punch_at, factor = duration / 2.0, 1.20
+    elif isinstance(punch, dict):
+        try:
+            punch_at = float(punch.get("at", duration / 2.0))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "punch_in at must be a number", field="clips.punch_in", clip_id=cid,
+                              fix=f"set punch_in at to seconds into the clip, between 0 and {duration:.2f}, or omit it for mid-clip"))
+            return
+        try:
+            factor = float(punch.get("factor", 1.20))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "punch_in factor must be a number", field="clips.punch_in", clip_id=cid,
+                              fix="set punch_in factor between 1.18 and 1.25, e.g. 1.20"))
+            return
+    else:
+        errors.append(err("INVALID_SCHEMA", "punch_in must be true or an object {at, factor}", field="clips.punch_in", clip_id=cid,
+                          fix="set punch_in to true for a mid-clip 1.20x punch, or to e.g. {\"at\": 2, \"factor\": 1.22}"))
+        return
+    if not 0 < punch_at < duration:
+        errors.append(err("CLIP_OUT_OF_RANGE", f"punch_in at {punch_at}s outside clip duration {duration:.2f}s", field="clips.punch_in", clip_id=cid,
+                          fix=f"set punch_in at between 0 and {duration:.2f}"))
+        return
+    if not 1.18 <= factor <= 1.25:
+        errors.append(err("INVALID_SCHEMA", "punch_in factor must be 1.18..1.25", field="clips.punch_in", clip_id=cid,
+                          fix="set punch_in factor between 1.18 and 1.25, e.g. 1.20"))
+        return
+    resolved_entry["punch_at"] = punch_at
+    resolved_entry["punch_factor"] = factor
+
+
+def effective_ken_burns(clip, index, project):
+    """Ken Burns motion actually applied to a clip (v1.37.0).
+
+    An explicit ken_burns wins. Otherwise, when the project sets
+    default_image_motion, image clips (except blurred-background
+    ones, whose blur chain cannot also zoom) get smooth alternating
+    motion by clip index: even indices zoom_in, odd indices
+    zoom_out. Video clips never get default motion. Returns the
+    motion name or "none"."""
+    kb = clip.get("ken_burns", "none")
+    if kb not in (None, "none"):
+        return kb
+    if not (project or {}).get("default_image_motion"):
+        return "none"
+    if clip.get("kind") != "image" or clip.get("fit") == "blur":
+        return "none"
+    return "zoom_in" if index % 2 == 0 else "zoom_out"
+
+
+def chunk_word_timings(word_timings):
+    """Group word timings into active-caption chunks (v1.37.0).
+
+    Chunks hold 2–4 words: greedy groups of 3, with the tail
+    rebalanced so no chunk is a single word (4 left -> 2+2, 1 left
+    after a full group -> merged into the previous group as 4,
+    unless it is the only chunk). Deterministic, so validation
+    warnings and rendering agree on chunk boundaries."""
+    words = list(word_timings)
+    if not words:
+        return []
+    chunks, cur = [], []
+    for w in words:
+        cur.append(w)
+        if len(cur) >= 3:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        if len(cur) == 1 and chunks:
+            chunks[-1] = chunks[-1] + cur
+        elif len(cur) == 1 and not chunks:
+            chunks.append(cur)
+        else:
+            chunks.append(cur)
+    if len(chunks) >= 2 and len(chunks[-1]) == 1:
+        chunks[-2] = chunks[-2] + chunks.pop()
+    # A 4-word tail from the merge above is legal (2–4); a chunk
+    # of 4 split as 2+2 only matters when the tail was exactly 4
+    # before merging, which the greedy pass already handles as
+    # 3+1 -> merged to 4. Nothing further to rebalance.
+    return chunks
+
+
+def _validate_word_timings(item, start, end, errors, label):
+    """Validate a caption's word_timings field (v1.37.0).
+
+    word_timings is the agent-supplied per-word timing list from
+    transcription (AgentCut computes nothing AI-side): a non-empty
+    list of {word, start, end} in absolute timeline seconds, in
+    order, non-overlapping, inside the caption window, whose words
+    joined by spaces equal the caption text. A mismatch is a
+    structured error: a mistimed or mistyped word list must not
+    silently highlight the wrong words."""
+    wt = item.get("word_timings")
+    if wt is None:
+        return
+    if label != "captions":
+        errors.append(err("INVALID_SCHEMA", "word_timings is only for captions (not texts)", field=label + ".word_timings",
+                          fix="move word_timings onto a caption item, or remove it"))
+        return
+    if not isinstance(wt, list) or not wt:
+        errors.append(err("INVALID_SCHEMA", "word_timings must be a non-empty list of {word, start, end} objects", field="captions.word_timings",
+                          fix="give one {word, start, end} per word of the caption text, in order"))
+        return
+    words = []
+    prev_end = None
+    for wi, w in enumerate(wt):
+        if not isinstance(w, dict) or not isinstance(w.get("word"), str) or not w["word"].strip():
+            errors.append(err("INVALID_SCHEMA", "each word_timings entry needs a non-empty word string", field="captions.word_timings",
+                              fix="give each entry as e.g. {\"word\": \"hello\", \"start\": 1.0, \"end\": 1.4}"))
+            return
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "each word_timings entry needs numeric start and end", field="captions.word_timings",
+                              fix="set start/end to timeline seconds inside the caption window"))
+            return
+        if we <= ws:
+            errors.append(err("INVALID_SCHEMA", f"word_timings word {wi} needs end after start", field="captions.word_timings",
+                              fix="set end after start for every word"))
+            return
+        if ws < start - 0.05 or we > end + 0.05:
+            errors.append(err("CLIP_OUT_OF_RANGE", f"word_timings word {wi} ({ws}..{we}s) outside caption window {start}..{end}s", field="captions.word_timings",
+                              fix=f"keep word times inside {start}..{end}"))
+            return
+        if prev_end is not None and ws < prev_end - 0.001:
+            errors.append(err("INVALID_SCHEMA", "word_timings entries must not overlap and must be in order", field="captions.word_timings",
+                              fix="sort word timings by start with no overlaps"))
+            return
+        prev_end = we
+        words.append(w["word"])
+    if words != str(item["text"]).split():
+        errors.append(err("INVALID_SCHEMA", f"word_timings words {words} do not match caption words {str(item['text']).split()} (one timing per word, in order)", field="captions.word_timings",
+                          fix="give exactly one timing per caption word, in the same order and spelling"))
+    hc = item.get("highlight_color", "yellow")
+    if not (isinstance(hc, str) and (hc in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", hc))):
+        errors.append(err("INVALID_SCHEMA", "highlight_color must be a #RRGGBB hex value or a named colour", field="captions.highlight_color",
+                          fix="set highlight_color to a named colour or #RRGGBB, e.g. yellow"))
+    hm = item.get("highlight_mode", "word")
+    if hm not in ("word", "chunk"):
+        errors.append(err("INVALID_SCHEMA", "highlight_mode must be 'word' or 'chunk'", field="captions.highlight_mode",
+                          fix="set highlight_mode to 'word' (per-word highlight) or 'chunk' (whole active chunk highlighted)"))
+    if item.get("reveal") is not None or item.get("animation") is not None:
+        errors.append(err("INVALID_SCHEMA", "word_timings cannot combine with reveal or animation", field="captions.word_timings",
+                          fix="remove reveal/animation from this caption; the word timings drive its display"))
+    if float(item.get("fade_in", 0) or 0) > 0 or float(item.get("fade_out", 0) or 0) > 0:
+        errors.append(err("INVALID_SCHEMA", "word_timings cannot combine with fade_in/fade_out", field="captions.word_timings",
+                          fix="remove fade_in/fade_out from this caption; the word timings drive its display"))
 
 
 def wrap_caption_lines(text, size, max_width_px):
@@ -969,6 +1174,13 @@ def validate_project(project):
             td = 0.0
         if resolved:
             resolved[-1]["transition_duration"] = td
+        # v1.37.0: punch-in (resolved onto the clip) and clip SFX
+        # (fired at the clip's timeline start, i.e. the transition
+        # start for xfade clips). Both validate against the
+        # resolved duration computed above.
+        if resolved and resolved[-1].get("id") == cid:
+            _validate_punch_in(clip, duration, errors, cid, resolved[-1])
+        _validate_sfx(clip, errors, cid, "clips")
         # start offset in the final timeline (after xfade overlaps)
         if len(resolved) >= 2 and transition in XFADE_TRANSITIONS:
             clip_starts.append(clip_starts[-1] + prev_duration - td)
@@ -1141,6 +1353,8 @@ def validate_project(project):
                               fix="use a preset position, or set x and y pixel offsets instead"))
             continue
         rov["position"] = position
+        # v1.37.0: overlay SFX, fired at the overlay's start.
+        _validate_sfx(ov, errors, oid, "overlays")
         for axis in ("x", "y"):
             if axis in ov:
                 try:
@@ -1385,6 +1599,10 @@ def validate_project(project):
                 continue
             if start < 0 or end <= start or end > total + 0.05:
                 errors.append(err("CLIP_OUT_OF_RANGE", f"{label} range {start}..{end} outside timeline {total:.2f}s", field=label))
+            # v1.37.0: element SFX (fired at the item's start) and,
+            # for captions, word-timed active highlighting.
+            _validate_sfx(item, errors, None, label)
+            _validate_word_timings(item, start, end, errors, label)
             fi = fo = 0.0
             for fname in ("fade_in", "fade_out"):
                 try:
@@ -1638,6 +1856,14 @@ def validate_project(project):
                         if not _lo <= _fv <= _hi:
                             errors.append(err("INVALID_SCHEMA", f"scrims.{_side}.{_fname} must be {_lo}..{_hi}", field=f"scrims.{_side}.{_fname}",
                                               fix=f"set scrims.{_side}.{_fname} between {_lo} and {_hi}"))
+    # Default micro-motion (v1.37.0): when true, image clips
+    # without an explicit ken_burns get alternating zoom_in /
+    # zoom_out by clip index (see effective_ken_burns). It is a
+    # project-level switch, so old projects (field absent) render
+    # identically.
+    if "default_image_motion" in project and not isinstance(project["default_image_motion"], bool):
+        errors.append(err("INVALID_SCHEMA", "default_image_motion must be true or false", field="default_image_motion",
+                          fix="set default_image_motion to true to auto-animate still images, or remove it"))
     merged_captions = [dict(c) if isinstance(c, dict) else c for c in (project.get("captions") or [])]
     captions_file = project.get("captions_file")
     if captions_file is not None:
@@ -1945,4 +2171,60 @@ def validate_project(project):
         info["warnings"] = check_layer_text_overlap(project, info)
     except Exception:
         info["warnings"] = []
+    # Static-shot warnings (v1.37.0, warnings only, never
+    # blocking): a still-image clip longer than 4.5s with no
+    # motion of any kind — no explicit or default Ken Burns, no
+    # punch_in, and no animated overlay (keyframes) overlapping
+    # its window — will read as a frozen frame. Each warning names
+    # the clip, so the agent can add motion or accept it.
+    try:
+        _starts = info.get("clip_starts") or []
+        for _ci, _clip in enumerate(info["clips"]):
+            if _clip.get("kind") != "image":
+                continue
+            if float(_clip["duration"]) <= 4.5:
+                continue
+            if _clip.get("punch_at") is not None:
+                continue
+            if effective_ken_burns(_clip, _ci, project) != "none":
+                continue
+            _cs = _starts[_ci] if _ci < len(_starts) else 0.0
+            _ce = _cs + float(_clip["duration"])
+            _animated = False
+            for _ov in (info.get("overlays") or []):
+                if not _ov.get("keyframes_resolved"):
+                    continue
+                _os, _oe = float(_ov["start"]), float(_ov["start"]) + float(_ov["duration"])
+                if _os < _ce and _oe > _cs:
+                    _animated = True
+                    break
+            if _animated:
+                continue
+            info["warnings"].append({
+                "code": "static_shot_warning",
+                "message": (f"image clip '{_clip['id']}' is {float(_clip['duration']):.1f}s long with no motion "
+                            f"(no ken_burns, punch_in, default_image_motion or animated overlay); "
+                            f"it will look frozen — add ken_burns, punch_in or default_image_motion"),
+                "clip_id": _clip["id"], "start": round(_cs, 3),
+                "end": round(_ce, 3)})
+        # Active-caption chunk width (v1.37.0, warning only): a
+        # 2–4 word chunk wider than the frame would clip, since
+        # active chunks are single-line by design.
+        for _cap in (info.get("captions") or []):
+            if not isinstance(_cap, dict) or not _cap.get("word_timings"):
+                continue
+            _size = float(_cap.get("size", 36))
+            _wt = _cap["word_timings"]
+            _chunks = chunk_word_timings(_wt)
+            for _ch in _chunks:
+                _text = " ".join(w["word"] for w in _ch)
+                if len(_text) * _size * 0.6 > width:
+                    info["warnings"].append({
+                        "code": "active_chunk_overflow_warning",
+                        "message": (f"active caption chunk '{_text}' estimated width "
+                                    f"{len(_text) * _size * 0.6:.0f}px exceeds output width {width}px "
+                                    f"and may clip (shorten the chunk or reduce caption size)"),
+                        "text": _text})
+    except Exception:
+        pass
     return errors, info

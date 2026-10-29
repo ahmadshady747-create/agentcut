@@ -82,6 +82,105 @@ def _frame_png(path, t, out):
     return _png_px(out)
 
 
+def _vol_window(path, start, end):
+    """Mean volume (dB) of an audio window, via volumedetect."""
+    import re as _re
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", path, "-af",
+         f"atrim=start={start}:end={end},asetpts=PTS-STARTPTS,"
+         "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=60)
+    m = _re.search(r"mean_volume:\s*(-?[0-9.]+)", proc.stderr or "")
+    return float(m.group(1)) if m else -91.0
+
+
+def _vol_filtered(path, filt, start, end):
+    """Mean volume (dB) of an audio window through one filter."""
+    import re as _re
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", path, "-af",
+         f"atrim=start={start}:end={end},asetpts=PTS-STARTPTS,"
+         f"{filt},volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=60)
+    m = _re.search(r"mean_volume:\s*(-?[0-9.]+)", proc.stderr or "")
+    return float(m.group(1)) if m else -91.0
+
+
+def _silence_onset(path, after=0.0):
+    """First silence_start after `after` seconds, or None.
+
+    The pre-SFX silence (before the SFX starts) is itself a
+    silence segment, so callers pass after=<sfx start> to get the
+    silence onset that marks the SFX's end."""
+    import re as _re
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", path, "-af",
+         "silencedetect=noise=-50dB:d=0.05", "-vn", "-sn", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=60)
+    for m in _re.finditer(r"silence_start:\s*(-?[0-9.]+)", proc.stderr or ""):
+        v = float(m.group(1))
+        if v > after:
+            return v
+    return None
+
+
+def _frame_mean_diff(path, t1, t2):
+    """Mean absolute pixel difference between two frames (sampled)."""
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="agentcut-diff-")
+    try:
+        _w1, _h1, px1 = _frame_png(path, t1, os.path.join(tmp, "a.png"))
+        _w2, _h2, px2 = _frame_png(path, t2, os.path.join(tmp, "b.png"))
+        total, n = 0.0, 0
+        for y in range(0, _h1, 10):
+            for x in range(0, _w1, 10):
+                a, b = px1(x, y), px2(x, y)
+                for k in range(min(len(a), len(b), 3)):
+                    total += abs(a[k] - b[k])
+                    n += 1
+        return total / max(n, 1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _red_bbox_width(path, t):
+    """Width of the red region in a frame (for punch measurement)."""
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="agentcut-red-")
+    try:
+        w, h, px = _frame_png(path, t, os.path.join(tmp, "f.png"))
+        xs = []
+        for y in range(h):
+            for x in range(w):
+                r, g, b = px(x, y)[:3]
+                if r > 180 and g < 80 and b < 80:
+                    xs.append(x)
+        return (max(xs) - min(xs) + 1) if xs else 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _yellow_stats(path, t):
+    """(mean_y, yellow_centroid_x, yellow_count) in the caption
+    band (bottom 160px) of a frame: yellow = R and G high, B low."""
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="agentcut-yel-")
+    try:
+        w, h, px = _frame_png(path, t, os.path.join(tmp, "f.png"))
+        xs, ys = [], []
+        for y in range(max(0, h - 160), h):
+            for x in range(w):
+                r, g, b = px(x, y)[:3]
+                if r > 180 and g > 180 and b < 100:
+                    xs.append(x)
+                    ys.append(y)
+        n = len(xs)
+        return ((sum(ys) / n) if n else 0,
+                (sum(xs) / n) if n else 0, n)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def example():
     with open(os.path.join(BASE, "examples", "basic.json")) as fh:
         return json.load(fh)
@@ -2856,6 +2955,511 @@ class TestAgentCut(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertNotIn("Traceback", proc.stdout)
+
+
+    def test_loop137_sfx_timing_and_no_audio_project(self):
+        # 1.37.0 SFX: a built-in SFX fires at its element's start
+        # and is absent well before it, measured with
+        # volumedetect windows (not filter-graph inspection),
+        # even when the project has no other audio at all.
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-sfx-")
+        try:
+            p = {"id": "sfx", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image",
+                            "src": "data/test_red.png", "duration": 4}],
+                 "texts": [{"text": "Hello", "start": 1, "end": 3,
+                            "sfx": "ding", "sfx_volume": 0.5}]}
+            out = os.path.join(tmp, "out.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            self.assertIn("audio",
+                          {s["codec_type"] for s in probe["streams"]})
+            before = _vol_window(out, 0.0, 0.9)
+            at = _vol_window(out, 1.0, 1.8)
+            self.assertLessEqual(before, -60.0, f"before window {before}")
+            self.assertGreater(at, -30.0, f"at window {at}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_sfx_all_names_and_spectra(self):
+        # 1.37.0 SFX: every built-in name renders non-silent with
+        # roughly its documented duration (silence onset after
+        # the SFX), and thud/click have opposite spectral
+        # signatures (low-dominant vs high-dominant).
+        import tempfile as _tf
+        expected = {"pop": 0.30, "whoosh": 1.00, "cash": 1.20,
+                    "chime": 1.20, "click": 0.12, "ding": 0.90,
+                    "thud": 0.70}
+        tmp = _tf.mkdtemp(prefix="agentcut-sfxall-")
+        try:
+            for name, dur in expected.items():
+                p = {"id": "sfx", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [{"id": "a", "kind": "image",
+                                "src": "data/test_red.png", "duration": 3}],
+                     "texts": [{"text": "X", "start": 0.5, "end": 2.5,
+                                "sfx": name}]}
+                out = os.path.join(tmp, f"{name}.mp4")
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                at = _vol_window(out, 0.5, min(0.5 + dur, 2.5))
+                self.assertGreater(at, -35.0, f"{name} window {at}")
+                sil = _silence_onset(out, after=0.5)
+                self.assertIsNotNone(sil, name)
+                self.assertAlmostEqual(sil, 0.5 + dur, delta=0.35)
+            # Spectra: thud low-dominant, click high-dominant.
+            def _render(name):
+                p = {"id": "sfx", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [{"id": "a", "kind": "image",
+                                "src": "data/test_red.png", "duration": 3}],
+                     "texts": [{"text": "X", "start": 0.5, "end": 2.5,
+                                "sfx": name}]}
+                out = os.path.join(tmp, f"spec_{name}.mp4")
+                ok, _i = render_project(p, out)
+                self.assertTrue(ok, _i)
+                return out
+            thud = _render("thud")
+            click = _render("click")
+            thud_low = _vol_filtered(thud, "lowpass=f=300", 0.5, 1.1)
+            thud_high = _vol_filtered(thud, "highpass=f=1500", 0.5, 1.1)
+            click_low = _vol_filtered(click, "lowpass=f=300", 0.5, 0.62)
+            click_high = _vol_filtered(click, "highpass=f=1500", 0.5, 0.62)
+            self.assertGreater(thud_low, thud_high,
+                               f"thud low {thud_low} high {thud_high}")
+            self.assertGreater(click_high, click_low,
+                               f"click high {click_high} low {click_low}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_sfx_file_volume_and_chapters(self):
+        # 1.37.0 SFX: a local file path works as an SFX, volume
+        # scaling is ~9 dB between 0.35 and 1.0, and SFX inputs
+        # appended after a chapters metadata input do not shift
+        # the chapter mapping.
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-sfxfile-")
+        try:
+            beep = os.path.join(tmp, "beep.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=0.5:"
+                            "sample_rate=48000", beep], check=True)
+            def _render(vol, chapters=False):
+                p = {"id": "sfx", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [{"id": "a", "kind": "image",
+                                "src": "data/test_red.png", "duration": 4}],
+                     "texts": [{"text": "Go", "start": 1, "end": 3,
+                                "sfx": "ding", "sfx_volume": vol}]}
+                if chapters:
+                    p["chapters"] = [{"title": "Intro", "start": 0}]
+                    p["texts"][0]["sfx"] = beep
+                out = os.path.join(tmp, f"v{vol}_{chapters}.mp4")
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                return out
+            quiet = _render(0.35)
+            loud = _render(1.0)
+            q = _vol_window(quiet, 1.0, 1.8)
+            l = _vol_window(loud, 1.0, 1.8)
+            self.assertGreater(l - q, 7.0, f"quiet {q} loud {l}")
+            self.assertLess(l - q, 11.0, f"quiet {q} loud {l}")
+            ch = _render(0.5, chapters=True)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_chapters", ch], capture_output=True, text=True)
+            chapters = json.loads(probe.stdout).get("chapters", [])
+            self.assertEqual(len(chapters), 1)
+            self.assertGreater(_vol_window(ch, 1.0, 1.4), -35.0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_sfx_validation(self):
+        # 1.37.0 SFX validation: unknown names are structured
+        # errors listing the valid names; bad volumes and missing
+        # files are structured errors too; transition and overlay
+        # SFX validate cleanly.
+        from agentcut.validate import SFX_NAMES, validate_project
+        base = {"id": "s", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_red.png", "duration": 3}]}
+        bad = dict(base)
+        bad["texts"] = [{"text": "Hi", "start": 0, "end": 2,
+                         "sfx": "bogus"}]
+        errors, _i = validate_project(bad)
+        self.assertTrue(errors)
+        self.assertTrue(any("pop" in e["message"] and "ding" in e["message"]
+                            for e in errors), errors)
+        badvol = dict(base)
+        badvol["texts"] = [{"text": "Hi", "start": 0, "end": 2,
+                            "sfx": "ding", "sfx_volume": 5}]
+        errors, _i = validate_project(badvol)
+        self.assertTrue(errors)
+        missing = dict(base)
+        missing["texts"] = [{"text": "Hi", "start": 0, "end": 2,
+                             "sfx": "no-such-file.wav"}]
+        errors, _i = validate_project(missing)
+        self.assertTrue(errors)
+        good = {"id": "s", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_red.png", "duration": 3},
+                          {"id": "b", "kind": "image",
+                           "src": "data/test_blue_solid.png", "duration": 3,
+                           "transition": "crossfade", "sfx": "whoosh"}],
+                "overlays": [{"id": "o", "kind": "image",
+                              "src": "data/test_green.png", "start": 0,
+                              "duration": 2, "sfx": "click"}]}
+        errors, _i = validate_project(good)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(tuple(SFX_NAMES),
+                         ("pop", "whoosh", "cash", "chime", "click",
+                          "ding", "thud"))
+
+    def test_loop1371_sfx_timing_with_default_motion(self):
+        # 1.37.1 regression: the 1.37.0 SFX timing tests never
+        # combined SFX with default_image_motion, so they missed
+        # the defect where EVERY SFX played from t=0 (and its
+        # scheduled window was silent) whenever a Ken Burns
+        # single-frame zoompan input was in the graph. These
+        # tests assert volumedetect windows — silence BEFORE the
+        # scheduled start AND energy INSIDE it — with motion on
+        # and off, for clip, text, caption and file SFX, and for
+        # several SFX sharing one start time. Motion-on renders
+        # are done twice because the 1.37.0 failure was
+        # nondeterministic (the old code passed some runs).
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-sfx1371-")
+        try:
+            def _clips(sfx=None):
+                clips = [{"id": "a", "kind": "image",
+                          "src": "data/test_red.png", "duration": 2},
+                         {"id": "b", "kind": "image",
+                          "src": "data/test_blue_solid.png", "duration": 2},
+                         {"id": "c", "kind": "image",
+                          "src": "data/test_green.png", "duration": 2}]
+                if sfx:
+                    clips[2]["sfx"] = sfx
+                return clips
+            # Clip SFX at 4.0, motion on (twice) and off.
+            for motion in (True, True, False):
+                p = {"id": "sfx", "version": 1,
+                     "output": {"width": 360, "height": 640,
+                                "fps": 30},
+                     "clips": _clips("whoosh")}
+                if motion:
+                    p["default_image_motion"] = True
+                out = os.path.join(tmp, f"clip_{motion}_{id(p)}.mp4")
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                self.assertLessEqual(_vol_window(out, 0.0, 0.25),
+                                     -60.0, f"motion={motion} pre")
+                self.assertGreater(_vol_window(out, 4.0, 5.0),
+                                   -30.0, f"motion={motion} win")
+            # Text SFX at 4.0 with motion on (the r16 case), plus
+            # caption SFX at 1.0 and two text SFX sharing 2.0.
+            p = {"id": "sfx", "version": 1,
+                 "default_image_motion": True,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": _clips(),
+                 "texts": [{"text": "Ding", "start": 4.0, "end": 5.0,
+                            "sfx": "ding"},
+                           {"text": "One", "start": 2.0, "end": 3.0,
+                            "sfx": "ding"},
+                           {"text": "Two", "start": 2.0, "end": 3.0,
+                            "y": 200, "sfx": "pop"}],
+                 "captions": [{"text": "Cash", "start": 1.0,
+                               "end": 1.9, "sfx": "cash"}]}
+            out = os.path.join(tmp, "mixed.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            self.assertLessEqual(_vol_window(out, 0.0, 0.25),
+                                 -60.0, "mixed pre")
+            self.assertGreater(_vol_window(out, 1.0, 1.9),
+                               -30.0, "mixed caption win")
+            self.assertGreater(_vol_window(out, 2.0, 2.9),
+                               -30.0, "mixed shared-start win")
+            self.assertLessEqual(_vol_window(out, 3.0, 3.9),
+                                 -60.0, "mixed gap")
+            self.assertGreater(_vol_window(out, 4.0, 4.9),
+                               -30.0, "mixed text win")
+            # File-path SFX at 4.0 with motion on.
+            beep = os.path.join(tmp, "beep.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=0.5:"
+                            "sample_rate=48000", beep], check=True)
+            _fc = _clips(beep)
+            _fc[2]["sfx_volume"] = 1.0
+            p = {"id": "sfx", "version": 1,
+                 "default_image_motion": True,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": _fc}
+            out = os.path.join(tmp, "file.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            self.assertLessEqual(_vol_window(out, 0.0, 0.25),
+                                 -60.0, "file pre")
+            self.assertGreater(_vol_window(out, 4.0, 4.5),
+                               -30.0, "file win")
+            # Same root cause, audio tracks: a voice track
+            # starting at 4.0 with motion on must not land at 0.
+            p = {"id": "sfx", "version": 1,
+                 "default_image_motion": True,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": _clips(),
+                 "audio": [{"kind": "voice",
+                            "src": "data/test_voice.wav",
+                            "start": 4.0, "volume": 1.0}]}
+            out = os.path.join(tmp, "track.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            self.assertLessEqual(_vol_window(out, 0.0, 0.25),
+                                 -60.0, "track pre")
+            self.assertGreater(_vol_window(out, 4.0, 5.0),
+                               -30.0, "track win")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_default_motion_and_punch(self):
+        # 1.37.0 motion: default_image_motion alternates
+        # zoom_in/zoom_out by clip index in the summary and moves
+        # frames; punch_in jumps scale by its factor at a frame
+        # boundary (red-square bbox 100 -> 122px at 1.22x).
+        import tempfile as _tf
+        from agentcut.render import timeline_summary
+        tmp = _tf.mkdtemp(prefix="agentcut-motion-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=white:s=360x640",
+                            "-vf", "drawbox=x=130:y=270:w=100:h=100:"
+                            "color=red:t=fill",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "m", "version": 1, "default_image_motion": True,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 3},
+                           {"id": "b", "kind": "image",
+                            "src": "data/test_red.png", "duration": 3}]}
+            ok, summ = timeline_summary(p)
+            self.assertTrue(ok, summ)
+            eff = [s.get("effective_ken_burns") for s in summ["segments"]]
+            self.assertEqual(eff, ["zoom_in", "zoom_out"], summ)
+            out = os.path.join(tmp, "mot.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            diff = _frame_mean_diff(out, 0.2, 2.8)
+            self.assertGreater(diff, 1.0, f"motion diff {diff}")
+            p2 = {"id": "p", "version": 1,
+                  "output": {"width": 360, "height": 640, "fps": 30},
+                  "clips": [{"id": "a", "kind": "image", "src": bg,
+                             "duration": 4,
+                             "punch_in": {"at": 2, "factor": 1.22}}]}
+            out2 = os.path.join(tmp, "pch.mp4")
+            ok, info = render_project(p2, out2)
+            self.assertTrue(ok, info)
+            before = _red_bbox_width(out2, 1.5)
+            after = _red_bbox_width(out2, 2.5)
+            self.assertAlmostEqual(after / before, 1.22, delta=0.12)
+            ok, summ = timeline_summary(p2)
+            self.assertEqual(summ["segments"][0]["punch_at"], 2)
+            self.assertEqual(summ["segments"][0]["punch_factor"], 1.22)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_static_shot_warning(self):
+        # 1.37.0 static-shot warning: fires for a long still with
+        # no motion, and only then — Ken Burns, punch-in,
+        # default motion, an animated overlay, or a short clip
+        # each silence it. Produce QA surfaces it too.
+        from agentcut.render import produce_video, timeline_summary
+        from agentcut.validate import validate_project
+        def _warns(p):
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            return [w for w in info.get("warnings", [])
+                    if w.get("code") == "static_shot_warning"]
+        base = {"id": "s", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_red.png", "duration": 6}]}
+        hit = _warns(base)
+        self.assertEqual(len(hit), 1)
+        self.assertIn("a", hit[0]["message"])
+        for variant in (
+                {"ken_burns": "zoom_in"},
+                {"punch_in": True}):
+            p = {"id": "s", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image",
+                            "src": "data/test_red.png", "duration": 6,
+                            **variant}]}
+            self.assertEqual(_warns(p), [], variant)
+        p = dict(base)
+        p["default_image_motion"] = True
+        self.assertEqual(_warns(p), [])
+        p = {"id": "s", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": "data/test_red.png", "duration": 6}],
+             "overlays": [{"id": "o", "kind": "image",
+                           "src": "data/test_green.png", "start": 0,
+                           "duration": 6,
+                           "keyframes": [{"time": 0, "x": 20, "y": 20},
+                                        {"time": 6, "x": 200, "y": 20}]}]}
+        self.assertEqual(_warns(p), [])
+        short = {"id": "s", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image",
+                            "src": "data/test_red.png", "duration": 4}]}
+        self.assertEqual(_warns(short), [])
+        ok, summ = timeline_summary(base)
+        self.assertTrue(any(w.get("code") == "static_shot_warning"
+                            for w in summ["warnings"]), summ)
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-static-")
+        try:
+            out = os.path.join(tmp, "prod.mp4")
+            ok, info = produce_video(
+                {"clips": [{"src": os.path.join(BASE, "data",
+                                                "test_red.png"),
+                            "duration": 6}]}, out)
+            self.assertTrue(ok, info)
+            self.assertTrue(any("static_shot_warning" in w
+                                for w in info["qa"]["warnings"]),
+                            info["qa"]["warnings"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_active_captions_word(self):
+        # 1.37.0 active captions, per-word mode (the shipped
+        # behaviour): Arabic words stay joined in RTL order and
+        # the yellow highlight moves from word to word at the
+        # word boundaries — measured as the yellow centroid
+        # moving left (RTL) between the first and second words.
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-active-")
+        try:
+            wt = [{"word": "هذا", "start": 0.5, "end": 1.5},
+                  {"word": "اختبار", "start": 1.5, "end": 2.5},
+                  {"word": "بسيط", "start": 2.5, "end": 3.5},
+                  {"word": "للكلمات", "start": 3.5, "end": 5.5}]
+            p = {"id": "a", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 30},
+                 "clips": [{"id": "c", "kind": "image",
+                            "src": "data/test_red.png", "duration": 6}],
+                 "captions": [{"text": "هذا اختبار بسيط للكلمات",
+                               "start": 0.5, "end": 5.5, "size": 40,
+                               "word_timings": wt}]}
+            out = os.path.join(tmp, "act.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            y1, x1, n1 = _yellow_stats(out, 1.0)
+            y2, x2, n2 = _yellow_stats(out, 2.0)
+            self.assertGreater(n1, 100, f"w1 yellow {n1}")
+            self.assertGreater(n2, 100, f"w2 yellow {n2}")
+            self.assertLess(x2, x1 - 20,
+                            f"highlight moved RTL: {x1} -> {x2}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop137_active_captions_chunk_and_validation(self):
+        # 1.37.0 active captions, chunk mode + adversarial
+        # validation: chunk text renders in the highlight colour
+        # per chunk window; empty/mismatched/out-of-window/
+        # overlapping timings, bad modes, texts with timings,
+        # and out-of-range punch values are all structured
+        # errors; punch_in: true defaults to mid-clip at 1.20x.
+        import tempfile as _tf
+        from agentcut.validate import (chunk_word_timings,
+                                       effective_ken_burns,
+                                       validate_project)
+        self.assertEqual(
+            [[w["word"] for w in c] for c in chunk_word_timings(
+                [{"word": str(i)} for i in range(7)])],
+            [["0", "1", "2"], ["3", "4", "5", "6"]])
+        self.assertEqual(effective_ken_burns(
+            {"kind": "video", "ken_burns": "none"}, 0,
+            {"default_image_motion": True}), "none")
+        self.assertEqual(effective_ken_burns(
+            {"kind": "image", "ken_burns": "none", "fit": "blur"}, 0,
+            {"default_image_motion": True}), "none")
+        tmp = _tf.mkdtemp(prefix="agentcut-chunk-")
+        try:
+            wt = [{"word": "one", "start": 0.5, "end": 1.3},
+                  {"word": "two", "start": 1.3, "end": 2.1},
+                  {"word": "three", "start": 2.1, "end": 2.9},
+                  {"word": "four", "start": 2.9, "end": 3.7},
+                  {"word": "five", "start": 3.7, "end": 4.5}]
+            p = {"id": "a", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 30},
+                 "clips": [{"id": "c", "kind": "image",
+                            "src": "data/test_red.png", "duration": 5}],
+                 "captions": [{"text": "one two three four five",
+                               "start": 0.5, "end": 4.5, "size": 40,
+                               "highlight_mode": "chunk",
+                               "word_timings": wt}]}
+            out = os.path.join(tmp, "chunk.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            _y, _x, n1 = _yellow_stats(out, 1.0)
+            _y, _x, n2 = _yellow_stats(out, 4.0)
+            self.assertGreater(n1, 100)
+            self.assertGreater(n2, 100)
+            _y, _x, n0 = _yellow_stats(out, 0.2)
+            self.assertEqual(n0, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        def _bad(caption=None, clip=None, texts=None):
+            p = {"id": "a", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [clip or {"id": "c", "kind": "image",
+                                    "src": "data/test_red.png",
+                                    "duration": 4}]}
+            if caption is not None:
+                p["captions"] = [caption]
+            if texts is not None:
+                p["texts"] = texts
+            errors, _i = validate_project(p)
+            return errors
+        good_wt = [{"word": "hi", "start": 0.5, "end": 1.5},
+                   {"word": "there", "start": 1.5, "end": 2.5}]
+        cap = {"text": "hi there", "start": 0.5, "end": 2.5,
+               "word_timings": good_wt}
+        self.assertTrue(_bad(caption={**cap, "word_timings": []}))
+        self.assertTrue(_bad(caption={**cap, "word_timings": [
+            {"word": "hi", "start": 0.5, "end": 1.5}]}))
+        self.assertTrue(_bad(caption={**cap, "word_timings": [
+            {"word": "hi", "start": 0.5, "end": 1.5},
+            {"word": "there", "start": 1.0, "end": 2.5}]}))
+        self.assertTrue(_bad(caption={**cap, "word_timings": [
+            {"word": "hi", "start": 0.5, "end": 1.5},
+            {"word": "there", "start": 1.5, "end": 3.5}]}))
+        self.assertTrue(_bad(caption={**cap, "highlight_mode": "line"}))
+        self.assertTrue(_bad(texts=[{"text": "hi", "start": 0, "end": 2,
+                                     "word_timings": good_wt}]))
+        self.assertTrue(_bad(clip={"id": "c", "kind": "image",
+                                   "src": "data/test_red.png", "duration": 4,
+                                   "punch_in": {"at": 2, "factor": 1.30}}))
+        self.assertTrue(_bad(clip={"id": "c", "kind": "image",
+                                   "src": "data/test_red.png", "duration": 4,
+                                   "punch_in": {"at": 4.5, "factor": 1.20}}))
+        self.assertTrue(_bad(clip={"id": "c", "kind": "image",
+                                   "src": "data/test_red.png", "duration": 4,
+                                   "punch_in": "soon"}))
+        errors, info = validate_project(
+            {"id": "a", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "c", "kind": "image",
+                        "src": "data/test_red.png", "duration": 4,
+                        "punch_in": True}]})
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["clips"][0]["punch_at"], 2.0)
+        self.assertEqual(info["clips"][0]["punch_factor"], 1.20)
 
 
 if __name__ == "__main__":
