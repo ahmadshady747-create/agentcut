@@ -155,8 +155,34 @@ TOOLS = [
 ]
 
 
+def _bad_id(value):
+    """True when value is not a safe project/job/snapshot id.
+
+    Ids are [A-Za-z0-9_-]+ by contract (see _save_project); load
+    endpoints previously passed ids straight into filesystem
+    paths, so a traversal id (e.g. "../snapshots/...") could read
+    files outside the projects/jobs/snapshots directories, and
+    list_snapshots would even create directories for arbitrary
+    ids. Every id-taking tool checks its ids first (1.34.0).
+    """
+    return not isinstance(value, str) or not _ID_RE.match(value)
+
+
+def _id_error(what="id"):
+    return _tool_error({"code": "INVALID_SCHEMA",
+                        "message": f"{what} must match [A-Za-z0-9_-]+"})
+
+
 def call_tool(name, args):
     args = args or {}
+    if name in ("get_project", "patch_project", "preview_project",
+                "render_project", "poster_frame", "snapshot_project",
+                "list_snapshots") and _bad_id(args.get("id")):
+        return _id_error()
+    if name == "rollback_project" and (_bad_id(args.get("id")) or _bad_id(args.get("snapshot_id"))):
+        return _id_error("id and snapshot_id")
+    if name == "get_job" and _bad_id(args.get("id")):
+        return _id_error()
     if name == "probe_media":
         info = probe_media(args["src"])
         if info is None:
@@ -301,6 +327,11 @@ def _server_version():
         return "1.0.0"
 
 
+def _respond(resp):
+    sys.stdout.write(json.dumps(resp) + "\n")
+    sys.stdout.flush()
+
+
 def serve():
     for line in sys.stdin:
         line = line.strip()
@@ -309,30 +340,62 @@ def serve():
         try:
             req = json.loads(line)
         except Exception:
+            # A line that is not JSON at all still gets a JSON-RPC
+            # parse error (id null: no id could be recovered), never
+            # silence — and never a crash. Found in the 1.34.0
+            # audit: the old code skipped the line, which is fine,
+            # but a parsed non-object (e.g. [1,2,3]) crashed the
+            # server below on req.get().
+            _respond({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32700, "message": "parse error"}})
+            continue
+        if not isinstance(req, dict):
+            # A parsed JSON value that is not an object (a list, a
+            # string, a number) has no method to dispatch: answer
+            # invalid-request and stay alive. This was a server
+            # crash before 1.34.0 (AttributeError on req.get()).
+            _respond({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32600,
+                                "message": "invalid request: expected a JSON object"}})
             continue
         method = req.get("method", "")
+        if not isinstance(method, str):
+            method = ""
         req_id = req.get("id")
         if method.startswith("notifications/"):
             continue
         if method == "initialize":
+            params = req.get("params")
+            if not isinstance(params, dict):
+                params = {}
             result = {
-                "protocolVersion": req.get("params", {}).get("protocolVersion", "2024-11-05"),
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "agentcut", "version": _server_version()},
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
-            params = req.get("params", {})
-            try:
-                result = call_tool(params.get("name"), params.get("arguments") or {})
-            except (KeyError, TypeError, AttributeError, ValueError) as exc:
-                # A malformed tool call (e.g. a missing required
-                # argument) must return a structured error, never kill
-                # the server with a traceback: the client may still
-                # have more calls to make, and the server is long-lived.
+            params = req.get("params")
+            if not isinstance(params, dict):
+                # Non-object params (e.g. a string) crashed the
+                # server before 1.34.0 on params.get(); answer a
+                # structured tool error instead.
                 result = _tool_error({"code": "INVALID_SCHEMA",
-                                      "message": f"missing or invalid tool argument: {exc}"})
+                                      "message": "tools/call params must be an object"})
+            elif params.get("arguments") is not None and not isinstance(params.get("arguments"), dict):
+                result = _tool_error({"code": "INVALID_SCHEMA",
+                                      "message": "tool arguments must be an object"})
+            else:
+                try:
+                    result = call_tool(params.get("name"), params.get("arguments") or {})
+                except (KeyError, TypeError, AttributeError, ValueError) as exc:
+                    # A malformed tool call (e.g. a missing required
+                    # argument) must return a structured error, never kill
+                    # the server with a traceback: the client may still
+                    # have more calls to make, and the server is long-lived.
+                    result = _tool_error({"code": "INVALID_SCHEMA",
+                                          "message": f"missing or invalid tool argument: {exc}"})
         elif method == "ping":
             result = {}
         else:

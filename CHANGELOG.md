@@ -1,3 +1,99 @@
+## 1.34.0 — Defect-fix loop (audit + fixes, no new features)
+
+User order 2026-10-29: fix ALL defects in AgentCut code, do not
+close until sure. Phase 1 audited every source file, the tests,
+the docs and the examples, re-proved every documented limit, and
+ran an adversarial edge-case checklist; Phase 2 fixed each
+confirmed defect with a failing test/repro first. No new tools,
+no AI features, no CapCut-like features. Tests 73/73 (62 prior +
+11 new loop tests) in the main tree and in a fresh copy.
+- Server crash fixed (F1): serve() died with AttributeError on
+  a parsed non-object JSON line ([1,2,3]) and on non-dict
+  tools/call params — a malformed payload killed the long-lived
+  server and hung the client. Now: unparseable lines get a
+  JSON-RPC parse error (-32700), non-object requests get
+  invalid-request (-32600), non-dict params get a structured
+  INVALID_SCHEMA tool error, and the server stays alive.
+  Test: test_loop134_server_survives_non_object_json.
+- Id validation fixed (F2): load endpoints passed ids straight
+  into filesystem paths (only _save_project enforced
+  [A-Za-z0-9_-]+), so traversal ids could read outside
+  projects/jobs/snapshots, and list_snapshots would create
+  directories for arbitrary ids. Every id-taking tool now
+  rejects ids outside the pattern with INVALID_SCHEMA.
+  Test: test_loop134_id_traversal_rejected.
+- Text geometry validated (F3a): text size (non-numeric,
+  negative, zero, >240) and text x/y (non-numeric, negative)
+  used to pass validation and fail only inside FFmpeg. Now:
+  size must be a number 8..240; text x must be "center" or a
+  number >= 0; text y must be a number >= 0; captions must not
+  set x/y at all (render ignores them — use position or
+  caption_position). Test: test_loop134_text_geometry_validation.
+- Silently ignored fields rejected (F3b): video clips must not
+  set "duration" (duration comes from trim/speed) and image
+  clips must not set trim_in/trim_out (duration is the length);
+  both now fail validation with a fix hint. No example or test
+  used either. Test: test_loop134_ignored_fields_rejected.
+- Broken media rejected (F3c): ffprobe "succeeds" on garbage
+  named .png (image2 probe, 0x0 dimensions) and an audio-only
+  file validated as a video clip — both failed only at render
+  time. Now: image and video media need width > 0 and height >
+  0, and video clips need a video stream. Overlays get the same
+  dimension check. Test: test_loop134_broken_media_rejected.
+- Silent + loudnorm structured (F3d): loudnorm on digital
+  silence measured -inf, emitted NaN, and the AAC encoder
+  failed with a cryptic error. Render now pre-checks loudnorm
+  tracks with loudnorm's own measurement and returns a
+  structured error naming the track and the fix (remove
+  loudnorm from the silent track). Note: volumedetect is NOT
+  the detector — on this build it reports -91.0 dB, not -inf,
+  for digital silence. Test: test_loop134_silent_loudnorm_structured.
+- Text overflow warnings (F4): single-line centred drawtext
+  clips both edges when a line is wider than the frame, with
+  no signal. Validation now adds text_overflow_warning
+  (estimated width, same approximation as the collision check)
+  to info["warnings"], surfaced by validate, timeline_summary
+  and produce QA. Warnings only, never blocking.
+  Test: test_loop134_text_overflow_warning.
+- Overlay box parity (F5): _overlay_box_at required BOTH x and
+  y for explicit placement while render applies x/y per axis,
+  so an x-only overlay's collision box was the preset box.
+  Estimation is now per-axis, matching render.
+  Test: test_loop134_overlay_box_per_axis.
+- Validation purity (F6): validate_project mutated the
+  caller's audio tracks (resolving srcs, coercing starts) when
+  run from another directory. Tracks are now copied; resolved
+  audio lives in info["audio"], the render uses it, and stored
+  projects keep paths as given. Test:
+  test_loop134_validate_does_not_mutate_audio (validates and
+  renders from /tmp with relative paths).
+- Structured brief/CLI numbers (F7): non-numeric produce-brief
+  durations/speeds/trims and bad numeric CLI arguments used to
+  escape as raw tracebacks outside the MCP path. Both now
+  return/print structured errors. LUT filter paths escape
+  backslashes. Tests: test_loop134_produce_bad_numbers_structured,
+  test_loop134_cli_bad_numbers_no_traceback.
+- Docs (F8): overlay precedence documented (explicit x/y win
+  per axis over a position preset; texts keep the documented
+  position-wins rule); the new warnings, the loudnorm-silent
+  error, the stream/dimension requirements, SRT overlap
+  behaviour (overlapping cues render stacked), and job/output
+  persistence (no auto-cleanup by design; old data/jobs and
+  data/outputs may be deleted by hand) are documented in
+  README/SKILL.
+- Deferred with reasons (see STATE.md): bool-as-number
+  coercion, integer-field float truncation (<=1px), job/output
+  auto-cleanup, %/# font coverage, chroma+scale keyframes,
+  schedule-based ducking, sample-peak QA, grading presets,
+  colourbalance-on-gray, 3840/600s caps. Verified not defects:
+  all transition/animation/chapter boundaries, non-UTF8 and
+  malformed SRT handling, render determinism (byte-identical
+  re-renders), special-character texts (backslash, colon,
+  quote, newline, percent), freeze warnings on still-image
+  timelines (intentional, asserted by an existing test),
+  preview guides/timecode never leaking into finals, detached
+  job survival.
+
 ## 1.33.0 — Arabic BiDi fix + layer/text collision warnings
 
 - Arabic BiDi display fix (render.py `bidi_display_text`, applied

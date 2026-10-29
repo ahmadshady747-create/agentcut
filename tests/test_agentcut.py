@@ -2132,5 +2132,227 @@ class TestAgentCut(unittest.TestCase):
         self.assertEqual(warns2, [])
 
 
+    def test_loop134_server_survives_non_object_json(self):
+        # 1.34.0 F1: a parsed non-object JSON line and non-dict
+        # params used to kill serve() with AttributeError. Each
+        # malformed line must now get a JSON-RPC error and the
+        # server must stay alive for a later ping.
+        proc = subprocess.Popen(
+            [os.path.join(BASE, "run.sh"), "serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            cwd=BASE)
+        try:
+            def send(line):
+                proc.stdin.write(line + "\n")
+                proc.stdin.flush()
+                return proc.stdout.readline()
+            r = send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                 "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                            "clientInfo": {"name": "t", "version": "1"}}}))
+            self.assertIn('"id": 1', r)
+            r = send("[1,2,3]")
+            self.assertIn("-32600", r)
+            r = send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                 "params": "not-a-dict"}))
+            self.assertIn("INVALID_SCHEMA", r)
+            r = send("{not json")
+            self.assertIn("-32700", r)
+            self.assertIsNone(proc.poll())
+            r = send(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+            self.assertIn('"id": 9', r)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+
+    def test_loop134_id_traversal_rejected(self):
+        # 1.34.0 F2: load endpoints must reject ids outside
+        # [A-Za-z0-9_-]+ instead of passing them into paths
+        # (list_snapshots used to makedirs() for arbitrary ids).
+        from agentcut.server import call_tool
+        out = call_tool("get_project", {"id": "../../etc/passwd"})
+        self.assertTrue(out.get("isError"))
+        self.assertIn("INVALID_SCHEMA", json.dumps(out))
+        out = call_tool("get_job", {"id": "../x"})
+        self.assertTrue(out.get("isError"))
+        evil = os.path.join(BASE, "data", "loop134evil")
+        self.assertFalse(os.path.exists(evil))
+        out = call_tool("list_snapshots", {"id": "../loop134evil"})
+        self.assertTrue(out.get("isError"))
+        self.assertFalse(os.path.exists(evil))
+
+    def test_loop134_text_geometry_validation(self):
+        # 1.34.0 F3a: size/x/y are validated, not left to FFmpeg.
+        base = {"id": "geo", "version": 1,
+                "output": {"width": 160, "height": 160, "fps": 12},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                           "duration": 2}]}
+        import copy
+        for bad_text in ({"text": "Hi", "size": "big", "start": 0, "end": 1},
+                         {"text": "Hi", "size": -5, "start": 0, "end": 1},
+                         {"text": "Hi", "size": 0, "start": 0, "end": 1},
+                         {"text": "Hi", "size": 241, "start": 0, "end": 1},
+                         {"text": "Hi", "x": "foo", "y": 10, "start": 0, "end": 1},
+                         {"text": "Hi", "x": "center", "y": -10, "start": 0, "end": 1},
+                         {"text": "Hi", "x": "center", "y": "ten", "start": 0, "end": 1}):
+            p = copy.deepcopy(base)
+            p["texts"] = [bad_text]
+            errors, _ = validate_project(p)
+            self.assertTrue(errors, bad_text)
+            self.assertTrue(any("fix" in e for e in errors), errors)
+        p = copy.deepcopy(base)
+        p["texts"] = [{"text": "Hi", "size": 48, "x": "center", "y": 80,
+                       "start": 0, "end": 1}]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [])
+        p = copy.deepcopy(base)
+        p["captions"] = [{"text": "cap", "x": 10, "y": 10, "start": 0, "end": 1}]
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)  # captions ignore x/y in render
+
+    def test_loop134_ignored_fields_rejected(self):
+        # 1.34.0 F3b: fields render ignores must not validate clean.
+        vid = os.path.join(BASE, "data", "test_media", "clip1.mp4")
+        img = os.path.join(BASE, "data", "test_media", "poster.png")
+        p = {"id": "ign", "version": 1,
+             "output": {"width": 160, "height": 160, "fps": 12},
+             "clips": [{"id": "a", "kind": "video", "src": vid,
+                        "trim_in": 0, "trim_out": 3, "duration": 3}]}
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        p["clips"] = [{"id": "a", "kind": "image", "src": img,
+                       "duration": 2, "trim_in": 0}]
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+
+    def test_loop134_broken_media_rejected(self):
+        # 1.34.0 F3c: ffprobe "succeeds" on garbage named .png
+        # (0x0) and an audio-only file validates as a video clip.
+        bad = os.path.join(BASE, "data", "test_broken134.png")
+        with open(bad, "w") as fh:
+            fh.write("not an image at all")
+        voice = os.path.join(BASE, "data", "test_voice.wav")
+        for src in (bad, voice):
+            p = {"id": "brk", "version": 1,
+                 "output": {"width": 160, "height": 160, "fps": 12},
+                 "clips": [{"id": "a", "kind": "video" if src == voice else "image",
+                            "src": src, "duration": 2}]}
+            if src == voice:
+                p["clips"][0].pop("duration")
+                p["clips"][0].update({"trim_in": 0, "trim_out": 1})
+            errors, _ = validate_project(p)
+            self.assertTrue(errors, src)
+
+    def test_loop134_silent_loudnorm_structured(self):
+        # 1.34.0 F3d: loudnorm on digital silence used to fail
+        # inside FFmpeg with a NaN/AAC error; now a structured
+        # error names the track and the fix.
+        silent = os.path.join(BASE, "data", "test_silent134.wav")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "anullsrc=r=48000:cl=stereo", "-t", "2",
+                        silent], check=True)
+        p = {"id": "sil", "version": 1,
+             "output": {"width": 160, "height": 160, "fps": 12},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                        "duration": 2}],
+             "audio": [{"src": silent, "kind": "music", "loudnorm": True}]}
+        ok, info = render_project(p, os.path.join(BASE, "data", "test_silent134.mp4"))
+        self.assertFalse(ok)
+        self.assertIn("loudnorm", json.dumps(info))
+        self.assertIn("fix", info)
+
+    def test_loop134_text_overflow_warning(self):
+        # 1.34.0 F4: a caption wider than the frame warns instead
+        # of clipping silently; a short caption does not warn.
+        img = os.path.join(BASE, "data", "test_media", "poster.png")
+        base = {"id": "ovf", "version": 1,
+                "output": {"width": 160, "height": 160, "fps": 12},
+                "clips": [{"id": "a", "kind": "image", "src": img, "duration": 2}]}
+        import copy
+        p = copy.deepcopy(base)
+        p["captions"] = [{"text": "This caption is far too long for a 160 pixel wide frame",
+                          "start": 0, "end": 1}]
+        _, info = validate_project(p)
+        self.assertTrue(any(w.get("code") == "text_overflow_warning"
+                            for w in info.get("warnings", [])), info.get("warnings"))
+        p = copy.deepcopy(base)
+        p["captions"] = [{"text": "Short", "start": 0, "end": 1}]
+        _, info = validate_project(p)
+        self.assertFalse(any(w.get("code") == "text_overflow_warning"
+                             for w in info.get("warnings", [])))
+
+    def test_loop134_overlay_box_per_axis(self):
+        # 1.34.0 F5: estimation must match render's per-axis x/y
+        # (an x-only overlay keeps the preset y, not the preset x).
+        from agentcut.validate import _overlay_box_at
+        ov = {"id": "o", "kind": "image", "src": "x.png", "duration": 2,
+              "start": 0, "size": 0.35, "position": "bottom_right",
+              "x": 0, "probe": {"width": 100, "height": 100}}
+        box = _overlay_box_at(ov, 0.5, 160, 160)
+        # bw = 0.35*160 = 56; preset bottom_right y = 160-56-20 = 84.
+        self.assertEqual(box, (0.0, 84.0, 56.0, 56.0))
+
+    def test_loop134_validate_does_not_mutate_audio(self):
+        # 1.34.0 F6: validation must not rewrite the caller's
+        # audio tracks, even from another working directory.
+        import copy
+        img = os.path.join(BASE, "data", "test_media", "poster.png")
+        p = {"id": "pure", "version": 1,
+             "output": {"width": 160, "height": 160, "fps": 12},
+             "clips": [{"id": "a", "kind": "image", "src": img, "duration": 2}],
+             "audio": [{"src": "data/test_media/clip1.mp4", "kind": "music"}]}
+        before = copy.deepcopy(p)
+        old = os.getcwd()
+        try:
+            os.chdir("/tmp")
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [])
+            self.assertEqual(p, before)
+            self.assertEqual(info["audio"][0]["src"],
+                             os.path.join(BASE, "data", "test_media", "clip1.mp4"))
+            # And a render from the other directory still resolves.
+            ok, rinfo = render_project(p, "/tmp/test_pure134.mp4")
+            self.assertTrue(ok, rinfo)
+        finally:
+            os.chdir(old)
+
+    def test_loop134_produce_bad_numbers_structured(self):
+        # 1.34.0 F7: non-numeric brief numbers are structured
+        # errors, not ValueError tracebacks.
+        from agentcut.render import produce_video
+        img = os.path.join(BASE, "data", "test_media", "poster.png")
+        ok, info = produce_video(
+            {"id": "badnum", "format": "square",
+             "clips": [{"src": img, "duration": "abc"}]},
+            os.path.join(BASE, "data", "test_badnum134.mp4"))
+        self.assertFalse(ok)
+        self.assertEqual(info["code"], "INVALID_SCHEMA")
+        vid = os.path.join(BASE, "data", "test_media", "clip1.mp4")
+        ok, info = produce_video(
+            {"id": "badnum2", "format": "square",
+             "clips": [{"src": vid, "trim_in": 0, "trim_out": 3, "speed": "fast"}]},
+            os.path.join(BASE, "data", "test_badnum134b.mp4"))
+        self.assertFalse(ok)
+        self.assertEqual(info["code"], "INVALID_SCHEMA")
+
+    def test_loop134_cli_bad_numbers_no_traceback(self):
+        # 1.34.0 F7 (CLI): bad numeric CLI arguments print an
+        # error and exit non-zero, without a traceback.
+        proc = subprocess.run(
+            [os.path.join(BASE, "run.sh"), "split",
+             os.path.join(BASE, "examples", "basic.json"), "c1", "notanumber"],
+            capture_output=True, text=True, cwd=BASE, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("Traceback", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

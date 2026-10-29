@@ -418,10 +418,14 @@ def _overlay_box_at(ov, t, width, height):
             "bottom_center": ((width - bw) / 2, height - bh - 20.0),
             "bottom_right": (width - bw - 20.0, height - bh - 20.0),
         }
-        if "x" in ov and "y" in ov:
-            x, y = float(ov["x"]), float(ov["y"])
-        else:
-            x, y = presets[ov.get("position", "bottom_right")]
+        # Per-axis, exactly like render.py: an x-only (or y-only)
+        # overlay keeps the preset value on the other axis. The
+        # old code required BOTH x and y for explicit placement,
+        # so an x-only overlay's estimated box was the preset box
+        # and collisions could be missed or misreported (1.34.0).
+        px, py = presets[ov.get("position", "bottom_right")]
+        x = float(ov["x"]) if "x" in ov else px
+        y = float(ov["y"]) if "y" in ov else py
         return (x, y, bw, bh)
     probe = ov.get("probe") or {}
     pw, ph = probe.get("width") or width, probe.get("height") or height
@@ -495,6 +499,24 @@ def check_layer_text_overlap(project, info):
                                 f"or shorten the text window)"),
                     "overlay_id": ov["id"], "text": text,
                     "start": round(hits[0], 3), "end": end})
+    # Text overflow (1.34.0): single-line centred drawtext clips
+    # both edges when the line is wider than the frame, silently
+    # (the known caption-clipping case). Estimated width, same
+    # approximation as the boxes above, so this is a warning,
+    # never an error: split the text into shorter cues or reduce
+    # its size. Long Arabic lines use the same estimate.
+    for text, t_start, t_end, tbox in texts:
+        if tbox[2] > width:
+            warnings.append({
+                "code": "text_overflow_warning",
+                "message": (f"text '{text}' estimated width "
+                            f"{tbox[2]:.0f}px exceeds output width {width}px "
+                            f"during {t_start:.2f}..{t_end:.2f}s and will clip "
+                            f"at the edges (split into shorter texts/captions "
+                            f"or reduce size)"),
+                "text": text, "start": round(t_start, 3),
+                "end": round(t_end, 3),
+                "estimated_width": round(tbox[2], 1)})
     return warnings
 
 
@@ -562,9 +584,27 @@ def validate_project(project):
             errors.append(err("FILE_NOT_FOUND", f"clip file not found: {src}", field="clips.src", clip_id=cid))
             continue
         if kind == "video":
+            # A video clip's duration comes from trim_in/trim_out
+            # (and speed), never from a "duration" key: accepting
+            # one would silently ignore the author's intent (1.34.0).
+            if "duration" in clip:
+                errors.append(err("INVALID_SCHEMA", "video clips must not set duration (duration comes from trim_in/trim_out and speed)", field="clips.duration", clip_id=cid,
+                                  fix="remove duration from this video clip, or set trim_in/trim_out to choose its length"))
+                continue
             info = probe_media(src)
             if info is None or info["duration"] is None:
                 errors.append(err("CLIP_OUT_OF_RANGE", "could not probe video duration (file may be corrupt or not a video)", field="clips.src", clip_id=cid))
+                continue
+            if not info.get("has_video"):
+                # An audio-only file used to validate here (it has
+                # a duration) and fail only at render time, when
+                # the filter graph found no video stream (1.34.0).
+                errors.append(err("INVALID_SCHEMA", "video clip src has no video stream (audio-only file)", field="clips.src", clip_id=cid,
+                                  fix="use a video file for a video clip, or add the file as an audio track instead"))
+                continue
+            if not info.get("width") or not info.get("height"):
+                errors.append(err("INVALID_SCHEMA", "could not determine video dimensions (file may be corrupt)", field="clips.src", clip_id=cid,
+                                  fix="replace the file with a readable video"))
                 continue
             trim_in = clip.get("trim_in", 0)
             trim_out = clip.get("trim_out", info["duration"])
@@ -695,6 +735,13 @@ def validate_project(project):
             resolved.append({**clip, "src": src, "duration": duration, "trim_in": trim_in, "trim_out": trim_out, "probe": info})
             total += duration
         else:
+            # Image clips have no trim: accepting trim_in/trim_out
+            # would silently ignore them (duration is the image's
+            # length), so they are rejected with a fix (1.34.0).
+            if "trim_in" in clip or "trim_out" in clip:
+                errors.append(err("INVALID_SCHEMA", "image clips must not set trim_in/trim_out (set duration instead)", field="clips.trim", clip_id=cid,
+                                  fix="remove trim_in/trim_out from this image clip and set duration"))
+                continue
             if "speed" in clip:
                 errors.append(err("INVALID_SCHEMA", "clip speed is only for video clips", field="clips.speed", clip_id=cid))
                 continue
@@ -706,6 +753,13 @@ def validate_project(project):
             iinfo = probe_media(src)
             if iinfo is None or not iinfo["has_video"]:
                 errors.append(err("INVALID_SCHEMA", f"could not probe image file (not a readable image): {src}", field="clips.src", clip_id=cid))
+                continue
+            if not iinfo.get("width") or not iinfo.get("height"):
+                # ffprobe "succeeds" on garbage named .png (image2
+                # probe, 0x0 dimensions), which used to validate
+                # clean and fail only at render time (1.34.0).
+                errors.append(err("INVALID_SCHEMA", f"image file has no usable dimensions (file may be corrupt): {src}", field="clips.src", clip_id=cid,
+                                  fix="replace the file with a readable still image"))
                 continue
             # Codec check, NOT duration: a JPEG probed via image2 gets
             # duration 0.04 (one frame at 25fps) while a PNG via png_pipe
@@ -868,6 +922,10 @@ def validate_project(project):
         info_p = probe_media(src)
         if info_p is None or not info_p["has_video"]:
             errors.append(err("INVALID_SCHEMA", f"could not probe overlay file (not a readable video/image): {src}", field="overlays.src", clip_id=oid,
+                              fix="replace src with a readable video or still image"))
+            continue
+        if not info_p.get("width") or not info_p.get("height"):
+            errors.append(err("INVALID_SCHEMA", f"overlay file has no usable dimensions (file may be corrupt): {src}", field="overlays.src", clip_id=oid,
                               fix="replace src with a readable video or still image"))
             continue
         rov = {**ov, "src": src, "probe": info_p}
@@ -1223,6 +1281,47 @@ def validate_project(project):
             position = item.get("position")
             if position is not None and position not in TEXT_POSITIONS:
                 errors.append(err("INVALID_SCHEMA", "text position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field=label + ".position"))
+            # Text geometry (1.34.0): size and x/y used to be
+            # unvalidated, so a non-numeric size or a negative
+            # coordinate passed validation and failed only inside
+            # FFmpeg. Captions ignore x/y entirely in render
+            # (position or the bottom default), so a caption x/y
+            # is rejected rather than silently ignored.
+            if "size" in item:
+                try:
+                    sv = float(item["size"])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"{label} size must be a number", field=label + ".size",
+                                      fix="set size to a number of pixels, e.g. 48 for texts or 36 for captions"))
+                    sv = None
+                if sv is not None and not 8 <= sv <= 240:
+                    errors.append(err("INVALID_SCHEMA", f"{label} size must be 8..240", field=label + ".size",
+                                      fix="set size between 8 and 240 pixels"))
+            if label == "captions":
+                if "x" in item or "y" in item:
+                    errors.append(err("INVALID_SCHEMA", "captions must not set x/y (use position or caption_position)", field=label,
+                                      fix="remove x/y from this caption and set position, or set caption_position on the project"))
+            else:
+                xv = item.get("x", "center")
+                if xv != "center":
+                    try:
+                        xvf = float(xv)
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", "text x must be 'center' or a number", field=label + ".x",
+                                          fix="set x to 'center' or a pixel offset >= 0"))
+                        xvf = None
+                    if xvf is not None and xvf < 0:
+                        errors.append(err("INVALID_SCHEMA", "text x must be >= 0", field=label + ".x",
+                                          fix="set x to 'center' or a pixel offset >= 0"))
+                try:
+                    yvf = float(item.get("y", 100))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "text y must be a number", field=label + ".y",
+                                      fix="set y to a pixel offset >= 0"))
+                    yvf = None
+                if yvf is not None and yvf < 0:
+                    errors.append(err("INVALID_SCHEMA", "text y must be >= 0", field=label + ".y",
+                                      fix="set y to a pixel offset >= 0"))
     # Project-level caption defaults: colour/size/position applied to
     # every caption (list captions and SRT cues) that does not set its
     # own value. SRT files carry no styling, so this is how SRT
@@ -1270,10 +1369,19 @@ def validate_project(project):
             _cap.setdefault("size", caption_size)
         if caption_position is not None:
             _cap.setdefault("position", caption_position)
+    # Resolved audio copies (1.34.0): validation used to mutate the
+    # caller's project in place (resolving track srcs and coercing
+    # starts), which leaked absolute paths into stored projects
+    # whenever the server ran from another directory. Tracks are
+    # now copied; the resolved list lives in info["audio"] and the
+    # render uses it, while the caller's project is untouched.
+    resolved_audio = []
     for track in project.get("audio") or []:
         if not isinstance(track, dict) or not isinstance(track.get("src"), str):
             errors.append(err("INVALID_SCHEMA", "each audio track needs a src path", field="audio"))
             continue
+        track = dict(track)
+        resolved_audio.append(track)
         track["src"] = resolve_path(track["src"])
         if not os.path.isfile(track["src"]):
             errors.append(err("FILE_NOT_FOUND", f"audio file not found: {track['src']}", field="audio.src"))
@@ -1401,7 +1509,7 @@ def validate_project(project):
     ducking = None
     raw_duck = project.get("ducking")
     if raw_duck is not None:
-        audio_tracks = project.get("audio") or []
+        audio_tracks = resolved_audio
         music_tracks = [t for t in audio_tracks if isinstance(t, dict) and t.get("kind") == "music"]
         if not isinstance(raw_duck, dict):
             errors.append(err("INVALID_SCHEMA", "ducking must be an object", field="ducking",
@@ -1505,6 +1613,7 @@ def validate_project(project):
     info = {"width": width, "height": height, "fps": fps, "clips": resolved,
             "total_duration": total, "clip_starts": clip_starts, "font": font,
             "captions": merged_captions, "overlays": resolved_overlays,
+            "audio": resolved_audio,
             "chapters": chapters, "ducking": ducking,
             "video_bitrate": video_bitrate, "loudness_target": loudness_target}
     # Layer/text collision is warnings-only: it never adds errors.

@@ -13,6 +13,18 @@ def _load(path):
 
 
 def main(argv):
+    """CLI entry point: file/argument errors are reported as
+    `error: ...` with a non-zero exit, never as a raw traceback
+    (1.34.0 — the MCP path already structured these, the CLI did
+    not). Internal bugs still raise, by design."""
+    try:
+        return _main(argv)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
+def _main(argv):
     if not argv or argv[0] == "serve":
         serve()
         return 0

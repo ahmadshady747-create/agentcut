@@ -320,7 +320,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         elif clip["kind"] == "image":
             argv += ["-loop", "1", "-t", str(clip["duration"])]
         argv += ["-i", clip["src"]]
-    audio_tracks = project.get("audio") or []
+    # Resolved audio from validation (1.34.0): validate no longer
+    # mutates the project, so the render must use info["audio"]
+    # (resolved srcs, coerced starts); fall back to the project's
+    # own list only for hand-built info dicts without it.
+    audio_tracks = info.get("audio") or project.get("audio") or []
     for track in audio_tracks:
         argv += ["-i", track["src"]]
     overlays = info.get("overlays", []) or []
@@ -520,7 +524,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             vf += "," + GRADE_PRESETS[clip["grade"]]
         if clip.get("lut_resolved") or clip.get("lut"):
             lut_path = clip.get("lut_resolved") or clip["lut"]
-            vf += (f",format=rgb24,lut3d=file='{lut_path}',"
+            # Backslashes in a LUT path must be doubled inside
+            # the filter's single quotes, or FFmpeg reads them as
+            # escapes (1.34.0; quote characters are still rejected
+            # in validation).
+            lut_esc = str(lut_path).replace("\\", "\\\\")
+            vf += (f",format=rgb24,lut3d=file='{lut_esc}',"
                    f"format=yuv420p")
         fades = []
         if clip.get("transition") == "fade":
@@ -1138,6 +1147,30 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     errors, info = validate_project(project)
     if errors:
         return False, {"code": "INVALID_PROJECT", "errors": errors}
+    # Loudnorm on digital silence (1.34.0): single-pass loudnorm
+    # measures -inf, emits NaN samples, and the AAC encoder fails
+    # with a cryptic "Input contains (near) NaN" error. Check
+    # loudnorm tracks up front with loudnorm's own measurement
+    # (one fast pass per loudnorm track, at render time only so
+    # validation stays fast) and return a structured error naming
+    # the track and the fix, instead of a failed render.
+    # volumedetect is NOT the detector here: on this build it
+    # reports -91.0 dB (not -inf) for digital silence, while
+    # loudnorm's input_i is genuinely -inf — verified 2026-10-29.
+    # Non-silent tracks are untouched; an unmeasurable track is
+    # left alone and the normal render reports whatever is wrong.
+    for track in info.get("audio") or []:
+        if not track.get("loudnorm"):
+            continue
+        loud, loud_ok = _run_loudness(track["src"])
+        if not loud_ok:
+            continue
+        input_i = loud.get("input_i")
+        if input_i is None or input_i == float("-inf"):
+            return False, {"code": "INVALID_PROJECT",
+                           "message": (f"loudnorm audio track {track['src']} is digitally silent; "
+                                       "loudnorm cannot measure silence and the render would fail"),
+                           "fix": "remove loudnorm from this silent track, or replace it with a non-silent audio file"}
     # Stabilisation pass 1 (vidstabdetect) for stabilized clips:
     # the transform file is computed at the clip's final scale, so
     # pass 2 in the main graph sees identical frames. A failed
@@ -1651,7 +1684,15 @@ def produce_video(brief, output_path, review_dir=None):
         kind = item.get("kind") or _brief_kind(src)
         clip = {"id": item.get("id", f"c{i + 1}"), "kind": kind, "src": src}
         if kind == "image":
-            clip["duration"] = float(item.get("duration", 3))
+            # A non-numeric duration used to raise ValueError out
+            # of produce_video (a raw traceback on the CLI path);
+            # it is a structured brief error now (1.34.0).
+            try:
+                clip["duration"] = float(item.get("duration", 3))
+            except (TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"clip {i} duration must be a number",
+                               "fix": "set duration to seconds, e.g. 3, or remove it for the 3s default"}
         else:
             if item.get("trim_in") is not None:
                 clip["trim_in"] = item["trim_in"]
@@ -1678,10 +1719,20 @@ def produce_video(brief, output_path, review_dir=None):
             if info_p is None or info_p.get("duration") is None:
                 return False, {"code": "FILE_NOT_FOUND",
                                "message": f"cannot probe video clip: {clip['src']}"}
-            dur = (clip.get("trim_out", info_p["duration"])
-                   - clip.get("trim_in", 0))
-            if "speed" in clip:
-                dur = dur / float(clip["speed"])
+            # Non-numeric trim/speed used to raise out of
+            # produce_video (raw traceback on the CLI path);
+            # structured brief error now (1.34.0). Validation
+            # below would reject these too, but the arithmetic
+            # runs first, so it must not crash.
+            try:
+                dur = (float(clip.get("trim_out", info_p["duration"]))
+                       - float(clip.get("trim_in", 0)))
+                if "speed" in clip:
+                    dur = dur / float(clip["speed"])
+            except (TypeError, ValueError, ZeroDivisionError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": "video clip trim_in/trim_out/speed must be numbers (speed != 0)",
+                               "fix": "set trim_in/trim_out to seconds inside the source and speed to 0.25..4.0"}
         durations.append(dur)
     starts = [0.0]
     total = durations[0] if durations else 0.0

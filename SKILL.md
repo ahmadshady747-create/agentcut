@@ -41,10 +41,16 @@ failure is a JSON object with `code` and `message`.
   0.5s, set `transition_duration` per incoming clip, max 2.0s, less
   than both clip durations; text times are final-timeline
   coordinates after overlaps).
-- `texts`: overlays with `text`, `start`, `end`, `size`, `x`
-  (pixel number or `center`), `y` (pixels), optional `color`,
-  `box`, `position` preset, `fade_in`/`fade_out` seconds.
-- `captions`: like texts, but centred near the bottom by default.
+- `texts`: overlays with `text`, `start`, `end`, `size`
+  (8..240 pixels), `x` (pixel number >= 0 or `center`), `y`
+  (pixels >= 0), optional `color`, `box`, `position` preset
+  (overrides x/y), `fade_in`/`fade_out` seconds.
+- `captions`: like texts, but centred near the bottom by default,
+  and they must not set x/y (use `position` or
+  `caption_position` instead). Overlapping SRT cues render
+  stacked; a caption wider than the frame triggers a
+  `text_overflow_warning` (warnings never block — split the
+  caption or shrink it).
   `captions_file` points at an SRT file whose cues are appended
   to `captions` and validated against the timeline. Project fields
   `caption_color`, `caption_size`, `caption_position` are defaults
@@ -97,7 +103,7 @@ Crop-fill: clip `fit` is `contain` (default) or `cover` (fill the frame, centre-
 
 Transitions: `none`, `fade`, `crossfade`, plus `wipe_left/right/up/down` and `slide_left/right/up/down` (all 0.5s xfade overlap).
 
-Text styling: `color` (#RRGGBB or named colour), `box` true/false, and text `position` presets top_left/top_center/top_right/center/bottom_left/bottom_center/bottom_right.
+Text styling: `color` (#RRGGBB or named colour), `box` true/false, `size` 8..240, and text `position` presets top_left/top_center/top_right/center/bottom_left/bottom_center/bottom_right (a text `position` overrides its x/y; for overlays the reverse holds — explicit x/y win per axis over a preset).
 
 Audio fades: track `fade_in`/`fade_out` seconds. Clip speed: video clip `speed` 0.25..4.0 (effective duration = trim / speed).
 
@@ -167,7 +173,7 @@ the only source of truth it edits.
 Use `overlays` for picture-in-picture: a second visual track above
 the main timeline. Give each overlay an id, kind, src, start and
 duration that fit inside the timeline, a size fraction, and a
-position or x/y. A video overlay may set `volume` (default 0.0
+position or x/y (explicit x/y win per axis over a preset). A video overlay may set `volume` (default 0.0
 muted) to mix its audio in during its window; volume on an image
 or silent overlay is a validation error. Check the render's
 frames at a second inside the overlay window to confirm

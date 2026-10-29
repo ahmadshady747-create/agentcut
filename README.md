@@ -139,7 +139,7 @@ Crop-fill: a clip may set `fit` to `contain` (default, pad with black bars) or `
 
 Transitions: `none`, `fade` (to/from black), and xfade transitions with acrossfaded audio (default 0.5s overlap; set `transition_duration` per incoming clip, max 2.0s, less than both clip durations): `crossfade`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `slide_left`, `slide_right`, `slide_up`, `slide_down`.
 
-Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y.
+Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts accept `size` 8..240 pixels, `x` (`center` or >= 0) and `y` (>= 0); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y. Captions must not set x/y (render ignores them — use `position` or `caption_position`).
 
 Loudness: audio tracks accept `loudnorm` (true/false), single-pass normalisation to -16 LUFS before mixing.
 
@@ -153,7 +153,7 @@ Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution fra
 
 Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
 
-Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale.
+Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text/caption's estimated width exceeds the frame (split it or shrink it). Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
 
 ## Producer: one call, any agent
 
@@ -207,7 +207,9 @@ start second and a duration inside the timeline, a size as a
 fraction of the output width (default 0.35), a position preset
 (`top_left`, `top_center`, `top_right`, `center`, `bottom_left`,
 `bottom_center`, `bottom_right`) or x/y pixel offsets, and an
-opacity 0..1. Video overlays trim like clips and loop when shown
+opacity 0..1. When an overlay sets both a preset and x/y, the
+explicit x/y win per axis (texts differ: a text `position`
+overrides its x/y). Video overlays trim like clips and loop when shown
 longer than their trimmed source. An overlay video may also set
 `volume` (0..2, default 0.0 muted): its audio is then mixed in
 at the overlay's start, for its shown duration, alongside the
