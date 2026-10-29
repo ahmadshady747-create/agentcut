@@ -521,6 +521,22 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             audio_idx = _input_count(argv)
             argv += ["-i", ov["src"]]
         overlay_segments.append((ov, seg_start, seg_end, idx, audio_idx))
+    # Animated stroke diagrams (v1.38.0): transparent draw-on
+    # videos generated at render time by render_project (see
+    # diagrams.py). They enter as ordinary video inputs here,
+    # BEFORE the metadata input, so the chapters index computed
+    # below still lands exactly on the metadata input. A diagram
+    # without a generated video (hand-built info dicts) is
+    # skipped — render_project always generates one, so a skip
+    # here means the caller bypassed it, never a silent drop in
+    # a real render.
+    diagram_segments = []  # (diagram, video_index)
+    for dg in info.get("diagrams", []) or []:
+        if not dg.get("_video"):
+            continue
+        idx = _input_count(argv)
+        argv += ["-i", dg["_video"]]
+        diagram_segments.append((dg, idx))
     metadata_idx = None
     if metadata_path:
         # Chapters live in an ffmetadata input appended after all
@@ -1098,6 +1114,35 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             f"[{vcur}][{ov_label}]overlay=x='{x_expr}':y='{y_expr}':"
             f"eof_action=pass:enable='between(t,{abs_start},{abs_end})'[vov{si}]")
         vcur = f"vov{si}"
+    # Animated stroke diagrams (v1.38.0): the draw video holds
+    # only the draw frames, so the hold after the draw ends is
+    # a freeze on the LAST frame, not a replay: loop with
+    # size=1 at the last frame index repeats that one frame
+    # forever (frames before it pass through once), then trim
+    # cuts the stream to the display window. Looping the whole
+    # draw sequence (the video-overlay pattern) would RE-DRAW
+    # the diagram after every draw window — verified by eye
+    # on the example (a finished basket reverted to its rim).
+    # Placement mirrors overlays: size is a fraction of the
+    # output width, aspect from the diagram canvas, preset
+    # position or per-axis x/y.
+    for di, (dg, idx) in enumerate(diagram_segments):
+        dstart = float(dg["start"])
+        dend = float(dg["end"])
+        disp_dur = dend - dstart
+        draw_frames = max(1, int(round(float(dg["draw"]) * fps)))
+        dw = _even(float(dg["size"]) * width)
+        filters.append(
+            f"[{idx}:v]fps={fps},loop=loop=-1:size=1:start={draw_frames - 1},"
+            f"trim=end={disp_dur},setpts=PTS-STARTPTS,"
+            f"scale={dw}:-2,format=rgba,setpts=PTS+{dstart}/TB[dg{di}]")
+        px, py = OVERLAY_POS[dg.get("position", "bottom_right")]
+        x_expr = str(dg["x"]) if "x" in dg else px
+        y_expr = str(dg["y"]) if "y" in dg else py
+        filters.append(
+            f"[{vcur}][dg{di}]overlay=x='{x_expr}':y='{y_expr}':"
+            f"eof_action=pass:enable='between(t,{dstart},{dend})'[vdg{di}]")
+        vcur = f"vdg{di}"
     # Text overlays, then captions, on the concatenated video.
     # Text goes through files (see note above), created here and cleaned
     # up by render_project after ffmpeg exits.
@@ -1841,6 +1886,30 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
             lines.append(f"title={_ffmetadata_escape(ch['title'])}")
         with open(metadata_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
+    # Animated stroke diagrams (v1.38.0): generate each
+    # diagram's transparent draw video before the main graph
+    # is built (build_ffmpeg_args composites them as inputs).
+    # A failed encode is a structured render error, never a
+    # render with a missing diagram.
+    diagram_dir = None
+    if info.get("diagrams"):
+        from .diagrams import encode_diagram_video
+        diagram_dir = tempfile.mkdtemp(prefix="agentcut-diagrams-")
+        for di, dg in enumerate(info["diagrams"]):
+            dg_video = os.path.join(diagram_dir, f"diagram_{di}.mov")
+            try:
+                encode_diagram_video(dg, info["fps"], dg_video)
+            except RuntimeError as exc:
+                _remove_quietly(tmp_path)
+                shutil.rmtree(diagram_dir, ignore_errors=True)
+                if prescale_dir:
+                    shutil.rmtree(prescale_dir, ignore_errors=True)
+                if stab_dir:
+                    shutil.rmtree(stab_dir, ignore_errors=True)
+                if meta_dir:
+                    shutil.rmtree(meta_dir, ignore_errors=True)
+                return False, {"code": "RENDER_FAILED", "message": str(exc)}
+            dg["_video"] = dg_video
     effective_timecode = bool(review_timecode or project.get("timecode"))
     try:
         argv, total, text_dir = build_ffmpeg_args(
@@ -1853,6 +1922,8 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
         # tracebacks and never a render with tofu boxes.
         if str(exc).startswith("FONT_NOT_FOUND"):
             _remove_quietly(tmp_path)
+            if diagram_dir:
+                shutil.rmtree(diagram_dir, ignore_errors=True)
             return False, {"code": "INVALID_PROJECT", "message": str(exc),
                            "fix": "use the bundled fonts/ directory, or set "
                                   "AGENTCUT_FONT_DIR to a directory with the "
@@ -1872,6 +1943,8 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
             shutil.rmtree(stab_dir, ignore_errors=True)
         if meta_dir:
             shutil.rmtree(meta_dir, ignore_errors=True)
+        if diagram_dir:
+            shutil.rmtree(diagram_dir, ignore_errors=True)
     if proc.returncode != 0:
         _remove_quietly(tmp_path)
         return False, {"code": "RENDER_FAILED", "message": proc.stderr[-2000:]}
@@ -2659,12 +2732,25 @@ def timeline_summary(project):
                  "opacity": float(o.get("opacity", 1.0)),
                  "keyframes": len(o.get("keyframes_resolved", []) or [])}
                 for o in info.get("overlays", [])]
+    # v1.38.0: stroke diagrams — the draw window (start + draw)
+    # is when the animation runs; the diagram holds complete
+    # from draw end until the window end.
+    diagrams = [{"id": d["id"], "source": d.get("source"),
+                 "template": d.get("template"),
+                 "strokes": len(d.get("strokes") or []),
+                 "start": float(d["start"]), "end": float(d["end"]),
+                 "draw": float(d["draw"]),
+                 "draw_end": round(float(d["start"]) + float(d["draw"]), 3),
+                 "size": float(d.get("size", 0.5)),
+                 "position": d.get("position", "bottom_right")}
+                for d in info.get("diagrams", [])]
     return True, {"id": project["id"],
                   "total_duration": round(info["total_duration"], 3),
                   "width": info["width"], "height": info["height"],
                   "fps": info["fps"], "segments": segments,
                   "texts": texts, "captions": captions,
                   "audio": audio, "overlays": overlays,
+                  "diagrams": diagrams,
                   "chapters": info.get("chapters", []),
                   "warnings": info.get("warnings", []),
                   "ducking": info.get("ducking"),

@@ -3613,5 +3613,293 @@ class TestAgentCut(unittest.TestCase):
                          "none (punch_in)")
 
 
+    def test_loop138_stroke_order_timing_and_final_frame(self):
+        # 1.38.0: strokes draw in list order by weight, progress
+        # is monotonic, and the animator's last frame is
+        # byte-identical to the complete diagram rendered
+        # directly (the hold after the draw window is therefore
+        # exactly the finished art, never a redraw).
+        from agentcut.diagrams import (DiagramAnimator, build_template,
+                                       render_diagram_rgba)
+        strokes = [
+            {"kind": "polyline", "points": [[20, 100], [220, 100]],
+             "color": "white", "width": 7},
+            {"kind": "circle", "center": [150, 50], "radius": 30,
+             "color": "yellow", "width": 7},
+        ]
+        w, h = 300, 200
+
+        def _alpha(buf, x, y):
+            return buf[(y * w + x) * 4 + 3]
+
+        def _count(buf):
+            return sum(1 for i in range(3, len(buf), 4) if buf[i] > 0)
+
+        empty = render_diagram_rgba(strokes, w, h, 0.0)
+        self.assertEqual(_count(empty), 0)
+        early = render_diagram_rgba(strokes, w, h, 0.30)
+        # At 30% only the first stroke has started: chalk near
+        # the line start, nothing at all on the circle.
+        self.assertGreater(_alpha(early, 30, 100), 0)
+        self.assertEqual(_alpha(early, 150, 20), 0)
+        counts = [_count(render_diagram_rgba(strokes, w, h, p))
+                  for p in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        self.assertTrue(all(a <= b for a, b in zip(counts, counts[1:])),
+                        counts)
+        full = render_diagram_rgba(strokes, w, h, 1.0)
+        anim = DiagramAnimator(strokes, w, h, 30, 2.0)
+        last = None
+        n = 0
+        while True:
+            frame = anim.next_frame()
+            if frame is None:
+                break
+            last = frame
+            n += 1
+        self.assertEqual(n, 60)
+        self.assertEqual(last, full)
+        # Template hand order: chart axes first, faint grid
+        # (small weights) in the middle, yellow tip last.
+        _cw, _ch, cstrokes = build_template("chart", {"values": [10, 12, 14, 18]})
+        self.assertEqual(cstrokes[0]["kind"], "arrow")
+        self.assertEqual(cstrokes[0]["color"], "white")
+        self.assertEqual(cstrokes[-1]["kind"], "arrow")
+        self.assertEqual(cstrokes[-1]["color"], "yellow")
+        self.assertEqual([s.get("weight") for s in cstrokes[2:5]], [50, 50, 50])
+
+    def test_loop138_templates_geometry(self):
+        # 1.38.0: templates are parameterized geometry, not
+        # pictures — values/counts change the strokes in the
+        # expected direction, and nothing is baked text.
+        from agentcut.diagrams import build_template
+        _w, _h, rising = build_template("chart", {"values": [10, 20, 30]})
+        curve = [s for s in rising if s["kind"] == "polyline"][-1]
+        self.assertLess(curve["points"][-1][1], curve["points"][0][1])
+        _w, _h, flat = build_template("chart", {"values": [10, 10, 10]})
+        fcurve = [s for s in flat if s["kind"] == "polyline"][-1]
+        self.assertEqual(fcurve["points"][0][1], fcurve["points"][-1][1])
+        _w, _h, b1 = build_template("basket", {"coins": 1})
+        _w, _h, b5 = build_template("basket", {"coins": 5})
+        self.assertEqual(len([s for s in b1 if s["kind"] == "circle"]), 2)
+        self.assertEqual(len([s for s in b5 if s["kind"] == "circle"]), 10)
+        _w, _h, heavy_left = build_template("balance", {"left": 5, "right": 1})
+        _w, _h, heavy_right = build_template("balance", {"left": 1, "right": 5})
+        _w, _h, level = build_template("balance", {"left": 3, "right": 3})
+        beam_l = [s for s in heavy_left if s["kind"] == "polyline"][4]
+        beam_r = [s for s in heavy_right if s["kind"] == "polyline"][4]
+        beam_0 = [s for s in level if s["kind"] == "polyline"][4]
+        # Canvas y grows downward: the heavier side sits lower.
+        self.assertGreater(beam_l["points"][0][1], beam_l["points"][1][1])
+        self.assertLess(beam_r["points"][0][1], beam_r["points"][1][1])
+        self.assertEqual(beam_0["points"][0][1], beam_0["points"][1][1])
+        _w, _h, c2 = build_template("causes", {"rows": 2})
+        _w, _h, c3 = build_template("causes", {"rows": 3})
+        self.assertEqual(len(c2), 6)
+        self.assertEqual(len(c3), 11)
+
+    def test_loop138_diagram_validation(self):
+        # 1.38.0: diagram schema errors are structured with fix
+        # hints; defaults (draw = min(4s, window)) resolve; and
+        # a diagram overlapping a text warns like an overlay.
+        def _base(diagrams, overlays=None, texts=None):
+            p = {"id": "d", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image",
+                            "src": "data/test_red.png", "duration": 6}],
+                 "diagrams": diagrams}
+            if overlays is not None:
+                p["overlays"] = overlays
+            if texts is not None:
+                p["texts"] = texts
+            return p
+
+        def _errs(p):
+            errors, _info = validate_project(p)
+            return errors
+
+        ok = _base([{"id": "c1", "start": 0.5, "end": 4.0,
+                     "template": "chart", "params": {"values": [10, 12, 14]},
+                     "size": 0.8, "x": 36, "y": 100}])
+        errors, info = validate_project(ok)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["diagrams"][0]["draw"], 3.5)
+        self.assertEqual(info["diagrams"][0]["source"], "template")
+        # Default draw caps at 4s for a long window.
+        errors, info = validate_project(_base(
+            [{"id": "c1", "start": 0, "end": 6, "template": "causes",
+              "params": {"rows": 2}, "size": 0.5}]))
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["diagrams"][0]["draw"], 4.0)
+        bad = [
+            # Unknown template.
+            [{"id": "c1", "start": 0, "end": 2, "template": "pie",
+              "params": {}}],
+            # Both strokes and template.
+            [{"id": "c1", "start": 0, "end": 2, "template": "chart",
+              "params": {"values": [1, 2]},
+              "strokes": [{"kind": "polyline", "points": [[0, 0], [10, 10]]}]}],
+            # Neither strokes nor template.
+            [{"id": "c1", "start": 0, "end": 2, "size": 0.5}],
+            # Draw longer than the window.
+            [{"id": "c1", "start": 0, "end": 2, "draw": 3.0,
+              "template": "chart", "params": {"values": [1, 2]}}],
+            # Stroke outside its canvas.
+            [{"id": "c1", "start": 0, "end": 2,
+              "strokes": [{"kind": "polyline",
+                           "points": [[0, 0], [9999, 10]]}]}],
+            # Rect geometry uses rect_width, not width (which is
+            # the stroke width); a width-only rect is rejected.
+            [{"id": "c1", "start": 0, "end": 2,
+              "strokes": [{"kind": "rect", "x": 10, "y": 10,
+                           "width": 100, "height": 50}]}],
+            # Chart values too short.
+            [{"id": "c1", "start": 0, "end": 2, "template": "chart",
+              "params": {"values": [5]}}],
+            # Basket coins out of range.
+            [{"id": "c1", "start": 0, "end": 2, "template": "basket",
+              "params": {"coins": 9}}],
+            # Unknown template parameter.
+            [{"id": "c1", "start": 0, "end": 2, "template": "basket",
+              "params": {"coins": 3, "colour": "red"}}],
+            # Window past the timeline.
+            [{"id": "c1", "start": 5, "end": 7, "template": "causes",
+              "params": {"rows": 2}}],
+        ]
+        for dg in bad:
+            errs = _errs(_base(dg))
+            self.assertTrue(errs, dg)
+            self.assertEqual(errs[0]["code"] in ("INVALID_SCHEMA", "CLIP_OUT_OF_RANGE"), True, errs)
+            self.assertIn("fix", errs[0], errs)
+        # Diagram id colliding with an overlay id is rejected.
+        errs = _errs(_base(
+            [{"id": "same", "start": 0, "end": 2, "template": "causes",
+              "params": {"rows": 2}}],
+            overlays=[{"id": "same", "kind": "image",
+                       "src": "data/test_red.png", "start": 0,
+                       "duration": 2, "size": 0.3}]))
+        self.assertTrue(errs)
+        # Diagram/text overlap warns (warnings only, valid).
+        p = _base(
+            [{"id": "c1", "start": 0, "end": 6, "template": "chart",
+              "params": {"values": [10, 12]}, "size": 0.8,
+              "x": 36, "y": 100}],
+            texts=[{"text": "Hello", "start": 0, "end": 6, "size": 40,
+                    "x": "center", "y": 150, "box": False}])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        warns = [w for w in info["warnings"]
+                 if w.get("code") == "layer_text_overlap_warning"]
+        self.assertTrue(warns, info["warnings"])
+        self.assertEqual(warns[0].get("diagram_id"), "c1")
+
+    def test_loop138_diagram_renders_and_holds(self):
+        # 1.38.0: a template diagram renders, grows during its
+        # draw window, and HOLDS complete afterwards (no replay:
+        # the hold frame matches the draw-end frame, it does not
+        # revert to an early draw frame).
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-diag-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=black:s=360x640",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "d", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 4}],
+                 "diagrams": [{"id": "c1", "start": 0.5, "end": 4.0,
+                               "draw": 2.0, "template": "chart",
+                               "params": {"values": [10, 12, 14, 18]},
+                               "size": 0.8, "x": 36, "y": 100}]}
+            out = os.path.join(tmp, "d.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            self.assertEqual((info["width"], info["height"]), (360, 640))
+            mid = _crop_mean(out, 1.0, 36, 100, 288, 179)
+            end = _crop_mean(out, 2.5, 36, 100, 288, 179)
+            hold = _crop_mean(out, 3.9, 36, 100, 288, 179)
+            mid_b = sum(mid) / 3
+            end_b = sum(end) / 3
+            hold_b = sum(hold) / 3
+            self.assertGreater(end_b, mid_b + 5,
+                               (mid_b, end_b, hold_b))
+            self.assertLess(abs(hold_b - end_b), 10, (end_b, hold_b))
+            # Custom strokes render too, with the same hold.
+            p2 = {"id": "d2", "version": 1,
+                  "output": {"width": 360, "height": 640, "fps": 30},
+                  "clips": [{"id": "a", "kind": "image", "src": bg,
+                             "duration": 3}],
+                  "diagrams": [{"id": "s1", "start": 0.5, "end": 3.0,
+                                "draw": 1.5,
+                                "strokes": [
+                                    {"kind": "rect", "x": 50, "y": 50,
+                                     "rect_width": 200, "rect_height": 120,
+                                     "corner_radius": 10, "color": "white",
+                                     "width": 6},
+                                    {"kind": "circle", "center": [450, 150],
+                                     "radius": 60, "color": "yellow"}],
+                                "canvas": {"width": 600, "height": 300},
+                                "size": 0.8, "x": 36, "y": 100}]}
+            out2 = os.path.join(tmp, "d2.mp4")
+            ok, info = render_project(p2, out2)
+            self.assertTrue(ok, info)
+            hold2 = _crop_mean(out2, 2.9, 36, 100, 288, 144)
+            self.assertGreater(sum(hold2) / 3, 5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop138_diagram_with_motion_and_sfx_no_regression(self):
+        # 1.38.0: diagrams combine with default_image_motion and
+        # a text SFX without breaking SFX timing (the 1.37.1
+        # regression class) or the diagram itself.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-diag-sfx-")
+        try:
+            bg = os.path.join(tmp, "bg.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=black:s=360x640",
+                            "-frames:v", "1", bg], check=True)
+            p = {"id": "d", "version": 1, "default_image_motion": True,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image", "src": bg,
+                            "duration": 4}],
+                 "texts": [{"text": "Hi", "start": 0.5, "end": 3.0,
+                            "size": 40, "x": "center", "y": 500,
+                            "box": False, "sfx": "pop"}],
+                 "diagrams": [{"id": "c1", "start": 0.5, "end": 4.0,
+                               "draw": 2.0, "template": "basket",
+                               "params": {"coins": 3},
+                               "size": 0.6, "x": 72, "y": 100}]}
+            out = os.path.join(tmp, "d.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            pre = _vol_window(out, 0.0, 0.4)
+            win = _vol_window(out, 0.5, 1.0)
+            self.assertLess(pre, -70, pre)
+            self.assertGreater(win, -50, win)
+            bright = _crop_mean(out, 3.9, 72, 100, 216, 173)
+            self.assertGreater(sum(bright) / 3, 5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop138_example_renders(self):
+        # 1.38.0: the shipped stroke-diagram example renders
+        # end to end at its documented size and duration.
+        import tempfile
+        with open(os.path.join(BASE, "examples", "stroke-diagram.json"),
+                  encoding="utf-8") as fh:
+            p = json.load(fh)
+        tmp = tempfile.mkdtemp(prefix="agentcut-diag-ex-")
+        try:
+            out = os.path.join(tmp, "ex.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            self.assertEqual((info["width"], info["height"]), (360, 640))
+            self.assertAlmostEqual(info["duration"], 6.0, places=2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

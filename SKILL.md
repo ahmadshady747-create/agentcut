@@ -371,3 +371,65 @@ AgentCut edit and verify them.
   fades. A chunk wider than the frame warns
   (`active_chunk_overflow_warning`) — shrink the size or
   widen the frame for long active chunks.
+
+## Animated stroke diagrams (1.38.0)
+
+Use `diagrams` for hand-drawn educational art that draws
+itself on screen — a general element, not a one-video
+effect. A diagram is either custom strokes or one built-in
+template, placed like an overlay (`size` fraction of the
+output width, `position` preset, or x/y pixel offsets
+winning per axis) over a `start`..`end` window. It draws
+stroke by stroke, in list order, over `draw` seconds
+(default: min(4s, window), must fit inside the window),
+then holds the complete diagram until `end` — the hold is
+a freeze on the last frame, never a replay. The final
+frame equals the complete diagram exactly (tested).
+
+- Custom strokes: `{"kind": "polyline"|"arrow"|"circle"|
+  "ellipse"|"rect", ...}` in diagram-local coordinates
+  (canvas default 900x560, `canvas: {width, height}`
+  100..1920). Stroke fields: `color` (`white` default,
+  `yellow` for emphasis only, any named colour or
+  #RRGGBB), `width` (2..20, 7 is the standard chalk
+  weight), `alpha` (0.2..1, 0.95 solid; faint grid lines
+  use ~0.35), `weight` (share of the draw window; default
+  is path length, so long strokes naturally take longer —
+  give long faint lines a small explicit weight or they
+  will eat the window), `seed` (defaults to the stroke
+  index). Polyline/arrow take `points` ([x, y] pairs
+  inside the canvas); arrow takes `head_size` (10..100,
+  default 36). Circle takes `center` + `radius`, ellipse
+  `center` + `radius_x`/`radius_y`, rect `x`/`y` +
+  `rect_width`/`rect_height` (NOT `width` — that is the
+  stroke width) + optional `corner_radius`. All geometry
+  must fit inside the canvas, or validation fails with a
+  fix hint.
+- Templates (parameters only, never text — labels are
+  always AgentCut texts, never baked into a diagram):
+  `chart` (`values`: 2..8 numbers; axes with arrowheads,
+  faint grid, arrowed rising curve, yellow tip),
+  `basket` (`coins`: 1..5; basket with coins in a
+  pyramid), `balance` (`left`/`right` numbers; beam
+  tilts toward the heavier side, level when equal),
+  `causes` (`rows`: 1..4; badge + arrow per row).
+  A template diagram must not set `canvas`, and takes
+  only its own parameters — unknown parameters fail
+  validation. Example: `examples/stroke-diagram.json`
+  (chart + basket over a board still).
+- Artwork rules: clean geometry, one consistent chalk
+  weight per stroke, subtle chalk texture with slightly
+  irregular edges that are STATIC per stroke (baked into
+  the path once — never animated jitter, which reads as
+  vibration), white chalk with yellow for emphasis only.
+  Diagrams are data, not files: render packs carry them
+  verbatim in project.json and regenerate the animation
+  at render time, so no media file is collected for them.
+  A diagram drawing over a still counts as motion for the
+  static-shot warning, and a diagram overlapping a text
+  warns as `layer_text_overlap_warning` with a
+  `diagram_id` (warnings only).
+- `timeline_summary` reports diagrams with `start`,
+  `end`, `draw` and `draw_end`, plus `source`, `template`
+  and stroke count, so you can reason about draw timing
+  without re-reading the project.

@@ -1,3 +1,61 @@
+## 1.38.0 — Animated stroke diagrams (general draw-on element + templates)
+
+Coordinator order 2026-10-30: blackboard drawings must be
+more serious and more alive even when simple, and the
+solution must live GENERALLY in AgentCut — not as a
+one-off video fix. All deterministic, stdlib + FFmpeg only,
+no new dependencies, no in-tool AI. Tests 105/99+6 new (see
+STATE.md audit) in the main tree and in a fresh copy.
+Example: examples/stroke-diagram.json.
+- New project-level `diagrams` list. A diagram is custom
+  strokes (polyline, arrow, circle, ellipse, rect, in
+  diagram-local coordinates, canvas default 900x560) or one
+  built-in template with parameters — never both. Placement
+  mirrors overlays (size fraction of output width, position
+  preset, per-axis x/y). It draws stroke by stroke, in list
+  order, over `draw` seconds (default min(4s, window),
+  must fit the window), then holds complete until `end`.
+  The animation is monotonic and the last frame is
+  byte-identical to the complete diagram (tested), so the
+  hold is exactly the finished art.
+- Rendering: a stdlib chalk rasterizer (stamped discs along
+  sampled paths, deterministic grain, slightly irregular
+  edges baked into each path ONCE — static per stroke,
+  never animated jitter) pipes RGBA frames as rawvideo into
+  FFmpeg, encoded to a temporary transparent (PNG codec)
+  video; the main graph composites it with the overlay
+  filter and freezes its last frame for the hold. Two
+  defects found by eye on the example and fixed in-round:
+  (1) looping the whole draw sequence for the hold made a
+  finished basket revert to its rim — the hold is now a
+  loop of size=1 at the last frame index; (2) length-
+  weighted faint grid lines ate ~70% of the chart's draw
+  window, so the curve appeared only at the end — the
+  chart template now draws axes first, grid with small
+  explicit weights, curve last with a yellow tip.
+- Templates (parameters only, no baked text — labels are
+  always AgentCut texts): `chart` (values 2..8; axes with
+  arrowheads, faint grid, arrowed curve, yellow tip),
+  `basket` (coins 1..5, pyramid stack), `balance` (left/
+  right values tilt the beam, level when equal), `causes`
+  (rows 1..4, badge + arrow per row). Validation is strict
+  with fix hints: unknown templates/parameters, draw
+  longer than the window, geometry outside the canvas,
+  rect geometry via `width` (that field is the stroke
+  width; rects use rect_width/rect_height), duplicate ids
+  (including against overlay ids). Diagrams count as
+  motion for the static-shot warning, overlap a text with
+  a `layer_text_overlap_warning` (diagram_id), and appear
+  in `timeline_summary` with start/end/draw/draw_end.
+  Render packs need no change: diagrams are data, carried
+  verbatim in project.json and regenerated at render.
+- Tests: 6 new test_loop138_* (stroke order/timing/final-
+  frame byte-equality, template geometry incl. balance
+  tilt direction, validation battery incl. all fix hints,
+  render + hold frame means, diagrams + default motion +
+  SFX timing no-regression, shipped example renders).
+  Motion/SFX regression areas still green in-suite.
+
 ## 1.37.2 — Motion comfort: gentle Ken Burns, eased curve, punch never stacks
 
 User defect report on the 1.37.0 rhythm proof video

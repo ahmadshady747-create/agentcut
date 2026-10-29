@@ -386,6 +386,40 @@ two stills; a punch-in on a panel; an Arabic active caption.
   its word; Arabic joining and RTL order are preserved.
   Over-wide chunks warn instead of silently clipping.
 
+## Animated stroke diagrams (1.38.0)
+
+A project may carry a `diagrams` list: hand-drawn
+educational art that draws itself on screen, as a general
+element any project can use. A diagram is custom strokes
+(`polyline`, `arrow`, `circle`, `ellipse`, `rect`, in
+diagram-local coordinates, canvas default 900x560) or one
+built-in template with parameters — `chart` (values:
+axes, faint grid, arrowed rising curve, yellow tip),
+`basket` (coins: basket with coins), `balance` (left/
+right: beam tilts toward the heavier side), `causes`
+(rows: badge + arrow per row). Templates take parameters
+only, never text: every label on screen is an AgentCut
+text (drawtext), so Arabic labels keep the BiDi-verified
+path and no text is ever baked into a diagram image.
+
+Placement mirrors overlays: `size` as a fraction of the
+output width, a `position` preset, or x/y pixel offsets
+winning per axis, over a `start`..`end` window. The
+diagram draws stroke by stroke, in list order, over
+`draw` seconds (default min(4s, window)), then holds the
+complete diagram until `end` — the hold freezes the last
+frame, it never replays the draw, and the final frame
+equals the complete diagram exactly. Artwork rules:
+clean geometry, one consistent chalk weight per stroke
+(`width` 2..20, 7 standard), subtle chalk texture with
+slightly irregular edges that are static per stroke
+(never animated jitter), white chalk with yellow for
+emphasis only. Stroke `weight` defaults to path length
+(long strokes take longer); give long faint lines a
+small explicit weight or they will eat the draw window.
+See `examples/stroke-diagram.json` (chart + basket over
+a board still) and SKILL.md for the full schema.
+
 ## Export cap and stabilisation
 
 Outputs go up to 3840 wide (and tall). A video clip may set

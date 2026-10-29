@@ -769,10 +769,27 @@ def check_layer_text_overlap(project, info):
                           _text_box(cap, True, width, height, total,
                                     line_spacing=cap_spacing,
                                     max_width_frac=cap_maxw)))
-    warnings = []
+    # Layers above the clips: overlays plus stroke diagrams
+    # (v1.38.0). A diagram's box is its placement box, computed
+    # with the same per-axis preset logic as overlays (its
+    # "probe" size is its canvas size); the box is static, so
+    # no keyframe sampling applies to diagrams.
+    layers = []
     for ov in (info.get("overlays") or []):
-        o_start = float(ov["start"])
-        o_end = o_start + float(ov["duration"])
+        layers.append(("overlay", ov["id"], float(ov["start"]),
+                       float(ov["start"]) + float(ov["duration"]), ov))
+    for dg in (info.get("diagrams") or []):
+        synthetic = {"size": float(dg["size"]),
+                     "position": dg.get("position", "bottom_right"),
+                     "probe": {"width": dg["canvas_w"],
+                               "height": dg["canvas_h"]}}
+        for axis in ("x", "y"):
+            if axis in dg:
+                synthetic[axis] = dg[axis]
+        layers.append(("diagram", dg["id"], float(dg["start"]),
+                       float(dg["end"]), synthetic))
+    warnings = []
+    for kind, lid, o_start, o_end, ov in layers:
         for text, t_start, t_end, tbox in texts:
             w_start, w_end = max(o_start, t_start), min(o_end, t_end)
             if w_end <= w_start:
@@ -795,14 +812,16 @@ def check_layer_text_overlap(project, info):
                     hits.append(s)
             if hits:
                 end = min(round(hits[-1] + 0.5, 3), round(w_end, 3))
-                warnings.append({
+                warn = {
                     "code": "layer_text_overlap_warning",
-                    "message": (f"overlay '{ov['id']}' overlaps text "
+                    "message": (f"{kind} '{lid}' overlaps text "
                                 f"'{text}' during {hits[0]:.2f}..{end:.2f}s "
-                                f"(approximate boxes; move the overlay path "
+                                f"(approximate boxes; move the {kind} path "
                                 f"or shorten the text window)"),
-                    "overlay_id": ov["id"], "text": text,
-                    "start": round(hits[0], 3), "end": end})
+                    "text": text,
+                    "start": round(hits[0], 3), "end": end}
+                warn["overlay_id" if kind == "overlay" else "diagram_id"] = lid
+                warnings.append(warn)
     # Text overflow (1.34.0): single-line centred drawtext clips
     # both edges when the line is wider than the frame, silently
     # (the known caption-clipping case). Estimated width, same
@@ -822,6 +841,412 @@ def check_layer_text_overlap(project, info):
                 "end": round(t_end, 3),
                 "estimated_width": round(tbox[2], 1)})
     return warnings
+
+
+def _validate_stroke(st, cw, ch, errors, did):
+    """Validate one custom stroke dict against its canvas size.
+
+    Returns a resolved stroke dict (defaults filled) or None when
+    the stroke is invalid (errors already appended). Geometry
+    must fit inside the canvas: a diagram that spills past its
+    own frame would crop at render time, so it fails loudly
+    here instead, with a fix hint."""
+    if not isinstance(st, dict):
+        errors.append(err("INVALID_SCHEMA", "each diagram stroke must be an object", field="diagrams.strokes", clip_id=did,
+                          fix="make each stroke an object with kind, e.g. {'kind': 'polyline', 'points': [[0, 0], [100, 50]]}"))
+        return None
+    kind = st.get("kind")
+    if kind not in ("polyline", "arrow", "circle", "ellipse", "rect"):
+        errors.append(err("INVALID_SCHEMA", "stroke kind must be polyline, arrow, circle, ellipse or rect", field="diagrams.strokes.kind", clip_id=did,
+                          fix="set kind to polyline (free line), arrow (line with head), circle, ellipse or rect"))
+        return None
+    out = dict(st)
+    color = st.get("color", "white")
+    if not isinstance(color, str):
+        errors.append(err("INVALID_SCHEMA", "stroke color must be a name or #RRGGBB hex", field="diagrams.strokes.color", clip_id=did,
+                          fix="set color to 'white' (drawing) or 'yellow' (emphasis only), or a #RRGGBB hex value"))
+        return None
+    from .diagrams import resolve_color
+    if resolve_color(color) is None:
+        errors.append(err("INVALID_SCHEMA", f"unknown stroke color '{color}'", field="diagrams.strokes.color", clip_id=did,
+                          fix="set color to 'white', 'yellow', another named colour, or a #RRGGBB hex value"))
+        return None
+    out["color"] = color
+    try:
+        wdt = float(st.get("width", 7))
+    except (TypeError, ValueError):
+        errors.append(err("INVALID_SCHEMA", "stroke width must be a number", field="diagrams.strokes.width", clip_id=did,
+                          fix="set width between 2 and 20 pixels (7 is the standard chalk weight)"))
+        return None
+    if not 2.0 <= wdt <= 20.0:
+        errors.append(err("INVALID_SCHEMA", "stroke width must be 2..20", field="diagrams.strokes.width", clip_id=did,
+                          fix="set width between 2 and 20 pixels"))
+        return None
+    out["width"] = wdt
+    try:
+        alpha = float(st.get("alpha", 0.95))
+    except (TypeError, ValueError):
+        errors.append(err("INVALID_SCHEMA", "stroke alpha must be a number", field="diagrams.strokes.alpha", clip_id=did,
+                          fix="set alpha between 0.2 and 1 (0.95 is solid chalk)"))
+        return None
+    if not 0.2 <= alpha <= 1.0:
+        errors.append(err("INVALID_SCHEMA", "stroke alpha must be 0.2..1", field="diagrams.strokes.alpha", clip_id=did,
+                          fix="set alpha between 0.2 (faint, e.g. grid) and 1 (solid)"))
+        return None
+    out["alpha"] = alpha
+    if "weight" in st:
+        try:
+            wt = float(st["weight"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "stroke weight must be a number", field="diagrams.strokes.weight", clip_id=did,
+                              fix="set weight to a positive number, or remove it to weight by path length"))
+            return None
+        if wt <= 0:
+            errors.append(err("INVALID_SCHEMA", "stroke weight must be > 0", field="diagrams.strokes.weight", clip_id=did,
+                              fix="set weight to a positive number, or remove it"))
+            return None
+        out["weight"] = wt
+    if "seed" in st:
+        try:
+            out["seed"] = int(st["seed"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "stroke seed must be an integer", field="diagrams.strokes.seed", clip_id=did,
+                              fix="set seed to a whole number, or remove it (defaults to the stroke index)"))
+            return None
+
+    def _num_pair(v, what):
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            errors.append(err("INVALID_SCHEMA", f"{what} must be an [x, y] pair", field="diagrams.strokes", clip_id=did,
+                              fix=f"give {what} as two numbers, e.g. [100, 50]"))
+            return None
+        try:
+            fx, fy = float(v[0]), float(v[1])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", f"{what} must be numbers", field="diagrams.strokes", clip_id=did,
+                              fix=f"give {what} as two numbers, e.g. [100, 50]"))
+            return None
+        if not (0 <= fx <= cw and 0 <= fy <= ch):
+            errors.append(err("INVALID_SCHEMA", f"{what} ({fx}, {fy}) is outside the diagram canvas {cw}x{ch}", field="diagrams.strokes", clip_id=did,
+                              fix=f"keep {what} inside 0..{cw} horizontally and 0..{ch} vertically"))
+            return None
+        return (fx, fy)
+
+    if kind in ("polyline", "arrow"):
+        pts = st.get("points")
+        if not isinstance(pts, list) or len(pts) < 2:
+            errors.append(err("INVALID_SCHEMA", "polyline/arrow strokes need a points list of at least 2 [x, y] pairs", field="diagrams.strokes.points", clip_id=did,
+                              fix="give points as e.g. [[0, 0], [100, 50], [200, 20]]"))
+            return None
+        checked = []
+        for pt in pts:
+            cp = _num_pair(pt, "each point")
+            if cp is None:
+                return None
+            checked.append([cp[0], cp[1]])
+        out["points"] = checked
+        if kind == "arrow":
+            try:
+                hs = float(st.get("head_size", 36))
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "arrow head_size must be a number", field="diagrams.strokes.head_size", clip_id=did,
+                                  fix="set head_size between 10 and 100 pixels, or remove it for the 36 default"))
+                return None
+            if not 10.0 <= hs <= 100.0:
+                errors.append(err("INVALID_SCHEMA", "arrow head_size must be 10..100", field="diagrams.strokes.head_size", clip_id=did,
+                                  fix="set head_size between 10 and 100 pixels"))
+                return None
+            out["head_size"] = hs
+    elif kind == "circle":
+        cc = _num_pair(st.get("center"), "circle center")
+        if cc is None:
+            return None
+        try:
+            r = float(st["radius"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "circle strokes need a numeric radius", field="diagrams.strokes.radius", clip_id=did,
+                              fix="set radius to a positive number that fits inside the canvas"))
+            return None
+        if r <= 0 or cc[0] - r < 0 or cc[0] + r > cw or cc[1] - r < 0 or cc[1] + r > ch:
+            errors.append(err("INVALID_SCHEMA", "circle radius must be > 0 and fit inside the canvas", field="diagrams.strokes.radius", clip_id=did,
+                              fix="shrink the radius or move the center so the whole circle fits"))
+            return None
+        out["center"] = [cc[0], cc[1]]
+        out["radius"] = r
+    elif kind == "ellipse":
+        cc = _num_pair(st.get("center"), "ellipse center")
+        if cc is None:
+            return None
+        try:
+            rx, ry = float(st["radius_x"]), float(st["radius_y"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "ellipse strokes need numeric radius_x and radius_y", field="diagrams.strokes.radius_x", clip_id=did,
+                              fix="set radius_x and radius_y to positive numbers that fit inside the canvas"))
+            return None
+        if rx <= 0 or ry <= 0 or cc[0] - rx < 0 or cc[0] + rx > cw or cc[1] - ry < 0 or cc[1] + ry > ch:
+            errors.append(err("INVALID_SCHEMA", "ellipse radii must be > 0 and fit inside the canvas", field="diagrams.strokes", clip_id=did,
+                              fix="shrink the radii or move the center so the whole ellipse fits"))
+            return None
+        out["center"] = [cc[0], cc[1]]
+        out["radius_x"] = rx
+        out["radius_y"] = ry
+    else:  # rect
+        try:
+            x, y = float(st["x"]), float(st["y"])
+            rw, rh = float(st["rect_width"]), float(st["rect_height"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "rect strokes need numeric x, y, rect_width and rect_height", field="diagrams.strokes", clip_id=did,
+                              fix="give x/y (top-left) plus rect_width/rect_height that fit inside the canvas"))
+            return None
+        if x < 0 or y < 0 or rw <= 0 or rh <= 0 or x + rw > cw or y + rh > ch:
+            errors.append(err("INVALID_SCHEMA", "rect must fit inside the canvas", field="diagrams.strokes", clip_id=did,
+                              fix="move or shrink the rect so it stays inside the canvas"))
+            return None
+        out["x"], out["y"], out["rect_width"], out["rect_height"] = x, y, rw, rh
+        try:
+            cr = float(st.get("corner_radius", 0))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "rect corner_radius must be a number", field="diagrams.strokes.corner_radius", clip_id=did,
+                              fix="set corner_radius between 0 and half the smaller side, or remove it"))
+            return None
+        if not 0 <= cr <= min(rw, rh) / 2:
+            errors.append(err("INVALID_SCHEMA", "rect corner_radius must be 0..half the smaller side", field="diagrams.strokes.corner_radius", clip_id=did,
+                              fix="set corner_radius between 0 and half the smaller side"))
+            return None
+        out["corner_radius"] = cr
+    return out
+
+
+def _validate_diagrams(project, total, overlay_ids, errors):
+    """Validate the project-level `diagrams` list (v1.38.0).
+
+    Returns resolved diagram dicts for info["diagrams"]. A
+    diagram is custom strokes (with a canvas, default 900x560)
+    or one built-in template with parameters — never both, and
+    labels are never part of a diagram (templates take no text;
+    labels are AgentCut texts). Placement mirrors overlays:
+    size (fraction of output width), position preset, or x/y
+    pixel offsets winning per axis."""
+    from .diagrams import TEMPLATES, build_template
+    resolved = []
+    raw = project.get("diagrams")
+    if raw is None:
+        return resolved
+    if not isinstance(raw, list):
+        errors.append(err("INVALID_SCHEMA", "diagrams must be a list", field="diagrams",
+                          fix="give diagrams as a list of diagram objects, or remove diagrams"))
+        return resolved
+    seen = set()
+    for dg in raw:
+        if not isinstance(dg, dict):
+            errors.append(err("INVALID_SCHEMA", "each diagram must be an object", field="diagrams",
+                              fix="make each diagram an object with id, start, end and strokes or template"))
+            continue
+        did = dg.get("id")
+        if not isinstance(did, str) or not did.strip():
+            errors.append(err("INVALID_SCHEMA", "each diagram needs a non-empty string id", field="diagrams.id",
+                              fix="give every diagram an id, e.g. 'chart1'"))
+            continue
+        if did in seen or did in overlay_ids:
+            errors.append(err("INVALID_SCHEMA", f"duplicate diagram id {did}", field="diagrams.id", clip_id=did,
+                              fix=f"rename one of the diagrams/overlays called {did}"))
+            continue
+        seen.add(did)
+        try:
+            start = float(dg.get("start", 0))
+            end = float(dg.get("end", total))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "diagram start/end must be numbers", field="diagrams", clip_id=did,
+                              fix="set start/end to timeline seconds, e.g. start 2, end 10"))
+            continue
+        if start < 0 or end <= start or end > total + 0.05:
+            errors.append(err("CLIP_OUT_OF_RANGE", f"diagram range {start}..{end} outside timeline {total:.2f}s", field="diagrams", clip_id=did,
+                              fix=f"keep the diagram window inside 0..{total:.2f} with end after start"))
+            continue
+        window = end - start
+        if "draw" in dg:
+            try:
+                draw = float(dg["draw"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "diagram draw must be a number of seconds", field="diagrams.draw", clip_id=did,
+                                  fix="set draw to the draw-on duration in seconds, e.g. 3.0, or remove it"))
+                continue
+            if draw <= 0 or draw > window + 1e-9:
+                errors.append(err("INVALID_SCHEMA", "diagram draw must be > 0 and no longer than its window", field="diagrams.draw", clip_id=did,
+                                  fix=f"set draw between 0 and {window:.2f}s (the diagram window), or remove it"))
+                continue
+        else:
+            draw = min(4.0, window)
+        try:
+            size = float(dg.get("size", 0.5))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "diagram size must be a number", field="diagrams.size", clip_id=did,
+                              fix="set size to a fraction of the output width, e.g. 0.5"))
+            continue
+        if not 0.05 <= size <= 1.0:
+            errors.append(err("INVALID_SCHEMA", "diagram size must be 0.05..1.0 (fraction of output width)", field="diagrams.size", clip_id=did,
+                              fix="set size between 0.05 and 1.0"))
+            continue
+        position = dg.get("position", "bottom_right")
+        if position not in TEXT_POSITIONS:
+            errors.append(err("INVALID_SCHEMA", "diagram position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field="diagrams.position", clip_id=did,
+                              fix="use a preset position, or set x and y pixel offsets instead"))
+            continue
+        rdg = {"id": did, "start": start, "end": end, "draw": draw,
+               "size": size, "position": position}
+        bad_xy = False
+        for axis in ("x", "y"):
+            if axis in dg:
+                try:
+                    aval = int(dg[axis])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"diagram {axis} must be an integer pixel offset", field=f"diagrams.{axis}", clip_id=did,
+                                      fix=f"set {axis} to a non-negative integer pixel offset"))
+                    bad_xy = True
+                    continue
+                if aval < 0:
+                    errors.append(err("INVALID_SCHEMA", f"diagram {axis} must be >= 0", field=f"diagrams.{axis}", clip_id=did,
+                                      fix=f"set {axis} to 0 or more"))
+                    bad_xy = True
+                    continue
+                rdg[axis] = aval
+        if bad_xy:
+            continue
+        has_strokes = "strokes" in dg and dg.get("strokes") is not None
+        has_template = "template" in dg and dg.get("template") is not None
+        if has_strokes == has_template:
+            errors.append(err("INVALID_SCHEMA", "a diagram needs exactly one of strokes or template", field="diagrams", clip_id=did,
+                              fix="give custom strokes, or a template name with params — not both, not neither"))
+            continue
+        if has_template:
+            if "canvas" in dg:
+                errors.append(err("INVALID_SCHEMA", "a template diagram must not set canvas (the template fixes its own geometry)", field="diagrams.canvas", clip_id=did,
+                                  fix="remove canvas from this template diagram, or use custom strokes with canvas instead"))
+                continue
+            tname = dg["template"]
+            if tname not in TEMPLATES:
+                errors.append(err("INVALID_SCHEMA", f"unknown diagram template '{tname}'; valid templates are: " + ", ".join(sorted(TEMPLATES)), field="diagrams.template", clip_id=did,
+                                  fix="set template to one of: " + ", ".join(sorted(TEMPLATES))))
+                continue
+            params = dg.get("params") or {}
+            if not isinstance(params, dict):
+                errors.append(err("INVALID_SCHEMA", "diagram params must be an object", field="diagrams.params", clip_id=did,
+                                  fix="give params as an object, e.g. {'values': [10, 12, 14]}"))
+                continue
+            allowed = {"chart": {"values"}, "basket": {"coins"},
+                       "balance": {"left", "right"}, "causes": {"rows"}}[tname]
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                errors.append(err("INVALID_SCHEMA", f"template '{tname}' does not take params: " + ", ".join(unknown), field="diagrams.params", clip_id=did,
+                                  fix=f"template '{tname}' takes only: " + ", ".join(sorted(allowed))))
+                continue
+            ok = True
+            if tname == "chart":
+                vals = params.get("values")
+                if not isinstance(vals, list) or not 2 <= len(vals) <= 8:
+                    errors.append(err("INVALID_SCHEMA", "chart template needs values: a list of 2..8 numbers", field="diagrams.params.values", clip_id=did,
+                                      fix="give values as e.g. [10, 12, 14, 18]"))
+                    ok = False
+                else:
+                    try:
+                        vals = [float(v) for v in vals]
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", "chart values must be numbers", field="diagrams.params.values", clip_id=did,
+                                          fix="give values as numbers, e.g. [10, 12, 14]"))
+                        ok = False
+                    else:
+                        params = dict(params, values=vals)
+            elif tname == "basket":
+                try:
+                    coins = int(params.get("coins", 3))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "basket coins must be an integer", field="diagrams.params.coins", clip_id=did,
+                                      fix="set coins to a whole number 1..5, or remove it for 3"))
+                    ok = False
+                else:
+                    if isinstance(params.get("coins", 3), bool) or not 1 <= coins <= 5:
+                        errors.append(err("INVALID_SCHEMA", "basket coins must be 1..5", field="diagrams.params.coins", clip_id=did,
+                                          fix="set coins between 1 and 5"))
+                        ok = False
+                    else:
+                        params = dict(params, coins=coins)
+            elif tname == "balance":
+                for fname in ("left", "right"):
+                    try:
+                        fv = float(params.get(fname, 1))
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", f"balance {fname} must be a number", field="diagrams.params", clip_id=did,
+                                          fix=f"set {fname} to a number >= 0, or remove it"))
+                        ok = False
+                        break
+                    if fv < 0:
+                        errors.append(err("INVALID_SCHEMA", f"balance {fname} must be >= 0", field="diagrams.params", clip_id=did,
+                                          fix=f"set {fname} to 0 or more"))
+                        ok = False
+                        break
+                    params = dict(params, **{fname: fv})
+            elif tname == "causes":
+                try:
+                    rows = int(params.get("rows", 3))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "causes rows must be an integer", field="diagrams.params.rows", clip_id=did,
+                                      fix="set rows to a whole number 1..4, or remove it for 3"))
+                    ok = False
+                else:
+                    if isinstance(params.get("rows", 3), bool) or not 1 <= rows <= 4:
+                        errors.append(err("INVALID_SCHEMA", "causes rows must be 1..4", field="diagrams.params.rows", clip_id=did,
+                                          fix="set rows between 1 and 4"))
+                        ok = False
+                    else:
+                        params = dict(params, rows=rows)
+            if not ok:
+                continue
+            try:
+                cw, ch, tstrokes = build_template(tname, params)
+            except ValueError as exc:
+                errors.append(err("INVALID_SCHEMA", f"template '{tname}' failed: {exc}", field="diagrams.template", clip_id=did,
+                                  fix="check the template parameters and retry"))
+                continue
+            rdg.update({"source": "template", "template": tname,
+                        "params": params, "canvas_w": cw, "canvas_h": ch,
+                        "strokes": tstrokes})
+        else:
+            canvas = dg.get("canvas") or {}
+            if not isinstance(canvas, dict):
+                errors.append(err("INVALID_SCHEMA", "diagram canvas must be an object", field="diagrams.canvas", clip_id=did,
+                                  fix="give canvas as e.g. {'width': 900, 'height': 560}, or remove it"))
+                continue
+            try:
+                cw = int(canvas.get("width", 900))
+                ch = int(canvas.get("height", 560))
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "diagram canvas width/height must be integers", field="diagrams.canvas", clip_id=did,
+                                  fix="set canvas width/height to whole pixels, e.g. 900x560"))
+                continue
+            if not 100 <= cw <= 1920 or not 100 <= ch <= 1920:
+                errors.append(err("INVALID_SCHEMA", "diagram canvas width/height must be 100..1920", field="diagrams.canvas", clip_id=did,
+                                  fix="set canvas between 100 and 1920 pixels per side"))
+                continue
+            strokes = dg.get("strokes")
+            if not isinstance(strokes, list) or not strokes:
+                errors.append(err("INVALID_SCHEMA", "a custom diagram needs a non-empty strokes list", field="diagrams.strokes", clip_id=did,
+                                  fix="give at least one stroke, e.g. {'kind': 'polyline', 'points': [[0, 0], [100, 50]]}"))
+                continue
+            rstrokes = []
+            for si, st in enumerate(strokes):
+                st2 = dict(st) if isinstance(st, dict) else st
+                if isinstance(st2, dict) and "seed" not in st2:
+                    st2["seed"] = si
+                rs = _validate_stroke(st2, cw, ch, errors, did)
+                if rs is None:
+                    rstrokes = None
+                    break
+                rstrokes.append(rs)
+            if rstrokes is None:
+                continue
+            rdg.update({"source": "custom", "template": None,
+                        "canvas_w": cw, "canvas_h": ch, "strokes": rstrokes})
+        resolved.append(rdg)
+    return resolved
 
 
 def validate_project(project):
@@ -2168,9 +2593,17 @@ def validate_project(project):
             if voice_index is not None and amount_db is not None and fade is not None and windows is not None:
                 ducking = {"voice_index": voice_index, "amount_db": amount_db,
                            "fade": fade, "windows": windows}
+    # Animated stroke diagrams (v1.38.0): validated after the
+    # overlays so diagram ids can be checked against overlay ids.
+    # Diagrams are resolved data (strokes/templates expanded),
+    # never file references, so render packs carry them verbatim
+    # in project.json and regenerate the animation at render.
+    resolved_diagrams = _validate_diagrams(
+        project, total, {ov["id"] for ov in resolved_overlays}, errors)
     info = {"width": width, "height": height, "fps": fps, "clips": resolved,
             "total_duration": total, "clip_starts": clip_starts, "font": font,
             "captions": merged_captions, "overlays": resolved_overlays,
+            "diagrams": resolved_diagrams,
             "audio": resolved_audio,
             "chapters": chapters, "ducking": ducking,
             "video_bitrate": video_bitrate, "loudness_target": loudness_target}
@@ -2224,6 +2657,15 @@ def validate_project(project):
                 if _os < _ce and _oe > _cs:
                     _animated = True
                     break
+            if not _animated:
+                # A stroke diagram drawing over the still is
+                # motion too (v1.38.0): its draw window animates
+                # even though the underlying clip is a still.
+                for _dg in (info.get("diagrams") or []):
+                    _ds, _de = float(_dg["start"]), float(_dg["end"])
+                    if _ds < _ce and _de > _cs:
+                        _animated = True
+                        break
             if _animated:
                 continue
             info["warnings"].append({
