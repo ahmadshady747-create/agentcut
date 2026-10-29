@@ -2342,6 +2342,157 @@ class TestAgentCut(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(info["code"], "INVALID_SCHEMA")
 
+    def test_loop135_font_env_dir_wins_and_bundled_found(self):
+        # 1.35.0 on-device fonts: $AGENTCUT_FONT_DIR beats every
+        # other directory, and the bundled fonts/ directory is
+        # found with the variable unset.
+        import tempfile
+        import agentcut.validate as val
+        env_dir = tempfile.mkdtemp(prefix="agentcut-fontenv-")
+        shutil.copy(os.path.join(BASE, "fonts", "NotoNaskhArabic-Regular.ttf"),
+                    os.path.join(env_dir, "NotoNaskhArabic-Regular.ttf"))
+        old = os.environ.get("AGENTCUT_FONT_DIR")
+        try:
+            os.environ["AGENTCUT_FONT_DIR"] = env_dir
+            self.assertEqual(val.find_font_for_text("مرحبا"),
+                             os.path.join(env_dir, "NotoNaskhArabic-Regular.ttf"))
+        finally:
+            if old is None:
+                os.environ.pop("AGENTCUT_FONT_DIR", None)
+            else:
+                os.environ["AGENTCUT_FONT_DIR"] = old
+        bundled = val.find_font_for_text("مرحبا")
+        self.assertTrue(bundled and bundled.startswith(os.path.join(BASE, "fonts")),
+                        bundled)
+        self.assertEqual(val.find_font_for_text("Hello"), val.find_font())
+        shutil.rmtree(env_dir, ignore_errors=True)
+
+    def test_loop135_arabic_without_arabic_font_is_structured(self):
+        # 1.35.0 tofu guard: Arabic text with only a Latin font
+        # available must fail loudly (FONT_NOT_FOUND) in validation
+        # AND in render — never fall back to DejaVu tofu boxes.
+        import tempfile
+        import agentcut.validate as val
+        latin_only = tempfile.mkdtemp(prefix="agentcut-fontlatin-")
+        shutil.copy(os.path.join(BASE, "fonts", "DejaVuSans.ttf"),
+                    os.path.join(latin_only, "DejaVuSans.ttf"))
+        orig_dirs = val._font_dirs
+        proj = {"id": "font-missing", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/poster.png", "duration": 2}],
+                "texts": [{"text": "مرحبا بالعالم", "start": 0, "end": 2,
+                           "size": 48, "x": "center", "y": 300}]}
+        try:
+            val._font_dirs = lambda: [latin_only]
+            self.assertIsNone(val.find_font_for_text("مرحبا بالعالم"))
+            errors, _ = validate_project(proj)
+            self.assertTrue(any(e.get("code") == "FONT_NOT_FOUND" for e in errors),
+                            errors)
+            ok, info = render_project(proj, os.path.join(BASE, "data", "test_fontmissing.mp4"))
+            self.assertFalse(ok)
+            self.assertIn("FONT_NOT_FOUND", json.dumps(info, ensure_ascii=False))
+        finally:
+            val._font_dirs = orig_dirs
+            shutil.rmtree(latin_only, ignore_errors=True)
+
+    def test_loop135_package_renders_in_clean_dir(self):
+        # 1.35.0 render pack: a representative project (crossfade,
+        # grade + LUT, Arabic text, captions file, audio) packs
+        # into a self-contained directory that renders with NO
+        # repo, NO network and NO MCP server, from another cwd,
+        # under a restricted TMPDIR, with AGENTCUT_FONT_DIR unset
+        # (render.sh supplies the pack's own fonts/).
+        import tempfile
+        from agentcut.package import package_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-pack-")
+        srt_path = os.path.join(tmp, "caps.srt")
+        with open(srt_path, "w", encoding="utf-8") as fh:
+            fh.write("1\n00:00:00,000 --> 00:00:01,800\nمرحبا 2 دولار\n\n"
+                     "2\n00:00:01,800 --> 00:00:03,600\nوداعا\n")
+        voice_path = os.path.join(tmp, "voice.wav")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=300:duration=2", voice_path],
+                       check=True)
+        proj = {"id": "pack-demo", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/pattern.jpg", "duration": 2,
+                           "grade": "warm"},
+                          {"id": "b", "kind": "image",
+                           "src": "data/test_media/poster.png", "duration": 2,
+                           "transition": "crossfade", "transition_duration": 0.4,
+                           "lut": "examples/test-lut.cube"}],
+                "texts": [{"text": "مرحبا 2 دولار", "start": 0.5, "end": 3.5,
+                           "size": 48, "x": "center", "y": 100}],
+                "captions_file": srt_path,
+                "audio": [{"src": voice_path, "kind": "voice",
+                           "volume": 1.0}]}
+        pack = os.path.join(tmp, "pack")
+        summary = package_project(proj, pack)
+        self.assertGreater(summary["files_copied"], 0)
+        for rel in ("project.json", "render.sh", "README.md",
+                    os.path.join("src", "agentcut", "__init__.py"),
+                    os.path.join("fonts", "NotoNaskhArabic-Regular.ttf"),
+                    os.path.join("media", "pattern.jpg"),
+                    os.path.join("media", "poster.png"),
+                    os.path.join("media", "test-lut.cube")):
+            self.assertTrue(os.path.isfile(os.path.join(pack, rel)), rel)
+        self.assertTrue(os.access(os.path.join(pack, "render.sh"), os.X_OK))
+        with open(os.path.join(pack, "project.json"), encoding="utf-8") as fh:
+            packed = json.load(fh)
+        for clip in packed["clips"]:
+            self.assertTrue(clip["src"].startswith("media/"), clip["src"])
+        # Clean-directory simulation: copy the pack elsewhere, run
+        # render.sh from / with a restricted TMPDIR and no font env.
+        clean = os.path.join(tmp, "clean")
+        shutil.copytree(pack, clean)
+        tmpdir = os.path.join(tmp, "restricted-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        env = {"PATH": os.environ["PATH"], "HOME": tmp, "TMPDIR": tmpdir}
+        proc = subprocess.run([os.path.join(clean, "render.sh")],
+                              capture_output=True, text=True, cwd="/",
+                              env=env, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = os.path.join(clean, "output.mp4")
+        self.assertTrue(os.path.isfile(out))
+        probe = ffprobe(out)
+        self.assertEqual(probe["streams"][0]["pix_fmt"], "yuv420p")
+        # 2s + 2s clips with a 0.4s crossfade overlap = 3.6s.
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 3.6, delta=0.5)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop135_package_rejects_invalid_and_dedupes(self):
+        # A pack is never built from an invalid project, and two
+        # different files sharing a basename get distinct media/.
+        import tempfile
+        from agentcut.package import package_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-packbad-")
+        bad = {"id": "pack-bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": "data/test_media/nonexistent.png", "duration": 2}]}
+        with self.assertRaises(ValueError):
+            package_project(bad, os.path.join(tmp, "pack"))
+        d1, d2 = os.path.join(tmp, "d1"), os.path.join(tmp, "d2")
+        os.makedirs(d1, exist_ok=True)
+        os.makedirs(d2, exist_ok=True)
+        shutil.copy(os.path.join(BASE, "data", "test_media", "pattern.jpg"),
+                    os.path.join(d1, "same.jpg"))
+        shutil.copy(os.path.join(BASE, "data", "test_media", "poster.png"),
+                    os.path.join(d2, "same.jpg"))
+        proj = {"id": "pack-dedupe", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(d1, "same.jpg"), "duration": 1},
+                          {"id": "b", "kind": "image",
+                           "src": os.path.join(d2, "same.jpg"), "duration": 1}]}
+        pack = os.path.join(tmp, "pack2")
+        package_project(proj, pack)
+        media = sorted(os.listdir(os.path.join(pack, "media")))
+        self.assertEqual(media, ["same.jpg", "same_2.jpg"])
+        shutil.rmtree(tmp, ignore_errors=True)
+
     def test_loop134_cli_bad_numbers_no_traceback(self):
         # 1.34.0 F7 (CLI): bad numeric CLI arguments print an
         # error and exit non-zero, without a traceback.

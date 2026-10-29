@@ -89,20 +89,48 @@ GRADE_PRESETS = {
 TEXT_POSITIONS = {"top_left", "top_center", "top_right", "center",
                   "bottom_left", "bottom_center", "bottom_right"}
 
-FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/DejaVuSans.ttf",
-]
-
+# Font files by script (searched in every font directory, in order).
 # DejaVu has no Arabic glyphs, so Arabic texts previously rendered
 # as missing glyphs. Noto Naskh Arabic is the preferred Arabic font
-# when it exists on the machine; Noto Sans Arabic is the fallback.
-ARABIC_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Medium.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
-]
+# when it exists; Noto Sans Arabic is the fallback.
+LATIN_FONT_FILES = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
+ARABIC_FONT_FILES = ["NotoNaskhArabic-Regular.ttf",
+                     "NotoNaskhArabic-Medium.ttf",
+                     "NotoSansArabic-Regular.ttf"]
+
+
+def _font_dirs():
+    """Directories searched for fonts, in priority order (v1.35.0,
+    on-device portability). The old code only knew absolute Linux
+    paths under /usr/share/fonts, which do not exist on Android:
+    Termux keeps its prefix under $PREFIX (e.g.
+    /data/data/com.termux/files/usr) and ships no fonts by default.
+    Order: an explicit $AGENTCUT_FONT_DIR first, then the bundled
+    fonts/ directory shipped in the repo (and in render packs),
+    then Termux $PREFIX font dirs, then system paths."""
+    dirs = []
+    env_dir = os.environ.get("AGENTCUT_FONT_DIR")
+    if env_dir:
+        dirs.append(env_dir)
+    dirs.append(os.path.join(BASE_DIR, "fonts"))
+    prefix = os.environ.get("PREFIX")
+    if prefix:
+        dirs.append(os.path.join(prefix, "share/fonts/truetype/dejavu"))
+        dirs.append(os.path.join(prefix, "share/fonts/truetype/noto"))
+        dirs.append(os.path.join(prefix, "share/fonts"))
+    dirs.append("/usr/share/fonts/truetype/dejavu")
+    dirs.append("/usr/share/fonts/truetype/noto")
+    dirs.append("/usr/share/fonts")
+    return dirs
+
+
+def _find_font_file(files):
+    for directory in _font_dirs():
+        for name in files:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                return path
+    return None
 
 
 def contains_arabic(text):
@@ -117,11 +145,14 @@ def contains_arabic(text):
 
 
 def find_font_for_text(text):
-    """Font for one text: an Arabic font for Arabic text, else DejaVu."""
+    """Font for one text: an Arabic font for Arabic text, else the
+    Latin font. Deliberately NO fallback from Arabic to Latin (v1.35.0):
+    the old code fell back to DejaVu when no Arabic font existed, and
+    DejaVu has no Arabic glyphs, so Arabic text rendered as silent
+    tofu boxes. Returning None here lets validation fail loudly with
+    FONT_NOT_FOUND instead."""
     if contains_arabic(text):
-        for path in ARABIC_FONT_CANDIDATES:
-            if os.path.isfile(path):
-                return path
+        return _find_font_file(ARABIC_FONT_FILES)
     return find_font()
 
 
@@ -141,10 +172,7 @@ def resolve_path(path):
 
 
 def find_font():
-    for path in FONT_CANDIDATES:
-        if os.path.isfile(path):
-            return path
-    return None
+    return _find_font_file(LATIN_FONT_FILES)
 
 
 def err(code, message, field=None, clip_id=None, fix=None):
@@ -551,10 +579,15 @@ def validate_project(project):
     if not isinstance(clips, list) or not clips:
         errors.append(err("EMPTY_TIMELINE", "clips must be a non-empty list", field="clips"))
         return errors, {"width": width, "height": height, "fps": fps, "clips": [], "total_duration": 0}
-    needs_font = bool(project.get("texts") or project.get("captions"))
+    # The Latin default font (may be None); per-text font requirements
+    # are checked after captions are merged, below. The old blanket
+    # check ("any text needs DejaVu") was wrong in both directions:
+    # an Arabic-only project failed on a machine with only Noto fonts
+    # even though it could render, while an Arabic project with only
+    # DejaVu passed validation and then rendered tofu boxes.
+    needs_font = bool(project.get("texts") or project.get("captions")
+                      or project.get("captions_file"))
     font = find_font() if needs_font else None
-    if needs_font and font is None:
-        errors.append(err("FONT_NOT_FOUND", "no usable DejaVu font found for text overlays", field="texts"))
     resolved = []
     total = 0.0
     seen_ids = set()
@@ -1369,6 +1402,33 @@ def validate_project(project):
             _cap.setdefault("size", caption_size)
         if caption_position is not None:
             _cap.setdefault("position", caption_position)
+    # Per-text font requirements (v1.35.0, on-device portability):
+    # every rendered text needs a font for its own script. Arabic
+    # text with no Arabic font is a hard error, never a silent
+    # fallback to a Latin font (which would render tofu boxes);
+    # Latin text with no Latin font is a hard error the same way.
+    # The fix names the two portable remedies: the bundled fonts/
+    # directory, or $AGENTCUT_FONT_DIR.
+    for _t in list(project.get("texts") or []) + merged_captions:
+        if not isinstance(_t, dict) or not isinstance(_t.get("text"), str):
+            continue
+        _txt = _t["text"]
+        if not _txt:
+            continue
+        if contains_arabic(_txt):
+            if find_font_for_text(_txt) is None:
+                errors.append(err("FONT_NOT_FOUND",
+                                  f"no Arabic font found for text {_txt[:40]!r}; "
+                                  "Arabic text needs Noto Naskh Arabic (or Noto Sans Arabic)",
+                                  field="texts",
+                                  fix="use the bundled fonts/ directory, or set AGENTCUT_FONT_DIR to a directory containing NotoNaskhArabic-Regular.ttf"))
+                break
+        elif find_font() is None:
+            errors.append(err("FONT_NOT_FOUND",
+                              f"no Latin font found for text {_txt[:40]!r}",
+                              field="texts",
+                              fix="use the bundled fonts/ directory, or set AGENTCUT_FONT_DIR to a directory containing DejaVuSans.ttf"))
+            break
     # Resolved audio copies (1.34.0): validation used to mutate the
     # caller's project in place (resolving track srcs and coercing
     # starts), which leaked absolute paths into stored projects

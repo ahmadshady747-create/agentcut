@@ -30,6 +30,34 @@ failure is a JSON object with `code` and `message`.
 - After `done`, verify the output with the probe data in the job
   result: duration, width, height, video and audio streams.
 
+## On-device rendering (render packs) vs VM rendering
+
+Two workflows, and they must not be mixed up:
+
+- VM rendering (this MCP server, as above): the agent renders
+  and verifies directly. This is the default.
+- On-device rendering: the agent CANNOT run anything on the
+  user's phone — there is no shell channel to it, and Muse
+  does not host user MCP servers. The agent builds the project
+  exactly as usual, then runs `./run.sh package <project.json>
+  <outdir>` and delivers the pack (archive or link). The user
+  unpacks it on their device (Termux: `pkg install python
+  ffmpeg`), runs `./render.sh` inside it, and reports the
+  result back. The pack is self-contained: rewritten project,
+  every media file, AgentCut source, bundled fonts, `render.sh`.
+  It needs no network, no MCP server and no repo checkout.
+- Never present a pack as a rendered video: until the user
+  reports a successful on-device render, the video is
+  undelivered. Never claim an on-phone trial you did not see.
+- Fonts on device resolve as: `$AGENTCUT_FONT_DIR`, bundled
+  `fonts/`, Termux `$PREFIX` font dirs, system paths. Arabic
+  text with no Arabic font fails with `FONT_NOT_FOUND` — that
+  error is the correct outcome, not something to work around
+  by switching fonts silently.
+- Detached MCP jobs are unreliable on Android (the OS can kill
+  background work); on-device rendering is foreground CLI by
+  design. Full user guide: `docs/ON_DEVICE.md`.
+
 ## Project shape (v1)
 
 - `version`: always 1. `id`: `[A-Za-z0-9_-]+`.

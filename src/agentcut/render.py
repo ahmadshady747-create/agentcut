@@ -920,9 +920,20 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # here exactly like titles, pop texts and SRT cues.
             fh.write(bidi_display_text(str(item["text"])))
         # Font by script: Arabic text gets Noto Naskh Arabic when
-        # present (DejaVu has no Arabic glyphs), everything else
-        # keeps the validated default font.
-        item_font = find_font_for_text(str(item["text"])) or font
+        # present, everything else keeps the validated default font.
+        # Deliberately NO fallback to the Latin font for Arabic text
+        # (v1.35.0): DejaVu has no Arabic glyphs, so falling back
+        # rendered silent tofu boxes. Validation normally rejects
+        # such projects first; this raise is the defence in depth
+        # for hand-built info dicts, and render_project turns it
+        # into a structured FONT_NOT_FOUND error.
+        item_font = find_font_for_text(str(item["text"]))
+        if item_font is None:
+            raise ValueError(
+                f"FONT_NOT_FOUND: no usable font for text "
+                f"{str(item['text'])[:40]!r}; Arabic text needs Noto Naskh "
+                "Arabic, Latin text needs DejaVuSans (bundled fonts/ or "
+                "$AGENTCUT_FONT_DIR)")
         filters.append(
             f"[{vcur}]drawtext=fontfile={item_font}:textfile={text_path}:"
             f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}:"
@@ -954,6 +965,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             cur = "vguide2"
         if review_timecode:
             tc_font = info.get("font") or find_font()
+            if tc_font is None:
+                raise ValueError(
+                    "FONT_NOT_FOUND: no Latin font for the review timecode "
+                    "(bundled fonts/ or $AGENTCUT_FONT_DIR)")
             filters.append(
                 f"[{cur}]drawtext=fontfile={tc_font}:"
                 f"text='%{{pts\\:hms}}':fontsize=28:fontcolor=yellow:"
@@ -1263,10 +1278,22 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
         with open(metadata_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
     effective_timecode = bool(review_timecode or project.get("timecode"))
-    argv, total, text_dir = build_ffmpeg_args(
-        project, info, tmp_path, scale_factor,
-        metadata_path=metadata_path, guides=guides,
-        review_timecode=effective_timecode)
+    try:
+        argv, total, text_dir = build_ffmpeg_args(
+            project, info, tmp_path, scale_factor,
+            metadata_path=metadata_path, guides=guides,
+            review_timecode=effective_timecode)
+    except ValueError as exc:
+        # Font failures raised by the filter builder (defence in
+        # depth behind validation) become structured errors, never
+        # tracebacks and never a render with tofu boxes.
+        if str(exc).startswith("FONT_NOT_FOUND"):
+            _remove_quietly(tmp_path)
+            return False, {"code": "INVALID_PROJECT", "message": str(exc),
+                           "fix": "use the bundled fonts/ directory, or set "
+                                  "AGENTCUT_FONT_DIR to a directory with the "
+                                  "needed font"}
+        raise
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

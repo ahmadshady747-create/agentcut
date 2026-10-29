@@ -1,3 +1,57 @@
+## 1.35.0 — On-device rendering (Termux render packs + portable fonts)
+
+User order 2026-10-29: make AgentCut work on the user's own
+device and edit using its resources. The agent has no shell
+channel to the phone and Muse does not host user MCP servers,
+so the deliverable is user-driven: the agent builds a
+self-contained render pack, the user renders it on their phone
+and reports back. The on-phone trial itself cannot be performed
+by the agent and stays listed as the remaining completion gate
+(see docs/ON_DEVICE.md). Tests 77/77 (73 prior + 4 new) in the
+main tree and in a fresh copy.
+- Portable fonts: font discovery was absolute Linux paths only
+  (/usr/share/fonts/...), which do not exist on Android/Termux,
+  and the validation gate demanded DejaVu for any text — so an
+  Arabic-only project failed on a Noto-only machine even though
+  it could render, while an Arabic project with only DejaVu
+  passed validation and then rendered tofu boxes. Now the order
+  is $AGENTCUT_FONT_DIR, then the bundled fonts/ directory
+  (NotoNaskhArabic-Regular under OFL-1.1, DejaVuSans under the
+  Bitstream Vera licence, both licences shipped in fonts/),
+  then Termux $PREFIX font dirs, then system paths. Font
+  requirements are checked per text by script: Arabic text with
+  no Arabic font, or Latin text with no Latin font, fails with
+  FONT_NOT_FOUND naming the fix; the renderer never falls back
+  to a Latin font for Arabic text (defence in depth: a
+  structured FONT_NOT_FOUND render error). Latin fallback
+  behaviour is unchanged. Tests: font env-dir-wins, bundled
+  fonts found, Arabic-without-Arabic-font structured.
+- Render packs: new CLI `./run.sh package <project.json>
+  <outdir>` builds a self-contained directory — rewritten
+  project.json (every media reference rewritten to a relative
+  media/... path, basename collisions deduped), every referenced
+  file (clips, LUTs, overlays, audio, captions SRT), a copy of
+  the AgentCut source tree, the bundled fonts, an executable
+  render.sh (preflights python3/ffmpeg/ffprobe, sets
+  AGENTCUT_FONT_DIR from the pack, renders project.json to
+  output.mp4) and a README. It renders with no network, no MCP
+  server and no repo checkout. Invalid projects and missing
+  files refuse to pack. Test: pack renders in a clean directory
+  from another cwd under a restricted TMPDIR with no font env.
+- Termux setup: scripts/setup-termux.sh (idempotent: pkg
+  install python ffmpeg, version checks, drawtext/xfade/
+  loudnorm filter checks with vidstab reported as optional,
+  fonts into ~/.agentcut-fonts with a persistent bashrc export,
+  a 1-second Arabic smoke render) and docs/ON_DEVICE.md, the
+  Arabic on-device guide: pack workflow, full-repo workflow,
+  and plain honesty about heat, throttling, foreground-only
+  rendering and keeping the phone charging. Detached MCP jobs
+  are unreliable on Android (the OS can kill background work),
+  so on-device rendering is foreground CLI by design.
+- Also fixed in passing: __init__.__version__ was stale at
+  1.33.0 while VERSION said 1.34.0 (the server reads VERSION,
+  so MCP reported correctly; now both say 1.35.0).
+
 ## 1.34.0 — Defect-fix loop (audit + fixes, no new features)
 
 User order 2026-10-29: fix ALL defects in AgentCut code, do not

@@ -38,6 +38,29 @@ Requirements: Python 3.10+, `ffmpeg` and `ffprobe` on PATH. No Python
 dependencies. No network access is used for media in v1: all `src` paths
 are local files.
 
+## Run it on your own device (on-device rendering)
+
+The agent cannot run anything on your phone from here, so
+on-device rendering is user-driven: the agent builds a
+self-contained render pack and you render it on your phone:
+
+```sh
+./run.sh package project.json mypack     # agent side
+# on the phone (Termux): pkg install python ffmpeg
+./render.sh                              # inside mypack -> output.mp4
+```
+
+The pack holds the rewritten project, every media file, a copy
+of the AgentCut source, the bundled fonts and `render.sh`, and
+needs no network, no MCP server and no repo checkout. Fonts
+resolve in this order: `$AGENTCUT_FONT_DIR`, the bundled
+`fonts/` directory, Termux `$PREFIX` font dirs, then system
+paths; Arabic text with no Arabic font fails loudly with
+`FONT_NOT_FOUND` instead of rendering tofu boxes. Full guide,
+including heat/throttling honesty and troubleshooting, is in
+`docs/ON_DEVICE.md`; full-repo phone setup is
+`scripts/setup-termux.sh`.
+
 ## Project format (v1)
 
 ```json
