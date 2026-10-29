@@ -2271,6 +2271,12 @@ class TestAgentCut(unittest.TestCase):
     def test_loop134_text_overflow_warning(self):
         # 1.34.0 F4: a caption wider than the frame warns instead
         # of clipping silently; a short caption does not warn.
+        # 1.36.0 UPDATE (documented behaviour change, not a
+        # regression): a WRAPPABLE long caption no longer warns,
+        # because wrapping fixes it — it renders on several lines
+        # inside the frame. The warning survives exactly where
+        # wrapping cannot help: a single word wider than the
+        # frame, and a long non-caption text (texts do not wrap).
         img = os.path.join(BASE, "data", "test_media", "poster.png")
         base = {"id": "ovf", "version": 1,
                 "output": {"width": 160, "height": 160, "fps": 12},
@@ -2279,6 +2285,19 @@ class TestAgentCut(unittest.TestCase):
         p = copy.deepcopy(base)
         p["captions"] = [{"text": "This caption is far too long for a 160 pixel wide frame",
                           "start": 0, "end": 1}]
+        _, info = validate_project(p)
+        self.assertFalse(any(w.get("code") == "text_overflow_warning"
+                             for w in info.get("warnings", [])),
+                         info.get("warnings"))
+        p = copy.deepcopy(base)
+        p["captions"] = [{"text": "Averyveryverylongsinglewordthatcannotwrap",
+                          "start": 0, "end": 1}]
+        _, info = validate_project(p)
+        self.assertTrue(any(w.get("code") == "text_overflow_warning"
+                            for w in info.get("warnings", [])), info.get("warnings"))
+        p = copy.deepcopy(base)
+        p["texts"] = [{"text": "This text is far too long for a 160 pixel wide frame",
+                       "start": 0, "end": 1}]
         _, info = validate_project(p)
         self.assertTrue(any(w.get("code") == "text_overflow_warning"
                             for w in info.get("warnings", [])), info.get("warnings"))
@@ -2492,6 +2511,340 @@ class TestAgentCut(unittest.TestCase):
         media = sorted(os.listdir(os.path.join(pack, "media")))
         self.assertEqual(media, ["same.jpg", "same_2.jpg"])
         shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_wrap_caption_lines(self):
+        # 1.36.0 wrapped captions: greedy word packing on the
+        # logical text, words never split, single long words stay
+        # whole (they clip with a warning — the documented
+        # fallback — rather than crashing or splitting mid-word).
+        from agentcut.validate import _text_box, wrap_caption_lines
+        long_ar = ("هذا نص عربي طويل جدا يحتاج إلى الالتفاف على عدة "
+                   "أسطر لكي يظهر كاملا داخل الإطار")
+        lines = wrap_caption_lines(long_ar, 36, 324)
+        self.assertGreater(len(lines), 1)
+        for ln in lines:
+            self.assertLessEqual(len(ln) * 36 * 0.6, 324 + 1e-6)
+        self.assertEqual(" ".join(lines), long_ar)
+        self.assertEqual(len(wrap_caption_lines(
+            "كلمةطويلةجداجداجداجداجداجداجدا", 36, 100)), 1)
+        self.assertEqual(wrap_caption_lines("مرحبا", 36, 324), ["مرحبا"])
+        # The estimator sees the wrapped block, not the old
+        # single-line box: height covers all lines, width is the
+        # widest line and never exceeds the max width.
+        box = _text_box({"text": long_ar, "start": 0, "end": 4}, True,
+                        360, 640, 4.0, line_spacing=1.35, max_width_frac=0.9)
+        self.assertLessEqual(box[2], 324 + 1e-6)
+        self.assertAlmostEqual(box[3], (len(lines) - 1) * 36 * 1.35 + 36 * 1.4,
+                               delta=0.01)
+        self.assertAlmostEqual(box[1], 640 - 120 - (len(lines) - 1) * 36 * 1.35,
+                               delta=0.01)
+
+    def test_loop136_wrapped_caption_renders_inside_frame(self):
+        # 1.36.0 headline proof: a long Arabic caption that
+        # previously clipped both edges now shows fully, in
+        # several centred lines, with no glyph at the frame edges.
+        import tempfile
+        from agentcut.validate import validate_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-wrap-")
+        bg = os.path.join(tmp, "black.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+        long_ar = ("هذا نص عربي طويل يلتف على ثلاثة أسطر كاملة "
+                   "دون أن ينقطع عند الحواف")
+        proj = {"id": "wrap", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2}],
+                "captions": [{"text": long_ar, "start": 0, "end": 2}]}
+        errors, _info = validate_project(proj)
+        self.assertEqual(errors, [])
+        out = os.path.join(tmp, "out.mp4")
+        ok, _info = render_project(proj, out)
+        self.assertTrue(ok)
+        frame = os.path.join(tmp, "frame.png")
+        _w, _h, px = _frame_png(out, 1.0, frame)
+        # Bright (white caption) pixels in at least 3 separate
+        # ~48px line bands inside the caption block, and none at
+        # the extreme left/right edges (no clipping).
+        bands = set()
+        for y in range(340, 575):
+            for x in range(360):
+                r, g, b = px(x, y)[:3]
+                if min(r, g, b) > 150:
+                    bands.add((y - 340) // 48)
+                    self.assertGreaterEqual(x, 6)
+                    self.assertLessEqual(x, 353)
+        self.assertGreaterEqual(len(bands), 3)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_short_caption_untouched_by_wrap(self):
+        # A single-line caption renders identically whether the
+        # max width is the 0.9 default or 1.0: the wrap pass
+        # leaves single-line captions on the exact old path.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-shortcap-")
+        bg = os.path.join(tmp, "black.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+
+        def render(maxw, name):
+            proj = {"id": "shortcap", "version": 1,
+                    "output": {"width": 360, "height": 640, "fps": 30},
+                    "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2}],
+                    "caption_max_width": maxw,
+                    "captions": [{"text": "مرحبا", "start": 0, "end": 2}]}
+            out = os.path.join(tmp, name)
+            ok, _info = render_project(proj, out)
+            self.assertTrue(ok)
+            frame = os.path.join(tmp, name + ".png")
+            _frame_png(out, 1.0, frame)
+            with open(frame, "rb") as fh:
+                return fh.read()
+
+        a = render(0.9, "a.mp4")
+        b = render(1.0, "b.mp4")
+        self.assertEqual(a, b)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_scrim_darkens_edges_not_middle(self):
+        # 1.36.0 scrims: a bottom scrim darkens the bottom rows
+        # of a white frame and leaves the middle (and the top,
+        # where no scrim is set) untouched.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-scrim-")
+        bg = os.path.join(tmp, "white.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=white:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+        proj = {"id": "scrim", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2}],
+                "scrims": {"bottom": True}}
+        out = os.path.join(tmp, "out.mp4")
+        ok, _info = render_project(proj, out)
+        self.assertTrue(ok)
+        top = _crop_mean(out, 1.0, 0, 0, 360, 20)
+        mid = _crop_mean(out, 1.0, 0, 300, 360, 20)
+        bottom = _crop_mean(out, 1.0, 0, 620, 360, 20)
+        self.assertGreater(min(top), 240)
+        self.assertGreater(min(mid), 240)
+        self.assertLess(max(bottom), 160)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_overlay_dressing_renders(self):
+        # 1.36.0 overlay dressing: black border, rounded corners
+        # (background shows through the corner) and a blurred
+        # drop shadow offset below-right, on a white background.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-dress-")
+        bg = os.path.join(tmp, "white.png")
+        red = os.path.join(tmp, "red.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=white:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=200x200", "-frames:v", "1", red],
+                       check=True)
+        proj = {"id": "dress", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2}],
+                "overlays": [{"id": "o", "kind": "image", "src": red,
+                              "size": 0.55, "x": 80, "y": 200,
+                              "start": 0, "duration": 2,
+                              "border_width": 4, "border_color": "black",
+                              "corner_radius": 30,
+                              "shadow_dx": 10, "shadow_dy": 10,
+                              "shadow_blur": 4, "shadow_opacity": 0.6}]}
+        out = os.path.join(tmp, "out.mp4")
+        ok, _info = render_project(proj, out)
+        self.assertTrue(ok)
+        frame = os.path.join(tmp, "frame.png")
+        _w, _h, px = _frame_png(out, 1.0, frame)
+        # Rounded corner: background shows through.
+        self.assertGreater(min(px(82, 202)[:3]), 240)
+        # Top-edge border: black.
+        self.assertLess(max(px(179, 201)[:3]), 50)
+        # Shadow band below the overlay (outside the overlay
+        # itself, away from its rounded corners): darkened but
+        # blurred, not pure black.
+        mean = sum(px(179, 404)[:3]) / 3
+        self.assertLess(mean, 220)
+        self.assertGreater(mean, 30)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_rounded_text_box_renders(self):
+        # 1.36.0 rounded text box: a dark pill behind the text,
+        # with the background showing through its rounded corner.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-pill-")
+        bg = os.path.join(tmp, "white.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=white:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+        proj = {"id": "pill", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2}],
+                "texts": [{"text": "Hi", "x": "center", "y": 100,
+                           "start": 0, "end": 2, "size": 48, "color": "white",
+                           "box": True, "box_radius": 20, "box_color": "black",
+                           "box_opacity": 0.8, "box_padding": 12}]}
+        out = os.path.join(tmp, "out.mp4")
+        ok, _info = render_project(proj, out)
+        self.assertTrue(ok)
+        frame = os.path.join(tmp, "frame.png")
+        _w, _h, px = _frame_png(out, 1.0, frame)
+        # Inside the pill, left of the glyphs: dark box colour.
+        self.assertLess(max(px(143, 130)[:3]), 120)
+        # Pill corner: background shows through the rounding.
+        self.assertGreater(min(px(140, 89)[:3]), 240)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_new_fields_validation(self):
+        # 1.36.0 validation: bad values are structured errors
+        # with fix hints; good values pass; rounded boxes refuse
+        # animation, fades and box:false (the pill would not
+        # move or fade with the text).
+        def check(proj):
+            errors, _info = validate_project(proj)
+            return errors
+
+        def base(**kw):
+            proj = {"id": "v", "version": 1,
+                    "output": {"width": 360, "height": 640, "fps": 30},
+                    "clips": [{"id": "a", "kind": "image",
+                               "src": "data/test_media/pattern.jpg", "duration": 2}]}
+            proj.update(kw)
+            return proj
+
+        bad = base(texts=[{"text": "T", "start": 0, "end": 2,
+                           "shadow_x": 99}])
+        self.assertTrue(any(e["field"] == "texts.shadow_x" for e in check(bad)))
+        bad = base(texts=[{"text": "T", "start": 0, "end": 2,
+                           "shadow_color": "notacolor"}])
+        self.assertTrue(any(e["field"] == "texts.shadow_color" for e in check(bad)))
+        bad = base(scrims={"bottom": {"opacity": 2.0}})
+        self.assertTrue(any("scrims" in e["field"] for e in check(bad)))
+        bad = base(scrims="yes")
+        self.assertTrue(any(e["field"] == "scrims" for e in check(bad)))
+        bad = base(caption_max_width=0.2)
+        self.assertTrue(any(e["field"] == "caption_max_width" for e in check(bad)))
+        bad = base(caption_line_spacing=3.0)
+        self.assertTrue(any(e["field"] == "caption_line_spacing" for e in check(bad)))
+        bad = base(texts=[{"text": "T", "start": 0, "end": 2, "box": True,
+                           "box_radius": 20, "animation": "pop",
+                           "animation_duration": 0.5}])
+        self.assertTrue(any("animation" in e["message"] for e in check(bad)))
+        bad = base(texts=[{"text": "T", "start": 0, "end": 2, "box": True,
+                           "box_radius": 20, "fade_in": 0.5}])
+        self.assertTrue(any("fade" in e["message"] for e in check(bad)))
+        bad = base(texts=[{"text": "T", "start": 0, "end": 2, "box": False,
+                           "box_radius": 20}])
+        self.assertTrue(any("box" in e["message"] for e in check(bad)))
+        bad = base(overlays=[{"id": "o", "kind": "image",
+                              "src": "data/test_media/poster.png", "size": 0.3,
+                              "start": 0, "duration": 2,
+                              "corner_radius": 500}])
+        self.assertTrue(any(e["field"] == "overlays.corner_radius" for e in check(bad)))
+        bad = base(overlays=[{"id": "o", "kind": "image",
+                              "src": "data/test_media/poster.png", "size": 0.3,
+                              "start": 0, "duration": 2, "shadow_blur": 99}])
+        self.assertTrue(any(e["field"] == "overlays.shadow_blur" for e in check(bad)))
+        good = base(texts=[{"text": "T", "start": 0, "end": 2,
+                            "shadow_x": 3, "shadow_y": -2,
+                            "shadow_color": "#112233", "box": True,
+                            "box_radius": 12, "box_color": "white",
+                            "box_opacity": 0.5, "box_padding": 8}],
+                    scrims={"bottom": {"opacity": 0.6, "depth": 0.3}},
+                    caption_max_width=0.9, caption_line_spacing=1.4,
+                    overlays=[{"id": "o", "kind": "image",
+                               "src": "data/test_media/poster.png", "size": 0.3,
+                               "start": 0, "duration": 2, "border_width": 3,
+                               "border_color": "white", "corner_radius": 20,
+                               "shadow_dx": 5, "shadow_dy": 5,
+                               "shadow_blur": 3, "shadow_opacity": 0.5}])
+        self.assertEqual(check(good), [])
+
+    def test_loop136_adversarial_wrap_and_combined(self):
+        # Empty caption text is rejected; a single word wider
+        # than the frame renders with an overflow warning (never
+        # a crash); % + BiDi + wrapping combined renders; scrim
+        # + grading + transition combined renders.
+        import tempfile
+        from agentcut.validate import validate_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-adv-")
+        bg = os.path.join(tmp, "black.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=black:s=360x640", "-frames:v", "1", bg],
+                       check=True)
+
+        def proj(captions=None, **kw):
+            p = {"id": "adv", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image", "src": bg, "duration": 2},
+                           {"id": "b", "kind": "image",
+                            "src": "data/test_media/pattern.jpg", "duration": 2,
+                            "transition": "crossfade", "transition_duration": 0.4,
+                            "grade": "warm"}]}
+            if captions is not None:
+                p["captions"] = captions
+            p.update(kw)
+            return p
+
+        errors, _info = validate_project(
+            proj(captions=[{"text": "", "start": 0, "end": 2}]))
+        self.assertTrue(errors)
+        long_word = "كلمةطويلةجداجداجداجداجداجداجداجداجدا"
+        errors, info = validate_project(
+            proj(captions=[{"text": long_word, "start": 0, "end": 2}]))
+        self.assertEqual(errors, [])
+        self.assertTrue(any(w.get("code") == "text_overflow_warning"
+                            for w in info.get("warnings", [])))
+        out = os.path.join(tmp, "longword.mp4")
+        ok, _info = render_project(proj(captions=[{"text": long_word,
+                                                   "start": 0, "end": 2}]), out)
+        self.assertTrue(ok)
+        pct = ("خصم 80٪ على كل شيء اليوم فقط لا تفوت هذه الفرصة "
+               "الكبيرة جدا والمميزة للجميع")
+        out2 = os.path.join(tmp, "pct.mp4")
+        ok, _info = render_project(
+            proj(captions=[{"text": pct, "start": 0, "end": 2}],
+                 scrims={"bottom": True}), out2)
+        self.assertTrue(ok)
+        probe = ffprobe(out2)
+        self.assertEqual(probe["streams"][0]["pix_fmt"], "yuv420p")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop136_collision_uses_wrapped_box(self):
+        # 1.36.0 estimator: an overlay sitting where the WRAPPED
+        # block's upper lines are warns, while the same overlay
+        # above the block (where the old single-line box would
+        # have been silent) is now caught too.
+        from agentcut.validate import validate_project
+        long_ar = ("هذا نص عربي طويل جدا يحتاج إلى الالتفاف على عدة "
+                   "أسطر لكي يظهر كاملا داخل الإطار")
+        base = {"id": "col", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": "data/test_media/pattern.jpg", "duration": 4}],
+                "captions": [{"text": long_ar, "start": 0, "end": 4}]}
+        # Wrapped block spans roughly y 228..570 at 360x640.
+        hit = dict(base)
+        hit["overlays"] = [{"id": "o", "kind": "image",
+                            "src": "data/test_media/poster.png", "size": 0.3,
+                            "x": 100, "y": 350, "start": 0, "duration": 4}]
+        _e, info = validate_project(hit)
+        self.assertTrue(any(w.get("code") == "layer_text_overlap_warning"
+                            for w in info.get("warnings", [])),
+                        info.get("warnings"))
+        miss = dict(base)
+        miss["overlays"] = [{"id": "o", "kind": "image",
+                             "src": "data/test_media/poster.png", "size": 0.3,
+                             "x": 100, "y": 40, "start": 0, "duration": 4}]
+        _e, info = validate_project(miss)
+        self.assertFalse(any(w.get("code") == "layer_text_overlap_warning"
+                             for w in info.get("warnings", [])),
+                         info.get("warnings"))
 
     def test_loop134_cli_bad_numbers_no_traceback(self):
         # 1.34.0 F7 (CLI): bad numeric CLI arguments print an

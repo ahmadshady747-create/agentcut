@@ -17,7 +17,8 @@ import tempfile
 import uuid
 
 from .validate import (GRADE_PRESETS, XFADE_TRANSITIONS, find_font,
-                       find_font_for_text, probe_media, validate_project)
+                       find_font_for_text, probe_media, validate_project,
+                       wrap_caption_lines)
 
 
 # Text overlays use drawtext textfile=, not text=. A literal apostrophe,
@@ -179,6 +180,38 @@ def _mask_geq(mask):
     """
     return (f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
             f"a='({_mask_factor_expr(mask)})*255'")
+
+
+def _rounded_alpha_factor(radius):
+    """0..1 alpha factor for a rounded rectangle (v1.36.0), as a
+    geq expression in pixel coords (W,H = plane size). Each corner
+    keeps full alpha inside its circle and feathers linearly over
+    2px outside it, so corners are not staircased at full
+    resolution. Used for overlay corner rounding (on the extracted
+    alpha) and for rounded text-box backgrounds (on a colour
+    source). The radius is clamped by validation to half the
+    smaller side, so corner circles never overlap."""
+    r = int(radius)
+
+    def corner(cx, cy, in_x, in_y):
+        dist = f"hypot(X-({cx}),Y-({cy}))"
+        inside = f"({in_x})*({in_y})"
+        return (f"((1-{inside})+{inside}"
+                f"*clip(({r}+2-{dist})/2,0,1))")
+
+    tl = corner(str(r), str(r), f"lt(X,{r})", f"lt(Y,{r})")
+    tr = corner(f"W-{r}", str(r), f"gte(X,W-{r})", f"lt(Y,{r})")
+    bl = corner(str(r), f"H-{r}", f"lt(X,{r})", f"gte(Y,H-{r})")
+    br = corner(f"W-{r}", f"H-{r}", f"gte(X,W-{r})", f"gte(Y,H-{r})")
+    return f"({tl})*({tr})*({bl})*({br})"
+
+
+def _ff_color(color):
+    """FFmpeg colour literal for a validated colour: named colours
+    pass through, #RRGGBB becomes 0xRRGGBB."""
+    if isinstance(color, str) and color.startswith("#"):
+        return "0x" + color[1:]
+    return color
 
 
 def _scale_part(fit, width, height):
@@ -664,6 +697,38 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             filters.append(f"[{acur_chain}][a{i}]concat=n=2:v=0:a=1[ca{i}]")
             acur_chain = f"ca{i}"
             cur_dur_a += dur
+    # Gradient scrims (v1.36.0): optional project-level top/bottom
+    # black gradients, the standard Shorts readability technique.
+    # A scrim is a black colour source whose alpha ramps from full
+    # opacity at the frame edge to transparent over `depth` of the
+    # height (geq, same alpha-expression pattern as the mask geq).
+    # Scrims sit OVER the clips and UNDER overlays and texts (they
+    # are applied here, before both), so text over a bright panel
+    # stays readable without dimming the middle of the frame.
+    # Default off: scrims absent (or false) changes nothing.
+    scrims = project.get("scrims") or {}
+    if isinstance(scrims, dict):
+        for _side in ("top", "bottom"):
+            _sv = scrims.get(_side)
+            if not _sv:
+                continue
+            if _sv is True:
+                _op, _depth = 0.6, 0.35
+            else:
+                _op = float(_sv.get("opacity", 0.6))
+                _depth = float(_sv.get("depth", 0.35))
+            _dpx = max(1, int(height * _depth))
+            if _side == "bottom":
+                _aexpr = f"clip((Y-(H-{_dpx}))/{_dpx},0,1)*255*{_op}"
+            else:
+                _aexpr = f"clip(({_dpx}-Y)/{_dpx},0,1)*255*{_op}"
+            filters.append(
+                f"color=c=black:s={width}x{height}:r={fps},format=rgba,"
+                f"geq=r='0':g='0':b='0':a='{_aexpr}'[scrim{_side}]")
+            filters.append(
+                f"[{vcur_chain}][scrim{_side}]overlay=0:0:"
+                f"eof_action=pass[vscrim{_side}]")
+            vcur_chain = f"vscrim{_side}"
     # Overlays (Loop 5 round 1): picture-in-picture tracks above the
     # main timeline. Each overlay is scaled to a fraction of the
     # output width, delayed to its timeline start, and composited
@@ -797,6 +862,29 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 chain += f",colorchannelmixer=aa={float(ov['opacity'])}"
             chain += f",setpts=PTS+{abs_start}/TB[ov{si}]"
             filters.append(chain)
+        # Overlay dressing (v1.36.0): optional border, rounded
+        # corners and drop shadow, all default off so old overlays
+        # render identically. Border is drawn first so the
+        # rounding mask rounds the border corners too; the mask
+        # uses the same alphaextract/geq/alphamerge pattern as the
+        # chroma-key intersection. Dressing applies to the
+        # setpts-shifted stream, so timing is untouched.
+        ov_label = f"ov{si}"
+        bw_dress = int(ov.get("border_width", 0) or 0)
+        if bw_dress > 0:
+            filters.append(
+                f"[{ov_label}]drawbox=x=0:y=0:w=iw:h=ih:"
+                f"color={_ff_color(ov.get('border_color', 'black'))}:"
+                f"t={bw_dress}[ovb{si}]")
+            ov_label = f"ovb{si}"
+        cr_dress = int(ov.get("corner_radius", 0) or 0)
+        if cr_dress > 0:
+            filters.append(f"[{ov_label}]split=2[ovdrgb{si}][ovdkey{si}]")
+            filters.append(
+                f"[ovdkey{si}]alphaextract,"
+                f"geq=lum='{_rounded_alpha_factor(cr_dress)}*lum(X,Y)'[ovdm{si}]")
+            filters.append(f"[ovdrgb{si}][ovdm{si}]alphamerge[ovdr{si}]")
+            ov_label = f"ovdr{si}"
         if kfs:
             # Smooth position: overlay x/y expressions use main
             # timeline time t (verified: overlay honours t).
@@ -806,8 +894,32 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             px, py = OVERLAY_POS[ov.get("position", "bottom_right")]
             x_expr = str(ov["x"]) if "x" in ov else px
             y_expr = str(ov["y"]) if "y" in ov else py
+        # Drop shadow: a black, blurred copy of the dressed stream
+        # composited underneath at an offset. Active only when an
+        # offset or a blur is set (and opacity > 0); setting only
+        # shadow_opacity does nothing, by design — see validation.
+        sh_dx = int(ov.get("shadow_dx", 0) or 0)
+        sh_dy = int(ov.get("shadow_dy", 0) or 0)
+        sh_blur = float(ov.get("shadow_blur", 0) or 0)
+        sh_op = float(ov.get("shadow_opacity", 0.5))
+        sh_active = (sh_dx != 0 or sh_dy != 0 or sh_blur > 0) and sh_op > 0
+        if sh_active:
+            filters.append(f"[{ov_label}]split=2[ovm{si}][ovsh{si}]")
+            sh_chain = f"[ovsh{si}]lutrgb=r=0:g=0:b=0"
+            if sh_blur > 0:
+                sh_chain += f",gblur=sigma={sh_blur}"
+            if sh_op < 1.0:
+                sh_chain += f",colorchannelmixer=aa={sh_op}"
+            sh_chain += f"[ovshb{si}]"
+            filters.append(sh_chain)
+            filters.append(
+                f"[{vcur}][ovshb{si}]overlay="
+                f"x='({x_expr}){sh_dx:+d}':y='({y_expr}){sh_dy:+d}':"
+                f"eof_action=pass:enable='between(t,{abs_start},{abs_end})'[vsh{si}]")
+            vcur = f"vsh{si}"
+            ov_label = f"ovm{si}"
         filters.append(
-            f"[{vcur}][ov{si}]overlay=x='{x_expr}':y='{y_expr}':"
+            f"[{vcur}][{ov_label}]overlay=x='{x_expr}':y='{y_expr}':"
             f"eof_action=pass:enable='between(t,{abs_start},{abs_end})'[vov{si}]")
         vcur = f"vov{si}"
     # Text overlays, then captions, on the concatenated video.
@@ -853,10 +965,53 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     render_items.append((_sub, _is_cap))
                 continue
         render_items.append((_item, _is_cap))
+    # Caption wrapping (v1.36.0): each caption item becomes one
+    # item per wrapped line (same window, styling and timing).
+    # Lines are wrapped on the LOGICAL text; the BiDi display
+    # transform is applied per line later, at textfile write, so
+    # word order stays correct. Only y changes per line: wrapped
+    # blocks stack upward from the old single-line top (bottom
+    # positions and the default), downward from the top (top
+    # positions), or centred (center). Single-line captions get
+    # no _wrap_y key and render exactly as before.
+    cap_maxw = float(project.get("caption_max_width", 0.9))
+    cap_spacing = float(project.get("caption_line_spacing", 1.35))
+    wrapped_items = []
+    for _item, _is_cap in render_items:
+        if not _is_cap:
+            wrapped_items.append((_item, _is_cap))
+            continue
+        _size = float(_item.get("size", 36))
+        _lines = wrap_caption_lines(str(_item["text"]), _size, width * cap_maxw)
+        if len(_lines) <= 1:
+            wrapped_items.append((_item, _is_cap))
+            continue
+        _lh = _size * cap_spacing
+        _pos = _item.get("position")
+        for _li, _ln in enumerate(_lines):
+            _sub = dict(_item)
+            _sub["text"] = _ln
+            if _pos in ("top_left", "top_center", "top_right"):
+                _sub["_wrap_y"] = 40 + _li * _lh
+            elif _pos in ("bottom_left", "bottom_center", "bottom_right"):
+                _sub["_wrap_y"] = (height - 40 - _size * 1.4) - (len(_lines) - 1 - _li) * _lh
+            elif _pos == "center":
+                _block_h = (len(_lines) - 1) * _lh + _size * 1.4
+                _sub["_wrap_y"] = (height - _block_h) / 2 + _li * _lh
+            else:
+                _sub["_wrap_y"] = (height - 120) - (len(_lines) - 1 - _li) * _lh
+            wrapped_items.append((_sub, _is_cap))
+    render_items = wrapped_items
     for item, is_caption in render_items:
         size = item.get("size", 36 if is_caption else 48)
         if is_caption:
-            if item.get("position"):
+            if "_wrap_y" in item:
+                if item.get("position"):
+                    x_expr, _ = POS_MAP[item["position"]]
+                else:
+                    x_expr = "(w-text_w)/2"
+                y_expr = str(item["_wrap_y"])
+            elif item.get("position"):
                 x_expr, y_expr = POS_MAP[item["position"]]
             else:
                 x_expr = "(w-text_w)/2"
@@ -911,6 +1066,23 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if isinstance(sc, str) and sc.startswith("#"):
                 sc = "0x" + sc[1:]
             stroke_part = f":borderw={stroke}:bordercolor={sc}"
+        # Text shadow (v1.36.0): drawtext shadowx/shadowy. When
+        # neither axis is set, captions get a subtle default
+        # shadow (2,2) so they read over bright panels, while
+        # plain texts default to no shadow. Setting either axis
+        # takes over both (the missing axis reads as 0), so
+        # shadow_x=0 alone disables the caption default.
+        if "shadow_x" in item or "shadow_y" in item:
+            sx = int(item.get("shadow_x", 0))
+            sy = int(item.get("shadow_y", 0))
+        elif is_caption:
+            sx, sy = 2, 2
+        else:
+            sx, sy = 0, 0
+        shadow_part = ""
+        if sx or sy:
+            shadow_part = (f":shadowcolor={_ff_color(item.get('shadow_color', 'black'))}"
+                           f":shadowx={sx}:shadowy={sy}")
         text_path = os.path.join(text_dir, f"text_{overlay_index}.txt")
         with open(text_path, "w", encoding="utf-8") as fh:
             # BiDi display form (v1.33.0): stored text stays in
@@ -934,9 +1106,74 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 f"{str(item['text'])[:40]!r}; Arabic text needs Noto Naskh "
                 "Arabic, Latin text needs DejaVuSans (bundled fonts/ or "
                 "$AGENTCUT_FONT_DIR)")
+        # Rounded text background box (v1.36.0): a generated
+        # rounded-rect colour source overlaid UNDER the text, in
+        # place of drawtext's rectangular box. Geometry mirrors
+        # _text_box (same width estimate, same preset positions)
+        # so the pill hugs the text; the radius clamps to half
+        # the smaller pill side. Validation forbids combining
+        # this with animation or fades (the pill would not move
+        # or fade with the text). Wrapped caption lines each get
+        # their own pill.
+        box_radius = int(item.get("box_radius", 0) or 0)
+        if box_radius > 0:
+            box_part = ":box=0"
+            est_w = max(10.0, len(str(item["text"])) * float(size) * 0.6)
+            est_h = float(size) * 1.4
+            pad = int(item.get("box_padding", 12))
+            bw = int(est_w + 2 * pad + 0.5)
+            bh = int(est_h + 2 * pad + 0.5)
+            br = min(box_radius, bw // 2, bh // 2)
+            pos = item.get("position")
+            if is_caption:
+                if "_wrap_y" in item:
+                    top = float(item["_wrap_y"])
+                elif pos in ("top_left", "top_center", "top_right"):
+                    top = 40.0
+                elif pos in ("bottom_left", "bottom_center", "bottom_right"):
+                    top = height - est_h - 40.0
+                elif pos == "center":
+                    top = (height - est_h) / 2
+                else:
+                    top = float(height - 120)
+                if pos in ("top_left", "bottom_left"):
+                    left = 40.0
+                elif pos in ("top_right", "bottom_right"):
+                    left = width - est_w - 40.0
+                else:
+                    left = (width - est_w) / 2
+            else:
+                if pos in ("top_left", "top_center", "top_right"):
+                    top = 40.0
+                elif pos in ("bottom_left", "bottom_center", "bottom_right"):
+                    top = height - est_h - 40.0
+                elif pos == "center":
+                    top = (height - est_h) / 2
+                else:
+                    top = float(item.get("y", 100))
+                if pos in ("top_left", "bottom_left"):
+                    left = 40.0
+                elif pos in ("top_right", "bottom_right"):
+                    left = width - est_w - 40.0
+                elif pos:
+                    left = (width - est_w) / 2
+                else:
+                    xv = item.get("x", "center")
+                    left = (width - est_w) / 2 if xv == "center" else float(xv)
+            bx = max(0, int(left - pad))
+            by = max(0, int(top - pad))
+            bop = float(item.get("box_opacity", 0.5))
+            filters.append(
+                f"color=c={_ff_color(item.get('box_color', 'black'))}:s={bw}x{bh}:r={fps},"
+                f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                f"a='{_rounded_alpha_factor(br)}*255*{bop}'[box{overlay_index}]")
+            filters.append(
+                f"[{vcur}][box{overlay_index}]overlay=x={bx}:y={by}:"
+                f"eof_action=pass:enable='between(t,{start},{end})'[vbox{overlay_index}]")
+            vcur = f"vbox{overlay_index}"
         filters.append(
             f"[{vcur}]drawtext=fontfile={item_font}:textfile={text_path}:"
-            f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}:"
+            f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}{shadow_part}:"
             f"x='{x_out}':y={y_expr}:expansion=none:"
             f"enable='between(t,{start},{end})'[vout{overlay_index}]")
         vcur = f"vout{overlay_index}"

@@ -1,3 +1,64 @@
+## 1.36.0 — Text & graphics polish (wrapped captions, shadows, scrims, overlay dressing, rounded text boxes)
+
+User order 2026-10-29: improve the writing and the drawing
+inside the rendered video — readability over bright panels,
+clipped long captions, hard rectangular boxes, flat overlays.
+All deterministic, no AI, no new dependencies. Tests 86/86
+(77 prior + 9 new) in the main tree and in a fresh copy.
+Example: examples/text-polish.json.
+- Wrapped captions (headline fix): a caption cue wider than
+  the frame is automatically word-wrapped into centred lines
+  that fit within `caption_max_width` (default 0.9 of frame
+  width), stacked upward from the caption baseline (top
+  presets stack downward, center blocks centre), at
+  `caption_line_spacing` (default 1.35). Wrapping happens on
+  the logical text, then the existing BiDi transform applies
+  per line, so Arabic words stay whole and joined and read in
+  the correct order; cue timing is unchanged. Single-line
+  captions render exactly as before (frame-proven identical
+  across max-width settings). This resolves the root cause
+  behind the 1.34.0 overflow warning for captions; the warning
+  still fires for the one case wrapping cannot fix — a single
+  word wider than the frame, which stays whole and clips
+  (documented fallback, never a crash). The collision
+  estimator now uses the wrapped block, so an overlay crossing
+  a wrapped line warns.
+- Text readability styling: texts/captions accept `shadow_x` /
+  `shadow_y` (-20..20) and `shadow_color` (named or #RRGGBB),
+  alongside the existing `stroke`/`stroke_color` and `box`.
+  Captions get a subtle default shadow (2,2 black) so they
+  read over bright panels — INTENTIONAL appearance change vs
+  1.35.0: caption pixels now carry a 2px shadow where they
+  did not; setting either shadow axis takes over both, so
+  shadow_x=0 alone disables the caption default. Plain texts
+  default to no shadow.
+- Scrim gradients: optional project-level `scrims: {top,
+  bottom}` — each side true (defaults opacity 0.6, depth
+  0.35 of frame height) or {opacity 0..1, depth 0.05..0.6}.
+  A black gradient fading to transparent, rendered with a
+  geq alpha ramp, over the clips and under overlays and
+  texts. Default off, so old projects render identically.
+- Overlay dressing: optional per-overlay `border_width`
+  (0..20) + `border_color`, `corner_radius` (0..200, rejected
+  above half the smaller displayed side), and a drop shadow
+  (`shadow_dx`/`shadow_dy` -100..100, `shadow_blur` 0..30,
+  `shadow_opacity` 0..1). Border is drawn first so rounding
+  rounds the border too; the shadow is a black blurred copy
+  composited underneath at an offset. Shadow is active only
+  when an offset or a blur is set — setting only
+  shadow_opacity does nothing. All default off.
+- Rounded text background boxes: texts/captions accept
+  `box_radius` (0..100), `box_color` (default black) and
+  `box_padding` (default 12), plus `box_opacity` (default
+  0.5). A generated rounded-rect colour source (geq alpha
+  mask, same corner math as overlay rounding) is overlaid
+  under the text in place of drawtext's rectangular box,
+  sized from the same width estimate the validator uses.
+  Requires `box: true`; rejected with animation or fades
+  (the pill would not move or fade with the text). Wrapped
+  caption lines each get their own pill. INTENTIONAL
+  appearance change only for texts that set box_radius.
+
 ## 1.35.0 — On-device rendering (Termux render packs + portable fonts)
 
 User order 2026-10-29: make AgentCut work on the user's own

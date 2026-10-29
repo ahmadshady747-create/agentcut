@@ -1,0 +1,94 @@
+{
+  "id": "text-polish",
+  "version": 1,
+  "title": "AgentCut 1.36.0 text & graphics polish",
+  "output": {
+    "width": 360,
+    "height": 640,
+    "fps": 30
+  },
+  "clips": [
+    {
+      "id": "a",
+      "kind": "image",
+      "src": "data/test_media/pattern.jpg",
+      "duration": 3,
+      "grade": "warm"
+    },
+    {
+      "id": "b",
+      "kind": "image",
+      "src": "data/test_media/poster.png",
+      "duration": 3,
+      "transition": "crossfade",
+      "transition_duration": 0.4
+    }
+  ],
+  "chapters": [
+    {
+      "title": "Bright panel",
+      "start": 0
+    },
+    {
+      "title": "Poster",
+      "start": 2.6
+    }
+  ],
+  "scrims": {
+    "bottom": true
+  },
+  "texts": [
+    {
+      "text": "عنوان واضح",
+      "start": 0,
+      "end": 5.6,
+      "size": 48,
+      "color": "yellow",
+      "shadow_x": 3,
+      "shadow_y": 3,
+      "shadow_color": "black",
+      "box": true,
+      "box_radius": 20,
+      "box_color": "black",
+      "box_opacity": 0.5,
+      "box_padding": 14
+    },
+    {
+      "text": "80٪ هواء!",
+      "start": 1,
+      "end": 3,
+      "size": 54,
+      "color": "yellow",
+      "animation": "pop",
+      "animation_duration": 0.8,
+      "shadow_x": 2,
+      "shadow_y": 2,
+      "y": 180
+    }
+  ],
+  "captions": [
+    {
+      "text": "هذا نص طويل يلتف على عدة أسطر كاملة داخل الإطار",
+      "start": 0,
+      "end": 5.6
+    }
+  ],
+  "overlays": [
+    {
+      "id": "badge",
+      "kind": "image",
+      "src": "data/test_media/board.png",
+      "size": 0.35,
+      "position": "top_right",
+      "start": 0.5,
+      "duration": 5.1,
+      "border_width": 3,
+      "border_color": "white",
+      "corner_radius": 24,
+      "shadow_dx": 6,
+      "shadow_dy": 6,
+      "shadow_blur": 5,
+      "shadow_opacity": 0.6
+    }
+  ]
+}

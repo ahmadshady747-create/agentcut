@@ -359,7 +359,41 @@ def _validate_effects(obj, errors, oid, field_prefix):
                           fix="set vignette to true for a darkened-corner effect, or remove it"))
 
 
-def _text_box(item, is_caption, width, height, total):
+def wrap_caption_lines(text, size, max_width_px):
+    """Word-wrap a caption's LOGICAL text into lines fitting
+    max_width_px (v1.36.0, the headline caption fix).
+
+    Greedy word packing on whitespace; words are never split, so
+    Arabic words stay whole and joined (BiDi is applied per line
+    later, at render time, by bidi_display_text — wrapping the
+    logical text first is what keeps word order correct). A single
+    word wider than max_width_px stays on its own line: it will
+    still clip, and the overflow warning still fires for it — that
+    fallback is documented, not hidden. Width uses the same
+    0.6 x size per character estimate as _text_box, so the
+    estimator and the renderer agree. Returns at least one line.
+    """
+    words = str(text).split()
+    if not words:
+        return [str(text)]
+    lines, cur, cur_w = [], "", 0.0
+    space_w = float(size) * 0.6
+    for word in words:
+        word_w = max(10.0, len(word) * float(size) * 0.6)
+        new_w = word_w if not cur else cur_w + space_w + word_w
+        if cur and new_w > max_width_px:
+            lines.append(cur)
+            cur, cur_w = word, word_w
+        else:
+            cur = (cur + " " + word) if cur else word
+            cur_w = new_w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _text_box(item, is_caption, width, height, total,
+              line_spacing=1.35, max_width_frac=0.9):
     """Approximate on-screen box (x, y, w, h) for a text/caption item.
 
     APPROXIMATION, documented honestly: the true drawtext box
@@ -367,13 +401,26 @@ def _text_box(item, is_caption, width, height, total):
     measure. Width is estimated as len(text) x size x 0.6 and height
     as size x 1.4; positions mirror render.py (numeric x/y, the
     POS_MAP presets, centred texts, captions at height-120 by
-    default). The check is a warning, never an error, precisely
-    because these boxes are estimates.
+    default). Captions are wrapped (v1.36.0): the box spans the
+    wrapped block — width is the widest line, height covers all
+    lines at line_spacing — so collision checks see the real
+    wrapped block, not the old single-line box. The check is a
+    warning, never an error, precisely because these boxes are
+    estimates.
     """
     text = str(item.get("text", ""))
     size = float(item.get("size", 36 if is_caption else 48))
-    est_w = max(10.0, len(text) * size * 0.6)
-    est_h = size * 1.4
+    cap_lines = wrap_caption_lines(text, size, width * max_width_frac) \
+        if is_caption else [text]
+    if is_caption:
+        est_w = max(10.0, max(len(ln) * size * 0.6 for ln in cap_lines))
+        if len(cap_lines) > 1:
+            est_h = (len(cap_lines) - 1) * size * line_spacing + size * 1.4
+        else:
+            est_h = size * 1.4
+    else:
+        est_w = max(10.0, len(text) * size * 0.6)
+        est_h = size * 1.4
     pos = item.get("position")
     if pos:
         presets = {
@@ -387,7 +434,11 @@ def _text_box(item, is_caption, width, height, total):
         }
         x, y = presets[pos]
     elif is_caption:
-        x, y = (width - est_w) / 2, float(height - 120)
+        # Wrapped block, stacked upward: the LAST line keeps the
+        # old single-line top (height-120), earlier lines rise
+        # above it — exactly like render.py.
+        x, y = (width - est_w) / 2, float(
+            height - 120 - (len(cap_lines) - 1) * size * line_spacing)
     else:
         xv = item.get("x", "center")
         x = (width - est_w) / 2 if xv == "center" else float(xv)
@@ -488,11 +539,23 @@ def check_layer_text_overlap(project, info):
             texts.append((item["text"], float(item.get("start", 0)),
                           float(item.get("end", total)),
                           _text_box(item, False, width, height, total)))
+    cap_spacing = project.get("caption_line_spacing", 1.35)
+    cap_maxw = project.get("caption_max_width", 0.9)
+    try:
+        cap_spacing = float(cap_spacing)
+    except (TypeError, ValueError):
+        cap_spacing = 1.35
+    try:
+        cap_maxw = float(cap_maxw)
+    except (TypeError, ValueError):
+        cap_maxw = 0.9
     for cap in (info.get("captions") or []):
         if isinstance(cap, dict) and isinstance(cap.get("text"), str):
             texts.append((cap["text"], float(cap.get("start", 0)),
                           float(cap.get("end", total)),
-                          _text_box(cap, True, width, height, total)))
+                          _text_box(cap, True, width, height, total,
+                                    line_spacing=cap_spacing,
+                                    max_width_frac=cap_maxw)))
     warnings = []
     for ov in (info.get("overlays") or []):
         o_start = float(ov["start"])
@@ -1094,6 +1157,81 @@ def validate_project(project):
         _validate_effects(ov, errors, oid, "overlays")
         _ov_cm = _validate_chroma_mask(ov, errors, oid, "overlays")
         rov.update(_ov_cm)
+        # Overlay dressing (v1.36.0): optional border, rounded
+        # corners and drop shadow, all default off so old overlays
+        # render identically. Fields pass through rov (it starts
+        # as a copy of ov), so validation here is the gate.
+        if "border_width" in ov:
+            try:
+                _bw = int(ov["border_width"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "overlay border_width must be an integer", field="overlays.border_width", clip_id=oid,
+                                  fix="set border_width to 0 (no border) or a width 1..20"))
+                _bw = None
+            if _bw is not None and not 0 <= _bw <= 20:
+                errors.append(err("INVALID_SCHEMA", "overlay border_width must be 0..20", field="overlays.border_width", clip_id=oid,
+                                  fix="set border_width between 0 and 20 pixels"))
+        _bcol = ov.get("border_color", "black")
+        if not (isinstance(_bcol, str) and (_bcol in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", _bcol))):
+            errors.append(err("INVALID_SCHEMA", "overlay border_color must be a #RRGGBB hex value or a named colour", field="overlays.border_color", clip_id=oid,
+                              fix="set border_color to a named colour or #RRGGBB, e.g. white"))
+        if "corner_radius" in ov:
+            try:
+                _cr = int(ov["corner_radius"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "overlay corner_radius must be an integer", field="overlays.corner_radius", clip_id=oid,
+                                  fix="set corner_radius to 0 (square corners) or a radius 1..200"))
+                _cr = None
+            if _cr is not None:
+                if not 0 <= _cr <= 200:
+                    errors.append(err("INVALID_SCHEMA", "overlay corner_radius must be 0..200", field="overlays.corner_radius", clip_id=oid,
+                                      fix="set corner_radius between 0 and 200 pixels"))
+                else:
+                    # The rounded mask is a circle test per corner,
+                    # so a radius larger than half the smaller
+                    # displayed side would fold corners over each
+                    # other. Checked against the base size (for
+                    # varying-scale keyframes the base size is the
+                    # documented approximation; a smaller scale
+                    # only softens the corners into a blob, never
+                    # a crash).
+                    _pw, _ph = info_p.get("width") or width, info_p.get("height") or height
+                    _bw_disp = float(size) * width
+                    _bh_disp = _bw_disp * (_ph / _pw) if _pw else _bw_disp
+                    if _cr > min(_bw_disp, _bh_disp) / 2:
+                        errors.append(err("INVALID_SCHEMA", f"overlay corner_radius {_cr} exceeds half the smaller displayed side ({min(_bw_disp, _bh_disp) / 2:.0f}px)", field="overlays.corner_radius", clip_id=oid,
+                                          fix="reduce corner_radius, or increase overlay size"))
+        for _axis in ("shadow_dx", "shadow_dy"):
+            if _axis in ov:
+                try:
+                    _sv = int(ov[_axis])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"overlay {_axis} must be an integer", field=f"overlays.{_axis}", clip_id=oid,
+                                      fix=f"set {_axis} to a pixel offset -100..100"))
+                    _sv = None
+                if _sv is not None and not -100 <= _sv <= 100:
+                    errors.append(err("INVALID_SCHEMA", f"overlay {_axis} must be -100..100", field=f"overlays.{_axis}", clip_id=oid,
+                                      fix=f"set {_axis} between -100 and 100 pixels"))
+        if "shadow_blur" in ov:
+            try:
+                _sb = float(ov["shadow_blur"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "overlay shadow_blur must be a number", field="overlays.shadow_blur", clip_id=oid,
+                                  fix="set shadow_blur to a blur sigma 0..30"))
+                _sb = None
+            if _sb is not None and not 0.0 <= _sb <= 30.0:
+                errors.append(err("INVALID_SCHEMA", "overlay shadow_blur must be 0..30", field="overlays.shadow_blur", clip_id=oid,
+                                  fix="set shadow_blur between 0 and 30"))
+        if "shadow_opacity" in ov:
+            try:
+                _so = float(ov["shadow_opacity"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "overlay shadow_opacity must be a number", field="overlays.shadow_opacity", clip_id=oid,
+                                  fix="set shadow_opacity between 0 (invisible) and 1 (opaque)"))
+                _so = None
+            if _so is not None and not 0.0 <= _so <= 1.0:
+                errors.append(err("INVALID_SCHEMA", "overlay shadow_opacity must be 0..1", field="overlays.shadow_opacity", clip_id=oid,
+                                  fix="set shadow_opacity between 0 and 1"))
         # Keyframes (Loop 5 round 2): animate overlay position, scale
         # and opacity over time. Times are relative to the overlay
         # start, in seconds. Missing fields inherit the previous
@@ -1306,6 +1444,77 @@ def validate_project(project):
             if not (isinstance(sc, str) and (sc in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", sc))):
                 errors.append(err("INVALID_SCHEMA", "stroke_color must be a #RRGGBB hex value or a named colour", field=label + ".stroke_color",
                                   fix="set stroke_color to a named colour or #RRGGBB, e.g. black"))
+            # Text shadow (v1.36.0): drawtext shadowx/shadowy. Flat
+            # fields mirroring stroke/stroke_color. Captions get a
+            # subtle default shadow at render time (see render.py);
+            # an explicit 0 disables it.
+            for _axis in ("shadow_x", "shadow_y"):
+                if _axis in item:
+                    try:
+                        _sv = int(item[_axis])
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", f"text {_axis} must be an integer", field=label + f".{_axis}",
+                                          fix=f"set {_axis} to a pixel offset -20..20"))
+                        _sv = None
+                    if _sv is not None and not -20 <= _sv <= 20:
+                        errors.append(err("INVALID_SCHEMA", f"text {_axis} must be -20..20", field=label + f".{_axis}",
+                                          fix=f"set {_axis} between -20 and 20 pixels"))
+            _shc = item.get("shadow_color", "black")
+            if not (isinstance(_shc, str) and (_shc in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", _shc))):
+                errors.append(err("INVALID_SCHEMA", "shadow_color must be a #RRGGBB hex value or a named colour", field=label + ".shadow_color",
+                                  fix="set shadow_color to a named colour or #RRGGBB, e.g. black"))
+            # Rounded text background boxes (v1.36.0): a generated
+            # rounded-rect PNG under the text, sized from the same
+            # estimate as the collision boxes. Constraints, by
+            # design: the box is static, so it cannot combine with
+            # animation (the text moves but the box would not) or
+            # fades (the text fades but the box would not), and it
+            # replaces the rectangular drawtext box (box must stay
+            # true). Wrapped caption lines each get their own pill.
+            _br = item.get("box_radius", 0)
+            try:
+                _br = int(_br)
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "box_radius must be an integer", field=label + ".box_radius",
+                                  fix="set box_radius to 0 (rectangular box) or a radius 1..100"))
+                _br = 0
+            if _br < 0 or _br > 100:
+                errors.append(err("INVALID_SCHEMA", "box_radius must be 0..100", field=label + ".box_radius",
+                                  fix="set box_radius between 0 and 100 pixels"))
+            if _br > 0:
+                if item.get("box", True) is False:
+                    errors.append(err("INVALID_SCHEMA", "box_radius needs box enabled (it replaces the rectangular box)", field=label + ".box_radius",
+                                      fix="remove box: false, or set box_radius to 0"))
+                if anim is not None:
+                    errors.append(err("INVALID_SCHEMA", "box_radius cannot combine with animation (the box would not move with the text)", field=label + ".box_radius",
+                                      fix="remove animation, or set box_radius to 0"))
+                if fi > 0 or fo > 0:
+                    errors.append(err("INVALID_SCHEMA", "box_radius cannot combine with fade_in/fade_out (the box would not fade with the text)", field=label + ".box_radius",
+                                      fix="remove fade_in/fade_out, or set box_radius to 0"))
+            _bc = item.get("box_color", "black")
+            if not (isinstance(_bc, str) and (_bc in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", _bc))):
+                errors.append(err("INVALID_SCHEMA", "box_color must be a #RRGGBB hex value or a named colour", field=label + ".box_color",
+                                  fix="set box_color to a named colour or #RRGGBB, e.g. black"))
+            if "box_opacity" in item:
+                try:
+                    _bo = float(item["box_opacity"])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "box_opacity must be a number", field=label + ".box_opacity",
+                                      fix="set box_opacity between 0 (transparent) and 1 (opaque)"))
+                    _bo = None
+                if _bo is not None and not 0.0 <= _bo <= 1.0:
+                    errors.append(err("INVALID_SCHEMA", "box_opacity must be 0..1", field=label + ".box_opacity",
+                                      fix="set box_opacity between 0 and 1"))
+            if "box_padding" in item:
+                try:
+                    _bp = int(item["box_padding"])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "box_padding must be an integer", field=label + ".box_padding",
+                                      fix="set box_padding to a pixel count 0..40"))
+                    _bp = None
+                if _bp is not None and not 0 <= _bp <= 40:
+                    errors.append(err("INVALID_SCHEMA", "box_padding must be 0..40", field=label + ".box_padding",
+                                      fix="set box_padding between 0 and 40 pixels"))
             color = item.get("color", "white")
             if not (isinstance(color, str) and (color in TEXT_COLORS or re.fullmatch(r"#[0-9a-fA-F]{6}", color))):
                 errors.append(err("INVALID_SCHEMA", "text color must be a #RRGGBB hex value or one of: " + ", ".join(sorted(TEXT_COLORS)), field=label + ".color"))
@@ -1374,6 +1583,61 @@ def validate_project(project):
     caption_position = project.get("caption_position")
     if caption_position is not None and caption_position not in TEXT_POSITIONS:
         errors.append(err("INVALID_SCHEMA", "caption_position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field="caption_position"))
+    # Caption wrapping controls (v1.36.0): cues wider than
+    # caption_max_width (fraction of frame width) word-wrap into
+    # centred lines stacked at caption_line_spacing x size.
+    # Defaults 0.9 / 1.35 keep old single-line renders identical.
+    if "caption_max_width" in project:
+        try:
+            _cmw = float(project["caption_max_width"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "caption_max_width must be a number", field="caption_max_width",
+                              fix="set caption_max_width to a fraction of the frame width, e.g. 0.9"))
+            _cmw = None
+        if _cmw is not None and not 0.5 <= _cmw <= 1.0:
+            errors.append(err("INVALID_SCHEMA", "caption_max_width must be 0.5..1.0", field="caption_max_width",
+                              fix="set caption_max_width between 0.5 and 1.0 (0.9 = 90% of the frame width)"))
+    if "caption_line_spacing" in project:
+        try:
+            _cls = float(project["caption_line_spacing"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "caption_line_spacing must be a number", field="caption_line_spacing",
+                              fix="set caption_line_spacing to a line-height multiplier, e.g. 1.35"))
+            _cls = None
+        if _cls is not None and not 1.0 <= _cls <= 2.5:
+            errors.append(err("INVALID_SCHEMA", "caption_line_spacing must be 1.0..2.5", field="caption_line_spacing",
+                              fix="set caption_line_spacing between 1.0 (tight) and 2.5 (loose)"))
+    # Gradient scrims (v1.36.0): optional project-level top/bottom
+    # black gradients, over clips and under texts/captions/overlays
+    # (see render.py). Each side is false (off), true (defaults),
+    # or {"opacity": 0..1, "depth": 0..0.6 (fraction of height)}.
+    # Default off, so old projects render identically.
+    scrims = project.get("scrims")
+    if scrims is not None:
+        if not isinstance(scrims, dict):
+            errors.append(err("INVALID_SCHEMA", "scrims must be an object with optional top/bottom entries", field="scrims",
+                              fix="set scrims to e.g. {\"bottom\": {\"opacity\": 0.6, \"depth\": 0.35}} or remove it"))
+        else:
+            for _side in ("top", "bottom"):
+                if _side not in scrims:
+                    continue
+                _sv = scrims[_side]
+                if isinstance(_sv, bool):
+                    continue
+                if not isinstance(_sv, dict):
+                    errors.append(err("INVALID_SCHEMA", f"scrims.{_side} must be true, false, or an object", field=f"scrims.{_side}",
+                                      fix=f"set scrims.{_side} to true, false, or {{\"opacity\": 0.6, \"depth\": 0.35}}"))
+                    continue
+                for _fname, _lo, _hi in (("opacity", 0.0, 1.0), ("depth", 0.05, 0.6)):
+                    if _fname in _sv:
+                        try:
+                            _fv = float(_sv[_fname])
+                        except (TypeError, ValueError):
+                            errors.append(err("INVALID_SCHEMA", f"scrims.{_side}.{_fname} must be a number", field=f"scrims.{_side}.{_fname}"))
+                            continue
+                        if not _lo <= _fv <= _hi:
+                            errors.append(err("INVALID_SCHEMA", f"scrims.{_side}.{_fname} must be {_lo}..{_hi}", field=f"scrims.{_side}.{_fname}",
+                                              fix=f"set scrims.{_side}.{_fname} between {_lo} and {_hi}"))
     merged_captions = [dict(c) if isinstance(c, dict) else c for c in (project.get("captions") or [])]
     captions_file = project.get("captions_file")
     if captions_file is not None:

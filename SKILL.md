@@ -131,7 +131,7 @@ Crop-fill: clip `fit` is `contain` (default) or `cover` (fill the frame, centre-
 
 Transitions: `none`, `fade`, `crossfade`, plus `wipe_left/right/up/down` and `slide_left/right/up/down` (all 0.5s xfade overlap).
 
-Text styling: `color` (#RRGGBB or named colour), `box` true/false, `size` 8..240, and text `position` presets top_left/top_center/top_right/center/bottom_left/bottom_center/bottom_right (a text `position` overrides its x/y; for overlays the reverse holds — explicit x/y win per axis over a preset).
+Text styling: `color` (#RRGGBB or named colour), `box` true/false, `size` 8..240, and text `position` presets top_left/top_center/top_right/center/bottom_left/bottom_center/bottom_right (a text `position` overrides its x/y; for overlays the reverse holds — explicit x/y win per axis over a preset). Shadow: `shadow_x`/`shadow_y` (-20..20) and `shadow_color`; captions default to a subtle (2,2) black shadow, plain texts to none (setting either axis takes over both). Rounded pill background: `box_radius` (0..100), `box_color`, `box_opacity` (0.5), `box_padding` (12); requires `box: true`, refuses animation and fades. Captions wrap automatically: a cue wider than the frame becomes centred lines within `caption_max_width` (default 0.9) at `caption_line_spacing` (default 1.35), stacked upward from the baseline; logical-text wrapping, BiDi per line, timing unchanged; a single over-wide word stays whole and clips with a warning. Scrims: project `scrims: {top, bottom}`, each `true` or `{opacity, depth}` (defaults 0.6, 0.35); black gradient over clips, under overlays and texts; default off. Example: `examples/text-polish.json`.
 
 Audio fades: track `fade_in`/`fade_out` seconds. Clip speed: video clip `speed` 0.25..4.0 (effective duration = trim / speed).
 
@@ -203,7 +203,12 @@ the main timeline. Give each overlay an id, kind, src, start and
 duration that fit inside the timeline, a size fraction, and a
 position or x/y (explicit x/y win per axis over a preset). A video overlay may set `volume` (default 0.0
 muted) to mix its audio in during its window; volume on an image
-or silent overlay is a validation error. Check the render's
+or silent overlay is a validation error. Dressing (all default
+off): `border_width` (0..20) + `border_color`, `corner_radius`
+(0..200, at most half the smaller displayed side), and a drop
+shadow (`shadow_dx`/`shadow_dy`, `shadow_blur`, `shadow_opacity`) —
+the shadow activates only when an offset or a blur is set.
+Check the render's
 frames at a second inside the overlay window to confirm
 placement; if validation reports an overlay error, follow its
 `fix` hint.

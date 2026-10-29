@@ -162,7 +162,7 @@ Crop-fill: a clip may set `fit` to `contain` (default, pad with black bars) or `
 
 Transitions: `none`, `fade` (to/from black), and xfade transitions with acrossfaded audio (default 0.5s overlap; set `transition_duration` per incoming clip, max 2.0s, less than both clip durations): `crossfade`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `slide_left`, `slide_right`, `slide_up`, `slide_down`.
 
-Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts accept `size` 8..240 pixels, `x` (`center` or >= 0) and `y` (>= 0); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y. Captions must not set x/y (render ignores them — use `position` or `caption_position`).
+Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts accept `size` 8..240 pixels, `x` (`center` or >= 0) and `y` (>= 0); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y. Captions must not set x/y (render ignores them — use `position` or `caption_position`). Texts/captions accept a drop shadow: `shadow_x`/`shadow_y` (-20..20) and `shadow_color` (named or #RRGGBB); captions default to a subtle (2,2) black shadow, plain texts to none — setting either axis takes over both. A rounded background pill replaces the rectangular box: `box_radius` (0..100), `box_color` (default black), `box_opacity` (default 0.5), `box_padding` (default 12); it requires `box: true` and cannot combine with animation or fades.
 
 Loudness: audio tracks accept `loudnorm` (true/false), single-pass normalisation to -16 LUFS before mixing.
 
@@ -170,13 +170,15 @@ Audio fades: tracks accept `fade_in`/`fade_out` in seconds (sum must be less tha
 
 Per-clip filters: a clip may set `brightness` (-1..1), `contrast` (0..2), `saturation` (0..3) or `grayscale` (true/false).
 
-Caption styling: project fields `caption_color`, `caption_size` and `caption_position` are defaults for every caption (including SRT cues, which carry no styling of their own); a caption that sets its own value keeps it.
+Caption styling: project fields `caption_color`, `caption_size` and `caption_position` are defaults for every caption (including SRT cues, which carry no styling of their own); a caption that sets its own value keeps it. Wrapped captions: a cue wider than the frame is automatically word-wrapped into centred lines fitting `caption_max_width` (default 0.9 of frame width) at `caption_line_spacing` (default 1.35), stacked upward from the caption baseline; wrapping is on the logical text with BiDi applied per line, so Arabic words stay whole and joined and timing is unchanged. A single word wider than the frame stays whole and clips with a warning (the documented fallback).
+
+Scrim gradients: project field `scrims` with optional `top`/`bottom` sides — each `true` (opacity 0.6, depth 0.35 of frame height) or `{opacity 0..1, depth 0.05..0.6}`. A black gradient fading to transparent, over the clips and under overlays and texts. Default off.
 
 Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution frame (default: middle of the timeline), or the `poster_frame` MCP tool.
 
 Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
 
-Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text/caption's estimated width exceeds the frame (split it or shrink it). Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
+Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text's estimated width exceeds the frame, or a caption holds a single word wider than the frame (wrappable captions wrap instead of warning; split the text or shrink it). Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
 
 ## Producer: one call, any agent
 
@@ -321,6 +323,18 @@ from the left), `slide_out` (slides out to the right),
 with `animation_duration` in seconds (default 1.0, must fit
 the text window). `stroke` (0..10) and `stroke_color` add an
 outline around the text.
+
+## Text & graphics polish (1.36.0)
+
+See `examples/text-polish.json`: wrapped captions, a bottom
+scrim, a shadowed title with a rounded pill background, a
+pop keyword with shadow, and a bordered/rounded/shadowed
+overlay, in one render. Overlay dressing: overlays accept
+`border_width` (0..20) and `border_color`, `corner_radius`
+(0..200, at most half the smaller displayed side), and a drop
+shadow (`shadow_dx`/`shadow_dy` -100..100, `shadow_blur`
+0..30, `shadow_opacity` 0..1) — the shadow is active only
+when an offset or a blur is set. All dressing defaults off.
 
 ## Export cap and stabilisation
 
