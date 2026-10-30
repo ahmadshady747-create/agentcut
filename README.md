@@ -420,6 +420,61 @@ small explicit weight or they will eat the draw window.
 See `examples/stroke-diagram.json` (chart + basket over
 a board still) and SKILL.md for the full schema.
 
+## One-button board explainer (1.39.0)
+
+`produce_explainer` (MCP tool, or
+`./run.sh produce-explainer <brief.json> <mp4>`) is the
+one call for a finished board explainer: one brief in,
+one video out, no hand-written project.json. The brief
+shape, verbatim:
+
+```json
+{
+  "id": "strawman",
+  "style": "blackboard",
+  "output": {"width": 720, "height": 1280, "fps": 30},
+  "background": "/path/to/board_image.png",
+  "title": "مغالطة رجل القش",
+  "chapters": true,
+  "motion": "gentle",
+  "music": null,
+  "scenes": [
+    {"id": "s1", "title": "ما هي؟",
+     "narration": "/path/voice_s1.mp3", "captions": "/path/s1.srt",
+     "diagram": {"template": "causes", "params": {"rows": 2}, "draw": 3.5, "size": 0.72, "x": 101, "y": 330},
+     "keywords": [{"text": "رجل القش", "start": 5.0, "end": 9.0, "sfx": "pop"}]}
+  ]
+}
+```
+
+Everything is derived, nothing hand-assembled: scene
+clip durations come from ffprobe of the narration audio
+(never from hand-supplied durations); scenes play
+back-to-back in list order and the total is their sum.
+Per-scene SRT cues are scene-relative and are offset by
+the scene start into one merged captions track. A scene
+diagram defaults to the whole scene window (draw defaults
+to min(4s, window)); an explicit diagram start/end is a
+scene-relative offset and must stay inside the scene.
+The brief title stays fixed across the whole video and
+each scene title shows during its scene; keyword texts
+show at their scene-relative windows with the existing
+text SFX mechanism (a keyword may also set `x`, `y`,
+`size`, `color` or `position` to sit above or below its
+diagram instead of at the default spot). `chapters: true` writes one chapter
+per scene title at the scene start. Blackboard style
+turns scrims top+bottom on; `motion: "gentle"` turns
+`default_image_motion` on (gentle Ken Burns ≤1.12x).
+`punch_in` anywhere in the brief is rejected with a fix
+hint — gentle motion only, zero punch-ins. Optional
+`music` adds a music track with 12 dB ducking windows
+equal to the narration spans. Structured errors with fix
+hints cover missing narration/captions files, narration
+with no measurable duration, a diagram outside its scene
+window, and unknown templates. A runnable example with
+repo media only: `examples/one-button-explainer.json`
+(+ `examples/one-button-explainer.srt`).
+
 ## Export cap and stabilisation
 
 Outputs go up to 3840 wide (and tall). A video clip may set

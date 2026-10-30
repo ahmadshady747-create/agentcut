@@ -1,3 +1,38 @@
+## 1.39.0 — One-button board explainer (produce_explainer)
+
+New MCP tool `produce_explainer` + CLI
+`./run.sh produce-explainer <brief.json> <mp4>`: one
+brief in, one finished board video out, no
+hand-written project.json. The brief is exactly the
+shape in README/SKILL (id, style blackboard, output,
+background, title, chapters, motion gentle, music,
+scenes with narration/captions/diagram/keywords).
+Scene durations are derived from ffprobe of the
+narration audio, scenes play back-to-back, per-scene
+SRT cues (scene-relative) merge into one captions
+track, diagrams default to their scene window (explicit
+start/end are scene-relative offsets), the brief title
+is fixed across the video, scene titles show per scene,
+keyword texts carry SFX, chapters=true writes one
+chapter per scene title, blackboard style turns scrims
+top+bottom on, motion gentle turns default_image_motion
+on, and optional music is ducked 12 dB over the
+narration spans. punch_in anywhere in the brief is
+rejected with a fix hint (gentle motion only). All
+failures are structured errors with fix hints: missing
+narration/captions, unmeasurable narration, a diagram
+outside its scene window, unknown templates. The render
+timeout scales with the derived duration (max(600s,
+20x duration)): a 78s proof timed out at the 600s
+default under load, and the failed run left no partial
+file (renders are atomic). Old
+produce_video briefs are untouched. Tests: 5 new
+test_loop139_* (end-to-end ffprobe + frame checks,
+diagram-in-scene timing, punch_in rejection, error
+battery, shipped example renders). Example:
+examples/one-button-explainer.json (+ .srt, +
+data/test_media/one-button-voice.wav).
+
 ## 1.38.0 — Animated stroke diagrams (general draw-on element + templates)
 
 Coordinator order 2026-10-30: blackboard drawings must be

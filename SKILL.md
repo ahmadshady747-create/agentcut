@@ -372,6 +372,56 @@ AgentCut edit and verify them.
   (`active_chunk_overflow_warning`) — shrink the size or
   widen the frame for long active chunks.
 
+## One-button board explainer (1.39.0)
+
+For a finished board explainer, do NOT hand-write a
+project.json. Call `produce_explainer` (MCP tool, or
+`./run.sh produce-explainer <brief.json> <mp4>`) with
+one brief — this is the button:
+
+```json
+{
+  "id": "strawman",
+  "style": "blackboard",
+  "output": {"width": 720, "height": 1280, "fps": 30},
+  "background": "/path/to/board_image.png",
+  "title": "مغالطة رجل القش",
+  "chapters": true,
+  "motion": "gentle",
+  "music": null,
+  "scenes": [
+    {"id": "s1", "title": "ما هي؟",
+     "narration": "/path/voice_s1.mp3", "captions": "/path/s1.srt",
+     "diagram": {"template": "causes", "params": {"rows": 2}, "draw": 3.5, "size": 0.72, "x": 101, "y": 330},
+     "keywords": [{"text": "رجل القش", "start": 5.0, "end": 9.0, "sfx": "pop"}]}
+  ]
+}
+```
+
+Derived, never hand-assembled: scene durations from
+ffprobe of the narration audio; scenes back-to-back in
+list order; total = sum of scenes. Per-scene SRT cues
+are scene-relative and merged into one captions track
+offset by the scene start. A scene diagram defaults to
+the whole scene window; an explicit diagram start/end
+is a scene-relative offset inside the scene (outside =
+structured error). The brief title is fixed across the
+video; scene titles show during their scene; keyword
+texts show at their scene-relative windows with SFX via
+the normal text SFX mechanism (a keyword may also set
+`x`, `y`, `size`, `color` or `position` for placement).
+`chapters: true` = one
+chapter per scene title at the scene start. Blackboard
+style = scrims top+bottom on; `motion: "gentle"` =
+`default_image_motion` on (≤1.12x only). `punch_in`
+anywhere in the brief is rejected with a fix hint.
+Optional `music` = a music track ducked 12 dB over the
+narration spans. Errors are structured with fix hints
+for missing narration/captions, unmeasurable narration,
+a diagram outside its scene, and unknown templates.
+Runnable example (repo media only):
+`examples/one-button-explainer.json`.
+
 ## Animated stroke diagrams (1.38.0)
 
 Use `diagrams` for hand-drawn educational art that draws

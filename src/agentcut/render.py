@@ -2612,6 +2612,329 @@ def produce_video(brief, output_path, review_dir=None):
     }
 
 
+def _explainer_find_punch_in(obj, where="brief"):
+    """First punch_in occurrence in a brief, or None.
+
+    Scans dicts/lists recursively so a punch_in hidden in a
+    scene, a diagram or a keyword is caught exactly like a
+    top-level one: the one-button path never accepts it.
+    """
+    if isinstance(obj, dict):
+        if "punch_in" in obj:
+            return where
+        for key, val in obj.items():
+            found = _explainer_find_punch_in(val, f"{where}.{key}")
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for i, val in enumerate(obj):
+            found = _explainer_find_punch_in(val, f"{where}[{i}]")
+            if found:
+                return found
+    return None
+
+
+def produce_explainer(brief, output_path, review_dir=None):
+    """One-button board explainer (v1.39.0): one brief in, one
+    finished video out. No hand-written project.json: every
+    timeline fact is DERIVED here from the brief.
+
+    Brief shape (verbatim — this is the button):
+      {"id": "strawman", "style": "blackboard",
+       "output": {"width": 720, "height": 1280, "fps": 30},
+       "background": "/path/to/board_image.png",
+       "title": "مغالطة رجل القش", "chapters": true,
+       "motion": "gentle", "music": null,
+       "scenes": [{"id": "s1", "title": "ما هي؟",
+         "narration": "/path/voice_s1.mp3",
+         "captions": "/path/s1.srt",
+         "diagram": {"template": "causes", "params": {"rows": 2},
+                     "draw": 3.5, "size": 0.72, "x": 101, "y": 330},
+         "keywords": [{"text": "رجل القش", "start": 5.0,
+                       "end": 9.0, "sfx": "pop"}]}]}
+    Rules, all enforced with structured errors + fix hints,
+    never a raw traceback:
+    - Scene clip durations come from ffprobe of the narration
+      audio, never from hand-supplied durations; scenes play
+      back-to-back in list order, total = sum of scenes.
+    - Per-scene SRT cues are scene-relative (they start at 0
+      in their own file) and are offset by the scene start
+      into one merged captions track, clamped to the scene.
+    - A scene diagram defaults to the whole scene window
+      (start/end = scene span, draw = min(4s, window) via
+      validation); an explicit diagram start/end is a
+      SCENE-RELATIVE offset and must stay inside the scene.
+      Placement mirrors overlays (size/x/y/position).
+    - The brief title is fixed across the whole video (top,
+      white); each scene title shows during its scene
+      (below it, yellow); keyword texts show at their
+      scene-relative windows with the existing text SFX
+      mechanism when "sfx" is given.
+    - chapters=true writes one chapter per scene title at
+      the scene start; chapters=false/absent writes none.
+    - style "blackboard" (or absent) turns scrims top+bottom
+      on; motion "gentle" (or absent) turns
+      default_image_motion on. punch_in ANYWHERE in the
+      brief is rejected: gentle motion only, zero punch-ins.
+    - Optional music: when "music" names a file it is added
+      as a music track with deterministic 12 dB ducking
+      windows = the narration spans.
+    Returns (ok, info_or_error); info carries output,
+    duration, the derived scenes list, chapters, review
+    frames and the built project (callers strip it, as
+    produce_video does, before printing).
+    """
+    from .diagrams import TEMPLATES
+    from .srt import parse_srt_file
+    if not isinstance(brief, dict):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "explainer brief must be an object",
+                       "fix": "pass a brief object with id, background and scenes"}
+    punched = _explainer_find_punch_in(brief)
+    if punched is not None:
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"punch_in is not allowed in a one-button explainer (found at {punched})",
+                       "fix": "remove punch_in from the brief; gentle motion (default_image_motion) is the only motion in this path"}
+    style = brief.get("style", "blackboard")
+    if style != "blackboard":
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"explainer style must be 'blackboard', got {style!r}",
+                       "fix": "set style to 'blackboard', or remove it for the blackboard default"}
+    motion = brief.get("motion", "gentle")
+    if motion not in ("gentle", "none"):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"explainer motion must be 'gentle' or 'none', got {motion!r}",
+                       "fix": "set motion to 'gentle' for default_image_motion, or 'none' for a static board"}
+    out = brief.get("output") or {}
+    if not isinstance(out, dict):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "output must be an object {width, height, fps}",
+                       "fix": "set output to e.g. {\"width\": 720, \"height\": 1280, \"fps\": 30}"}
+    width, height = out.get("width", 720), out.get("height", 1280)
+    fps = out.get("fps", 30)
+    if (type(width) is not int or type(height) is not int
+            or not 16 <= width <= 3840 or not 16 <= height <= 3840):
+        return False, {"code": "INVALID_DIMENSION",
+                       "message": "output width/height must both be integers 16..3840",
+                       "fix": "set output width and height, e.g. 720 and 1280, or remove output for the 720x1280 default"}
+    background = brief.get("background")
+    if not isinstance(background, str) or not background:
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "explainer brief needs a background board image path",
+                       "fix": "set background to a local board image, e.g. data/test_media/board.png"}
+    if not os.path.isfile(resolve_path(background)):
+        return False, {"code": "FILE_NOT_FOUND",
+                       "message": f"background image not found: {background}",
+                       "fix": "fix the background path to an existing local image file"}
+    title = brief.get("title")
+    if title is not None and (not isinstance(title, str) or not title.strip()):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "title must be a non-empty string",
+                       "fix": "set title to the video title, or remove it"}
+    scenes_in = brief.get("scenes")
+    if not isinstance(scenes_in, list) or not scenes_in:
+        return False, {"code": "EMPTY_TIMELINE",
+                       "message": "explainer brief needs a non-empty scenes list",
+                       "fix": "give scenes as a list of {id, title, narration, captions} objects"}
+    music = brief.get("music")
+    if music is not None:
+        if not isinstance(music, str) or not music:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": "music must be a local audio file path or null",
+                           "fix": "set music to an audio file path, or null for no music"}
+        if not os.path.isfile(resolve_path(music)):
+            return False, {"code": "FILE_NOT_FOUND",
+                           "message": f"music file not found: {music}",
+                           "fix": "fix the music path to an existing local audio file, or set music to null"}
+    # Derive the timeline: probe every narration first, so a
+    # bad scene fails before any render starts.
+    scenes, clips, texts, captions, diagrams, audio = [], [], [], [], [], []
+    total = 0.0
+    for si, scene in enumerate(scenes_in):
+        if not isinstance(scene, dict):
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {si} must be an object",
+                           "fix": "make each scene an object with id, title, narration and captions"}
+        sid = scene.get("id") or f"s{si + 1}"
+        if not isinstance(sid, str) or not sid:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {si} needs a non-empty string id",
+                           "fix": f"give scene {si} an id, e.g. 's{si + 1}'"}
+        narration = scene.get("narration")
+        if not isinstance(narration, str) or not narration:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} needs a narration audio path",
+                           "fix": f"set scene {sid} narration to a local audio file"}
+        if not os.path.isfile(resolve_path(narration)):
+            return False, {"code": "FILE_NOT_FOUND",
+                           "message": f"scene {sid} narration not found: {narration}",
+                           "fix": f"fix scene {sid} narration to an existing local audio file"}
+        probe = probe_media(narration)
+        if probe is None or probe.get("duration") is None or float(probe["duration"]) <= 0:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} narration has no measurable duration: {narration}",
+                           "fix": f"replace scene {sid} narration with an audio file ffprobe can read"}
+        dur = float(probe["duration"])
+        srt_path = scene.get("captions")
+        if not isinstance(srt_path, str) or not srt_path:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} needs a captions SRT path",
+                           "fix": f"set scene {sid} captions to a local .srt file"}
+        if not os.path.isfile(resolve_path(srt_path)):
+            return False, {"code": "FILE_NOT_FOUND",
+                           "message": f"scene {sid} captions not found: {srt_path}",
+                           "fix": f"fix scene {sid} captions to an existing local .srt file"}
+        try:
+            cues = parse_srt_file(resolve_path(srt_path))
+        except Exception as exc:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} captions cannot be parsed: {exc}",
+                           "fix": f"fix scene {sid} captions as a valid SRT file"}
+        start, end = total, total + dur
+        for cue in cues:
+            if cue["start"] >= dur:
+                continue
+            captions.append({"text": cue["text"],
+                             "start": round(start + cue["start"], 3),
+                             "end": round(start + min(cue["end"], dur), 3)})
+        clips.append({"id": sid, "kind": "image", "src": background,
+                      "duration": dur, "transition": "none"})
+        audio.append({"src": narration, "kind": "voice", "volume": 1.0,
+                      "start": start})
+        stitle = scene.get("title")
+        if isinstance(stitle, str) and stitle.strip():
+            texts.append({"text": stitle, "start": start, "end": end,
+                          "size": 52, "x": "center", "y": 190,
+                          "color": "yellow", "box": False})
+        dg = scene.get("diagram")
+        if dg is not None:
+            if not isinstance(dg, dict):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} diagram must be an object",
+                               "fix": f"give scene {sid} diagram as {{template, params}} or {{strokes, ...}}"}
+            if dg.get("template") is not None and dg["template"] not in TEMPLATES:
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} diagram: unknown template '{dg['template']}'",
+                               "fix": "set template to one of: " + ", ".join(sorted(TEMPLATES))}
+            rel_start = dg.get("start", 0.0)
+            rel_end = dg.get("end", dur)
+            try:
+                rel_start, rel_end = float(rel_start), float(rel_end)
+            except (TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} diagram start/end must be numbers (scene-relative seconds)",
+                               "fix": f"set scene {sid} diagram start/end inside 0..{dur:.2f}, or remove them for the whole scene"}
+            if rel_start < 0 or rel_end <= rel_start or rel_end > dur + 1e-9:
+                return False, {"code": "CLIP_OUT_OF_RANGE",
+                               "message": f"scene {sid} diagram window {rel_start}..{rel_end}s is outside its scene (0..{dur:.2f}s)",
+                               "fix": f"keep scene {sid} diagram start/end inside 0..{dur:.2f} with end after start, or remove them for the whole scene"}
+            ndg = {"id": dg.get("id") or f"{sid}-diagram",
+                   "start": round(start + rel_start, 3),
+                   "end": round(start + rel_end, 3)}
+            for key in ("template", "params", "strokes", "canvas",
+                        "draw", "size", "x", "y", "position"):
+                if key in dg:
+                    ndg[key] = dg[key]
+            diagrams.append(ndg)
+        for ki, kw in enumerate(scene.get("keywords") or []):
+            if not isinstance(kw, dict) or not kw.get("text"):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} keyword {ki} needs a text string",
+                               "fix": f"give scene {sid} keywords as {{text, start, end}} with scene-relative seconds"}
+            try:
+                ks, ke = float(kw["start"]), float(kw["end"])
+            except (KeyError, TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} keyword {ki} needs numeric start/end (scene-relative seconds)",
+                               "fix": f"set scene {sid} keyword start/end inside 0..{dur:.2f}"}
+            if ks < 0 or ke <= ks or ke > dur + 1e-9:
+                return False, {"code": "CLIP_OUT_OF_RANGE",
+                               "message": f"scene {sid} keyword window {ks}..{ke}s is outside its scene (0..{dur:.2f}s)",
+                               "fix": f"keep scene {sid} keyword start/end inside 0..{dur:.2f} with end after start"}
+            ktext = {"text": kw["text"], "start": round(start + ks, 3),
+                     "end": round(start + ke, 3), "size": 56,
+                     "x": "center", "y": 260, "color": "yellow",
+                     "box": False}
+            # Optional placement overrides (validated with the
+            # rest of the project): a keyword may sit above or
+            # below its diagram instead of at the default spot.
+            for key in ("x", "y", "size", "color", "position"):
+                if key in kw:
+                    ktext[key] = kw[key]
+            if kw.get("sfx") is not None:
+                ktext["sfx"] = kw["sfx"]
+            if kw.get("sfx_volume") is not None:
+                ktext["sfx_volume"] = kw["sfx_volume"]
+            texts.append(ktext)
+        scenes.append({"id": sid, "title": stitle, "start": round(start, 3),
+                       "end": round(end, 3), "duration": round(dur, 3),
+                       "narration": narration, "captions": srt_path})
+        total = end
+    if title:
+        texts.insert(0, {"text": title, "start": 0.0, "end": round(total, 3),
+                         "size": 60, "x": "center", "y": 80,
+                         "color": "white", "box": False})
+    project = {
+        "id": brief.get("id", "explainer"),
+        "title": title or "Explainer",
+        "version": 1,
+        "output": {"width": width, "height": height, "fps": fps},
+        "clips": clips,
+        "texts": texts,
+        "captions": captions,
+        "audio": audio,
+        "diagrams": diagrams,
+        "scrims": {"top": True, "bottom": True},
+        "default_image_motion": motion == "gentle",
+    }
+    if brief.get("chapters"):
+        project["chapters"] = [{"title": s["title"] or s["id"],
+                                "start": s["start"]} for s in scenes]
+    if music is not None:
+        project["audio"].append({"src": music, "kind": "music",
+                                 "volume": 1.0, "start": 0.0})
+        project["ducking"] = {"voice_track": 0, "amount_db": 12.0,
+                              "fade": 0.25,
+                              "windows": [{"start": s["start"], "end": s["end"]}
+                                          for s in scenes]}
+    errors, info = validate_project(project)
+    if errors:
+        return False, {"code": "INVALID_PROJECT", "errors": errors}
+    # A board explainer is long (tens of seconds at full
+    # frame size, plus diagram videos): the render timeout
+    # scales with the derived duration instead of the
+    # 600s default, which a 78s proof timed out on under
+    # load (the failed run left no partial file — renders
+    # are atomic — so the retry is still one finished
+    # video from one call).
+    timeout = max(600, int(total * 20))
+    ok, rinfo = render_project(project, output_path, timeout=timeout)
+    if not ok:
+        return False, rinfo
+    if review_dir is None:
+        review_dir = output_path + ".review"
+    os.makedirs(review_dir, exist_ok=True)
+    frames = []
+    for k, t in enumerate(sorted({0.0, total * 0.5, total * 0.99})):
+        frame = os.path.join(review_dir, f"frame_{k}.png")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", output_path,
+             "-frames:v", "1", frame],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0 and os.path.isfile(frame):
+            frames.append({"time": t, "path": frame})
+    return True, {
+        "output": output_path,
+        "duration": info["total_duration"],
+        "width": width, "height": height, "fps": fps,
+        "scenes": scenes,
+        "chapters": info.get("chapters", []),
+        "review_frames": frames,
+        "review_dir": review_dir,
+        "project": project,
+    }
+
+
 def produce_variants(brief, output_dir):
     """Render one brief in several shapes in one call.
 

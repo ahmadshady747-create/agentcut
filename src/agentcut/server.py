@@ -12,7 +12,7 @@ import os
 import re
 import sys
 
-from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_variants, produce_video, render_project, split_clip, timeline_summary
+from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_project, split_clip, timeline_summary
 from .validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,6 +109,12 @@ TOOLS = [
          "required": ["id"]}},
     {"name": "produce_video",
      "description": "Producer one-call: take a short brief (format preset, media paths, optional title/texts/audio) and return a finished video plus review frames. Blocks until the render completes.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object"},
+         "output": {"type": "string"}},
+         "required": ["brief", "output"]}},
+    {"name": "produce_explainer",
+     "description": "One-button board explainer: one brief (id, style blackboard, output, background, title, chapters, motion gentle, music, scenes with narration/captions/diagram/keywords) in, one finished video out. Scene durations come from narration audio via ffprobe; diagrams default to their scene window; punch_in anywhere is rejected. Blocks until the render completes.",
      "inputSchema": {"type": "object", "properties": {
          "brief": {"type": "object"},
          "output": {"type": "string"}},
@@ -259,6 +265,13 @@ def call_tool(name, args):
         ok, info = produce_variants(args["brief"], args["output_dir"])
         if not ok:
             return _tool_error(info)
+        return _text(info)
+    if name == "produce_explainer":
+        ok, info = produce_explainer(args["brief"], args["output"])
+        if not ok:
+            return _tool_error(info)
+        info = dict(info)
+        info.pop("project", None)
         return _text(info)
     if name == "produce_video":
         ok, info = produce_video(args["brief"], args["output"])

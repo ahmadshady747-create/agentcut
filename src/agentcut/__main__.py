@@ -3,7 +3,7 @@ import json
 import sys
 
 from .package import package_project
-from .render import poster_frame, preview_project, produce_variants, produce_video, render_project, run_job_worker, split_clip, timeline_summary
+from .render import poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_project, run_job_worker, split_clip, timeline_summary
 from .server import serve
 from .validate import probe_media, validate_project
 
@@ -51,6 +51,12 @@ def _main(argv):
         ok, info = produce_variants(_load(argv[1]), argv[2])
         print(json.dumps(info, indent=2, default=str))
         return 0 if ok else 1
+    if argv[0] == "produce-explainer" and len(argv) == 3:
+        ok, info = produce_explainer(_load(argv[1]), argv[2])
+        info = dict(info)
+        info.pop("project", None)
+        print(json.dumps(info, indent=2, default=str))
+        return 0 if ok else 1
     if argv[0] == "produce" and len(argv) == 3:
         ok, info = produce_video(_load(argv[1]), argv[2])
         info = dict(info)
@@ -78,7 +84,7 @@ def _main(argv):
         summary = package_project(_load(argv[1]), argv[2])
         print(json.dumps(summary, indent=2, default=str))
         return 0
-    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir>|worker <jobs_dir> <job_id> <out_dir>]")
+    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir>|worker <jobs_dir> <job_id> <out_dir>]")
     return 2
 
 

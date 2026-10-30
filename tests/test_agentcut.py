@@ -3901,5 +3901,239 @@ class TestAgentCut(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+    def test_loop139_explainer_end_to_end(self):
+        # 1.39.0: one produce_explainer brief -> a finished
+        # 720x1280 yuv420p 30fps video, durations derived from
+        # narration audio (4s + 3s = 7s), chapters at scene
+        # starts, diagram drawn in scene 1, caption + title
+        # visible on frame. No hand-written project.json.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-")
+        try:
+            bg = os.path.join(BASE, "data", "test_media", "board.png")
+            v1 = os.path.join(tmp, "v1.wav")
+            v2 = os.path.join(tmp, "v2.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=4", v1],
+                           check=True)
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=660:duration=3", v2],
+                           check=True)
+            s1 = os.path.join(tmp, "s1.srt")
+            s2 = os.path.join(tmp, "s2.srt")
+            with open(s1, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\n"
+                         "الجملة الأولى\n\n"
+                         "2\n00:00:02,000 --> 00:00:04,000\n"
+                         "الجملة الثانية\n")
+            with open(s2, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:01,500\n"
+                         "الجملة الثالثة\n\n"
+                         "2\n00:00:01,500 --> 00:00:03,000\n"
+                         "الجملة الرابعة\n")
+            brief = {
+                "id": "expl-e2e", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": bg, "title": "مغالطة رجل القش",
+                "chapters": True, "motion": "gentle", "music": None,
+                "scenes": [
+                    {"id": "s1", "title": "ما هي؟",
+                     "narration": v1, "captions": s1,
+                     "diagram": {"template": "causes",
+                                 "params": {"rows": 2}, "draw": 2.0,
+                                 "size": 0.72, "x": 101, "y": 330},
+                     "keywords": [{"text": "رجل القش", "start": 1.0,
+                                   "end": 2.0, "sfx": "pop"}]},
+                    {"id": "s2", "title": "كيف تكشفها؟",
+                     "narration": v2, "captions": s2},
+                ]}
+            out = os.path.join(tmp, "expl.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            self.assertAlmostEqual(info["duration"], 7.0, places=1)
+            self.assertEqual(
+                [(s["id"], s["start"]) for s in info["scenes"]],
+                [("s1", 0.0), ("s2", 4.0)])
+            probe = json.loads(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams",
+                 "-show_chapters", "-of", "json", out],
+                capture_output=True, text=True, check=True).stdout)
+            video = [s for s in probe["streams"]
+                     if s["codec_type"] == "video"][0]
+            self.assertEqual((video["width"], video["height"]), (720, 1280))
+            self.assertEqual(video["pix_fmt"], "yuv420p")
+            self.assertEqual(video["avg_frame_rate"], "30/1")
+            self.assertEqual(
+                [(c["tags"]["title"], float(c["start_time"]))
+                 for c in probe["chapters"]],
+                [("ما هي؟", 0.0), ("كيف تكشفها؟", 4.0)])
+            # Diagram: dim at draw start, bright once drawn.
+            early = _crop_mean(out, 0.3, 101, 330, 518, 265)
+            done = _crop_mean(out, 3.9, 101, 330, 518, 265)
+            self.assertGreater(sum(done) / 3, sum(early) / 3 + 5,
+                               (early, done))
+            # Title (top band) and caption (bottom band) both
+            # leave near-white pixels on the dark board.
+            frame = os.path.join(tmp, "f.png")
+            _frame_png(out, 1.0, frame)
+            _w, _h, px = _png_px(frame)
+            def _bright(x0, y0, x1, y1):
+                return sum(1 for y in range(y0, y1)
+                           for x in range(x0, x1)
+                           if px(x, y)[:3] > (180, 180, 180))
+            self.assertGreater(_bright(100, 60, 620, 150), 20)
+            self.assertGreater(_bright(100, 1080, 620, 1210), 20)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop139_explainer_diagram_in_scene_timing(self):
+        # 1.39.0: a diagram defaults to its own scene window
+        # and is absent before that scene, present inside it.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-timing-")
+        try:
+            bg = os.path.join(BASE, "data", "test_media", "board.png")
+            v1 = os.path.join(tmp, "v1.wav")
+            v2 = os.path.join(tmp, "v2.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=3", v1],
+                           check=True)
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=660:duration=4", v2],
+                           check=True)
+            srt = os.path.join(tmp, "s.srt")
+            with open(srt, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\nنص\n")
+            brief = {
+                "id": "expl-timing", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": bg, "title": "اختبار", "chapters": True,
+                "motion": "gentle", "music": None,
+                "scenes": [
+                    {"id": "s1", "title": "الأولى",
+                     "narration": v1, "captions": srt},
+                    {"id": "s2", "title": "الثانية",
+                     "narration": v2, "captions": srt,
+                     "diagram": {"template": "causes",
+                                 "params": {"rows": 2}, "draw": 2.0,
+                                 "size": 0.72, "x": 101, "y": 330}},
+                ]}
+            out = os.path.join(tmp, "t.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            before = _crop_mean(out, 1.5, 101, 330, 518, 265)
+            inside = _crop_mean(out, 6.9, 101, 330, 518, 265)
+            self.assertGreater(sum(inside) / 3, sum(before) / 3 + 5,
+                               (before, inside))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop139_explainer_punch_in_rejected(self):
+        # 1.39.0: punch_in anywhere in the brief is a
+        # structured rejection with a fix hint, never a render
+        # and never a traceback.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-punch-")
+        try:
+            v1 = os.path.join(tmp, "v1.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=2", v1],
+                           check=True)
+            srt = os.path.join(tmp, "s.srt")
+            with open(srt, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\nنص\n")
+            base = {
+                "id": "expl-punch", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": os.path.join(
+                    BASE, "data", "test_media", "board.png"),
+                "title": "اختبار", "chapters": False,
+                "motion": "gentle", "music": None,
+                "scenes": [{"id": "s1", "title": "الأولى",
+                            "narration": v1, "captions": srt}]}
+            for punch_brief in (
+                    dict(base, punch_in=True),
+                    dict(base, scenes=[dict(base["scenes"][0],
+                                            punch_in={"at": 1.0})])):
+                ok, info = produce_explainer(
+                    punch_brief, os.path.join(tmp, "p.mp4"))
+                self.assertFalse(ok)
+                self.assertEqual(info["code"], "INVALID_SCHEMA")
+                self.assertIn("punch_in", info["message"])
+                self.assertIn("fix", info)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop139_explainer_errors(self):
+        # 1.39.0: missing narration/captions, unmeasurable
+        # narration, a diagram outside its scene window and an
+        # unknown template are all structured errors with fix
+        # hints.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-err-")
+        try:
+            v1 = os.path.join(tmp, "v1.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=3", v1],
+                           check=True)
+            srt = os.path.join(tmp, "s.srt")
+            with open(srt, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\nنص\n")
+            empty = os.path.join(tmp, "empty.wav")
+            open(empty, "wb").close()
+            base = {
+                "id": "expl-err", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": os.path.join(
+                    BASE, "data", "test_media", "board.png"),
+                "title": "اختبار", "chapters": False,
+                "motion": "gentle", "music": None}
+            def _scene(**kw):
+                d = {"id": "s1", "title": "الأولى",
+                     "narration": v1, "captions": srt}
+                d.update(kw)
+                return dict(base, scenes=[d])
+            cases = [
+                _scene(narration=os.path.join(tmp, "missing.wav")),
+                _scene(captions=os.path.join(tmp, "missing.srt")),
+                _scene(narration=empty),
+                _scene(diagram={"template": "causes",
+                                "params": {"rows": 2},
+                                "start": 0.0, "end": 9.0}),
+                _scene(diagram={"template": "pie", "params": {}}),
+            ]
+            for brief in cases:
+                ok, info = produce_explainer(
+                    brief, os.path.join(tmp, "e.mp4"))
+                self.assertFalse(ok, brief)
+                self.assertIn("fix", str(info), info)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loop139_explainer_example_brief(self):
+        # 1.39.0: the shipped one-button example brief runs
+        # end to end (its media all exist in the repo).
+        from agentcut.render import produce_explainer
+        import tempfile
+        with open(os.path.join(BASE, "examples",
+                                "one-button-explainer.json"),
+                  encoding="utf-8") as fh:
+            brief = json.load(fh)
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-ex-")
+        try:
+            out = os.path.join(tmp, "ex.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            self.assertEqual((info["width"], info["height"]), (720, 1280))
+            self.assertAlmostEqual(info["duration"], 10.0, places=1)
+            self.assertEqual(len(info["chapters"]), 2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
