@@ -80,11 +80,15 @@ def _main(argv):
         info = probe_media(argv[1])
         print(json.dumps(info, indent=2, default=str) if info else "cannot probe")
         return 0 if info else 1
-    if argv[0] == "package" and len(argv) == 3:
-        summary = package_project(_load(argv[1]), argv[2])
+    if argv[0] == "package" and len(argv) in (3, 4):
+        trim = len(argv) == 4 and argv[3] == "--trim-clips"
+        if len(argv) == 4 and not trim:
+            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
+            return 2
+        summary = package_project(_load(argv[1]), argv[2], trim_clips=trim)
         print(json.dumps(summary, indent=2, default=str))
         return 0
-    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir>|worker <jobs_dir> <job_id> <out_dir>]")
+    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
     return 2
 
 

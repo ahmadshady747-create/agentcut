@@ -33,6 +33,7 @@ BiDi-verified path and never become AI-generated image text.
 
 Stroke schema (diagram-local coordinates, origin top-left):
   {"kind": "polyline", "points": [[x, y], ...], ...}
+  {"kind": "line", "points": [[x1, y1], [x2, y2]], ...}
   {"kind": "arrow", "points": [[x, y], ...], "head_size": 36, ...}
   {"kind": "circle", "center": [x, y], "radius": r, ...}
   {"kind": "ellipse", "center": [x, y], "radius_x": rx, "radius_y": ry, ...}
@@ -50,9 +51,11 @@ length, so longer strokes naturally take longer to draw),
 Templates (see build_template): "chart" (rising chart with
 axes, faint grid and an arrowed curve), "basket" (basket with
 coins), "balance" (beam scale, tilt from two values),
-"causes" (rows of badge + arrow). Templates take parameters
-only — values, counts, colours — and return strokes; they
-never take text.
+"causes" (rows of badge + arrow), "primitives" (arbitrary
+stroke lists — line, rect, circle, arrow, polyline — with an
+explicit canvas, for template-style diagrams that need full
+stroke control). Templates take parameters only — values,
+counts, colours — and return strokes; they never take text.
 """
 
 from __future__ import annotations
@@ -195,7 +198,11 @@ def stroke_to_points(stroke):
     width = float(stroke.get("width", 7))
     step = max(1.0, width / 3.0)
     seed = int(stroke.get("seed", 0))
-    if kind in ("polyline", "arrow"):
+    if kind in ("polyline", "arrow", "line"):
+        # "line" is a straight 2-point segment (validation
+        # enforces exactly 2 points); it renders through the
+        # same chalk path as a polyline, so it keeps the same
+        # weight, wobble and grain behaviour.
         raw = stroke["points"]
         dense = []
         for a, b in zip(raw, raw[1:]):
@@ -277,6 +284,27 @@ def stroke_to_points(stroke):
         points = _resample_walk(dense, step)
         points = _apply_wobble(points, width, seed)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
+    if kind == "arc":
+        # Arc: centre + radius + start/end angles in degrees.
+        # 0 degrees is east; positive angles run clockwise on
+        # screen (y grows downward), so 0 -> 90 draws the
+        # bottom-right quadrant. A zero sweep (start == end)
+        # means a full circle. Points follow the same chalk path
+        # (resample + wobble + grain) as every other stroke.
+        cx, cy = float(stroke["center"][0]), float(stroke["center"][1])
+        r = float(stroke["radius"])
+        a0 = math.radians(float(stroke["start_angle"]))
+        a1 = math.radians(float(stroke["end_angle"]))
+        sweep = (a1 - a0) % (2 * math.pi)
+        if sweep == 0:
+            sweep = 2 * math.pi
+        arc_len = r * sweep
+        n = max(16, int(arc_len / step))
+        dense = [(cx + r * math.cos(a0 + sweep * i / n),
+                  cy + r * math.sin(a0 + sweep * i / n)) for i in range(n + 1)]
+        points = _resample_walk(dense, step)
+        points = _apply_wobble(points, width, seed)
+        return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     raise ValueError(f"unknown stroke kind {kind!r}")
 
 
@@ -298,26 +326,44 @@ class Canvas:
         self.buf = bytearray(self.width * self.height * 4)
 
     def stamp(self, x, y, radius, color, alpha, seed):
-        r = radius
-        x0 = max(0, int(math.floor(x - r - 1)))
-        x1 = min(self.width - 1, int(math.ceil(x + r + 1)))
-        y0 = max(0, int(math.floor(y - r - 1)))
-        y1 = min(self.height - 1, int(math.ceil(y + r + 1)))
-        for yy in range(y0, y1 + 1):
-            for xx in range(x0, x1 + 1):
-                d = math.hypot(xx - x, yy - y)
-                if d > r + 1:
-                    continue
-                edge = 1.0 if d <= r - 1 else max(0.0, (r + 1 - d) / 2)
-                grain = 0.80 + 0.20 * _hash01(xx, yy, seed)
-                v = alpha * edge * grain
-                idx = (yy * self.width + xx) * 4
-                old_a = self.buf[idx + 3] / 255.0
-                if v > old_a:
-                    self.buf[idx] = color[0]
-                    self.buf[idx + 1] = color[1]
-                    self.buf[idx + 2] = color[2]
-                    self.buf[idx + 3] = int(round(v * 255))
+        # Incremental-rasterization hot path: a stamp's pixel
+        # offsets and edge falloff depend ONLY on (radius,
+        # fractional center), never on the integer center, so
+        # they are cached per (radius, fx, fy) instead of
+        # recomputed with math.hypot per pixel per stamp. The
+        # cache is EXACT, not approximate: xx - x equals
+        # (xx - ix) - fx bit-for-bit (a single rounding of the
+        # same real value), so edge values are identical to the
+        # uncached computation, and the grain still uses absolute
+        # pixel coordinates, so output bytes are unchanged.
+        # A second exact shortcut: a stamp's value v satisfies
+        # v <= alpha, so when the pixel's current alpha already
+        # reaches alpha the stamp cannot win there and the grain
+        # need not be computed at all.
+        ix = int(math.floor(x))
+        iy = int(math.floor(y))
+        fx = x - ix
+        fy = y - iy
+        mask = _stamp_mask(radius, fx, fy)
+        buf = self.buf
+        w = self.width
+        h = self.height
+        for dx, dy, edge in mask:
+            xx = ix + dx
+            yy = iy + dy
+            if xx < 0 or xx >= w or yy < 0 or yy >= h:
+                continue
+            idx = (yy * w + xx) * 4
+            old_a = buf[idx + 3] / 255.0
+            if old_a >= alpha:
+                continue
+            grain = 0.80 + 0.20 * _hash01(xx, yy, seed)
+            v = alpha * edge * grain
+            if v > old_a:
+                buf[idx] = color[0]
+                buf[idx + 1] = color[1]
+                buf[idx + 2] = color[2]
+                buf[idx + 3] = int(round(v * 255))
 
     def draw_points(self, points, color, width, alpha, seed):
         radius = width / 2.0
@@ -330,6 +376,50 @@ class Canvas:
     def opaque_pixel_count(self):
         """Pixels with any chalk on them (alpha > 0)."""
         return sum(1 for i in range(3, len(self.buf), 4) if self.buf[i] > 0)
+
+
+_STAMP_MASK_CACHE = {}
+_STAMP_MASK_CACHE_MAX = 1024
+
+
+def _stamp_mask(radius, fx, fy):
+    """(dx, dy, edge) offsets for a disc of `radius` centred at
+    fractional offset (fx, fy) within its pixel.
+
+    Built once per (radius, fx, fy) and reused for every stamp
+    with the same radius and sub-pixel phase — straight strokes
+    sampled at regular steps cycle through only a few phases,
+    so the cache hits constantly. The mask is exact (see
+    Canvas.stamp): offsets are relative to the integer center
+    and edge values are computed from relative geometry only.
+    The cache is bounded: when full it is cleared, which only
+    costs recomputation, never correctness."""
+    key = (radius, fx, fy)
+    mask = _STAMP_MASK_CACHE.get(key)
+    if mask is not None:
+        return mask
+    mask = []
+    x0 = int(math.floor(fx - radius - 1))
+    x1 = int(math.ceil(fx + radius + 1))
+    y0 = int(math.floor(fy - radius - 1))
+    y1 = int(math.ceil(fy + radius + 1))
+    for yy in range(y0, y1 + 1):
+        for xx in range(x0, x1 + 1):
+            d = math.hypot(xx - fx, yy - fy)
+            if d > radius + 1:
+                continue
+            # Delta: distance-based alpha feathering — a smoothstep
+            # falloff over the same 2px band the old linear ramp
+            # used, so diagonal lines and circles lose their hard
+            # stair-step edge without changing the stamp's reach
+            # (u = 1 at the inner edge, 0 at the outer edge).
+            u = 1.0 if d <= radius - 1 else max(0.0, (radius + 1 - d) / 2)
+            edge = u * u * (3 - 2 * u)
+            mask.append((xx, yy, edge))
+    if len(_STAMP_MASK_CACHE) >= _STAMP_MASK_CACHE_MAX:
+        _STAMP_MASK_CACHE.clear()
+    _STAMP_MASK_CACHE[key] = mask
+    return mask
 
 
 def _prepare_strokes(strokes):
@@ -393,8 +483,10 @@ def write_png_rgba(path, width, height, rgba):
 class DiagramAnimator:
     """Incremental draw-on animator: each next_frame() stamps
     only the newly revealed points, so total raster work is one
-    complete diagram, not one per frame. The final frame is
-    byte-identical to render_diagram_rgba(..., 1.0)."""
+    complete diagram, not one per frame. Stroke progress eases
+    (smoothstep) so the pen accelerates and slows like a hand;
+    the final frame is exact and byte-identical to
+    render_diagram_rgba(..., 1.0)."""
 
     def __init__(self, strokes, width, height, fps, draw_seconds):
         self.width = int(width)
@@ -421,7 +513,14 @@ class DiagramAnimator:
         if self._frame == self.frames:
             target = self.total_weight
         else:
-            target = self.total_weight * self._frame / self.frames
+            # Delta: hand-like pacing — stroke progress follows a
+            # smoothstep ease_in_out over the draw window, so the
+            # pen accelerates gently and slows at stroke ends
+            # instead of moving at a mechanical constant speed.
+            # The final frame is exact (ease(1) = 1), so it stays
+            # byte-identical to a direct full render.
+            u = self._frame / self.frames
+            target = self.total_weight * u * u * (3 - 2 * u)
         for i, (points, color, wdt, alpha, seed, weight) in enumerate(self.prepared):
             start = self._offsets[i]
             if target <= start:
@@ -636,11 +735,44 @@ def template_causes(params):
     return 900, 460, strokes
 
 
+def template_primitives(params):
+    """General primitives template: arbitrary stroke lists
+    (line, rect, circle, arrow, polyline) with an explicit canvas.
+
+    params: {"strokes": [stroke dicts], "canvas": {"width", "height"}
+    or [width, height]}. Canvas defaults to 900x560 and must be
+    100..1920 per side (same bounds as custom diagrams).
+    Strokes pass through unchanged here; validation in
+    validate.py checks them against the canvas before they
+    reach the renderer, exactly like custom strokes."""
+    canvas = params.get("canvas") or {}
+    if isinstance(canvas, (list, tuple)) and len(canvas) == 2:
+        try:
+            cw, ch = int(canvas[0]), int(canvas[1])
+        except (TypeError, ValueError):
+            raise ValueError("primitives canvas must be [width, height] numbers")
+    elif isinstance(canvas, dict):
+        try:
+            cw = int(canvas.get("width", 900))
+            ch = int(canvas.get("height", 560))
+        except (TypeError, ValueError):
+            raise ValueError("primitives canvas width/height must be integers")
+    else:
+        raise ValueError("primitives canvas must be [width, height] or {width, height}")
+    if not 100 <= cw <= 1920 or not 100 <= ch <= 1920:
+        raise ValueError("primitives canvas must be 100..1920 per side")
+    strokes = params.get("strokes")
+    if not isinstance(strokes, list) or not strokes:
+        raise ValueError("primitives needs a non-empty strokes list")
+    return cw, ch, list(strokes)
+
+
 TEMPLATES = {
     "chart": template_chart,
     "basket": template_basket,
     "balance": template_balance,
     "causes": template_causes,
+    "primitives": template_primitives,
 }
 
 

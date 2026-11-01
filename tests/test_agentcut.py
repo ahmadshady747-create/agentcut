@@ -590,7 +590,8 @@ class TestAgentCut(unittest.TestCase):
         real_run = _sp.run
 
         def _fake_run(cmd, **kwargs):
-            if cmd and cmd[0] == "ffmpeg" and "-filter_complex" in cmd:
+            if cmd and cmd[0] == "ffmpeg" and (
+                    "-filter_complex" in cmd or "-filter_complex_script" in cmd):
                 return _sp.CompletedProcess(cmd, 1, stdout="", stderr="boom")
             return real_run(cmd, **kwargs)
 
@@ -4133,6 +4134,1616 @@ class TestAgentCut(unittest.TestCase):
             self.assertEqual(len(info["chapters"]), 2)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestRefactoring(unittest.TestCase):
+    """Architectural refactoring tests (Tasks 1-6).
+
+    Each test covers a new feature only; the existing 110 tests
+    above must keep passing unchanged. Renders use tiny projects
+    (1-6s, 360x640) to keep the suite fast.
+    """
+
+    def _tiny_img_project(self, duration=1.0):
+        return {"id": "reftest", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "c1", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                           "duration": duration}]}
+
+    def _cache_project(self):
+        return {"id": "cachetest", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [
+                    {"id": "c1", "kind": "image",
+                     "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                     "duration": 2.5},
+                    {"id": "c2", "kind": "video",
+                     "src": os.path.join(BASE, "data", "test_media", "clip1.mp4"),
+                     "trim_in": 0, "trim_out": 2.51},
+                    {"id": "c3", "kind": "image",
+                     "src": os.path.join(BASE, "data", "test_media", "pattern.png"),
+                     "duration": 1.333}],
+                "texts": [{"text": "Cache test", "x": "center", "y": 80,
+                           "size": 48, "start": 0.5, "end": 2.0}]}
+
+    def _framemd5_list(self, path):
+        out = subprocess.run(["ffmpeg", "-v", "error", "-i", path,
+                              "-map", "0:v", "-f", "framemd5",
+                              "-pix_fmt", "yuv420p", "-"],
+                             capture_output=True, text=True).stdout
+        return [ln.split(",")[5] for ln in out.splitlines()
+                if ln and not ln.startswith("#")]
+
+    def _pcm(self, path):
+        return subprocess.run(["ffmpeg", "-v", "error", "-i", path,
+                               "-map", "0:a", "-f", "s16le",
+                               "-ac", "2", "-ar", "48000", "-"],
+                              capture_output=True).stdout
+
+    # ---- Task 1: diagrams ----
+    def test_refactor_stamp_mask_cache_and_idempotent_restamp(self):
+        from agentcut.diagrams import Canvas, _stamp_mask
+        m1 = _stamp_mask(3.5, 0.25, 0.75)
+        m2 = _stamp_mask(3.5, 0.25, 0.75)
+        self.assertIs(m1, m2)
+        c = Canvas(40, 40)
+        c.stamp(20.25, 20.75, 3.5, (255, 255, 255), 0.9, 7)
+        first = c.bytes()
+        self.assertGreater(sum(1 for i in range(3, len(first), 4) if first[i] > 0), 0)
+        c.stamp(20.25, 20.75, 3.5, (255, 255, 255), 0.9, 7)
+        self.assertEqual(c.bytes(), first)
+
+    def test_refactor_primitives_template_and_line_kind(self):
+        from agentcut.diagrams import build_template, stroke_to_points
+        from agentcut.validate import validate_project
+        w, h, strokes = build_template("primitives", {
+            "canvas": [600, 400],
+            "strokes": [
+                {"kind": "line", "points": [[10, 10], [100, 50]], "color": "white", "width": 5},
+                {"kind": "rect", "points": [[200, 100], [300, 200]], "color": "yellow", "width": 5},
+            ]})
+        self.assertEqual((w, h), (600, 400))
+        self.assertEqual(len(strokes), 2)
+        pts = stroke_to_points({"kind": "line", "points": [[0, 0], [10, 0]], "color": "white", "width": 5})
+        self.assertGreater(len(pts), 0)
+        proj = {"id": "primtest", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [{"id": "c1", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                           "duration": 1.0}],
+                "diagrams": [{"id": "d1", "template": "primitives",
+                              "params": {"canvas": [600, 400], "strokes": [
+                                  {"kind": "line", "points": [[10, 10], [100, 50]],
+                                   "color": "white", "width": 5}]},
+                              "start": 0.0, "end": 1.0, "x": 0, "y": 0}]}
+        errors, _info = validate_project(proj)
+        self.assertEqual(errors, [], errors)
+        bad = json.loads(json.dumps(proj))
+        bad["diagrams"][0]["params"]["strokes"][0]["points"] = [[10, 10], [50, 50], [100, 50]]
+        errors, _info = validate_project(bad)
+        self.assertTrue(any("line" in e["message"] for e in errors), errors)
+        bad2 = json.loads(json.dumps(proj))
+        bad2["diagrams"][0]["params"]["strokes"] = []
+        errors, _info = validate_project(bad2)
+        self.assertTrue(errors)
+
+    # ---- Task 2: render ----
+    def test_refactor_hw_detection_and_fallback(self):
+        from agentcut.render import choose_video_codec, detect_hw_encoders, encoder_smoke_test
+        detected = detect_hw_encoders()
+        self.assertIsInstance(detected, list)
+        self.assertEqual(choose_video_codec("libx264"), "libx264")
+        auto = choose_video_codec("auto")
+        self.assertTrue(auto == "libx264" or encoder_smoke_test(auto))
+
+    def test_refactor_hw_fallback_render(self):
+        import tempfile
+        from agentcut.render import render_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-hwfb-")
+        try:
+            out = os.path.join(tmp, "hw.mp4")
+            ok, info = render_project(self._tiny_img_project(), out,
+                                      video_codec="h264_nvenc")
+            self.assertTrue(ok, info)
+            self.assertTrue(os.path.isfile(out))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_refactor_smart_error_extraction(self):
+        from agentcut.render import extract_ffmpeg_error
+        sample = ("frame= 10 fps=0.0\n"
+                  "[Parsed_xfade_12 @ 0x123] [eval @ 0x456] Invalid expression\n"
+                  "[libx264 @ 0x789] error: something broke\n"
+                  "Conversion failed!\n")
+        out = extract_ffmpeg_error(sample)
+        self.assertIn("xfade", out)
+        self.assertIn("Conversion failed!", out)
+        self.assertNotIn("frame= 10", out)
+        self.assertTrue(extract_ffmpeg_error(""))
+        # No error-looking line: fallback is the raw tail itself.
+        self.assertIn("frame= 2", extract_ffmpeg_error("frame= 1\nframe= 2\n"))
+
+    def test_refactor_stale_temp_cleanup(self):
+        import tempfile
+        import time
+        from agentcut.render import cleanup_stale_temp_dirs
+        root = tempfile.mkdtemp(prefix="agentcut-clean-")
+        try:
+            old = os.path.join(root, "agentcut-old-123")
+            fresh = os.path.join(root, "agentcut-fresh-123")
+            other = os.path.join(root, "not-agentcut-old")
+            for d in (old, fresh, other):
+                os.makedirs(d)
+            ancient = time.time() - 3 * 3600
+            os.utime(old, (ancient, ancient))
+            os.utime(other, (ancient, ancient))
+            removed = cleanup_stale_temp_dirs(tmp_root=root, max_age_seconds=7200)
+            self.assertIn(old, removed)
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.isdir(fresh))
+            self.assertTrue(os.path.isdir(other))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_refactor_filter_script_graph_identical(self):
+        import tempfile
+        from agentcut.render import build_ffmpeg_args
+        from agentcut.validate import validate_project
+        proj = self._tiny_img_project()
+        errors, info = validate_project(proj)
+        self.assertEqual(errors, [])
+        argv_inline, _t, td1 = build_ffmpeg_args(proj, info, "/tmp/x.mp4")
+        self.assertIn("-filter_complex", argv_inline)
+        tmp = tempfile.mkdtemp(prefix="agentcut-fs-")
+        try:
+            argv_script, _t2, td2 = build_ffmpeg_args(
+                proj, info, "/tmp/x.mp4", filter_script_dir=tmp)
+            self.assertIn("-filter_complex_script", argv_script)
+            with open(os.path.join(tmp, "filter_complex.txt")) as fh:
+                script_graph = fh.read()
+            inline_graph = argv_inline[argv_inline.index("-filter_complex") + 1]
+            self.assertEqual(script_graph, inline_graph)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(td1, ignore_errors=True)
+            shutil.rmtree(td2, ignore_errors=True)
+
+    def test_refactor_segment_cache_image_byte_identical(self):
+        import tempfile
+        from agentcut.render import render_project, render_project_cached
+        proj = {"id": "imgcache", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [
+                    {"id": "c1", "kind": "image",
+                     "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                     "duration": 2.5},
+                    {"id": "c2", "kind": "image",
+                     "src": os.path.join(BASE, "data", "test_media", "pattern.png"),
+                     "duration": 1.333}]}
+        tmp = tempfile.mkdtemp(prefix="agentcut-segimg-")
+        try:
+            direct = os.path.join(tmp, "direct.mp4")
+            ok, _ = render_project(proj, direct)
+            self.assertTrue(ok)
+            cache = os.path.join(tmp, "cache")
+            miss = os.path.join(tmp, "miss.mp4")
+            ok, info = render_project_cached(proj, miss, cache_dir=cache)
+            self.assertTrue(ok, info)
+            self.assertTrue(info["cached"])
+            self.assertEqual(info["segments_rendered"], 2)
+            hit = os.path.join(tmp, "hit.mp4")
+            ok, info = render_project_cached(proj, hit, cache_dir=cache)
+            self.assertTrue(ok, info)
+            self.assertEqual(info["segments_reused"], 2)
+            self.assertEqual(info["segments_rendered"], 0)
+            blobs = []
+            for p in (direct, miss, hit):
+                with open(p, "rb") as fh:
+                    blobs.append(fh.read())
+            self.assertEqual(blobs[0], blobs[1])
+            self.assertEqual(blobs[1], blobs[2])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_refactor_segment_cache_video_hit_equals_miss_and_matches_direct(self):
+        import tempfile
+        from agentcut.render import (render_project, render_project_cached,
+                                     segment_fingerprint)
+        from agentcut.validate import validate_project
+        proj = self._cache_project()
+        tmp = tempfile.mkdtemp(prefix="agentcut-segvid-")
+        try:
+            direct = os.path.join(tmp, "direct.mp4")
+            ok, _ = render_project(proj, direct)
+            self.assertTrue(ok)
+            cache = os.path.join(tmp, "cache")
+            miss = os.path.join(tmp, "miss.mp4")
+            ok, info = render_project_cached(proj, miss, cache_dir=cache)
+            self.assertTrue(ok, info)
+            self.assertEqual(info["segments_rendered"], 3)
+            hit = os.path.join(tmp, "hit.mp4")
+            ok, info = render_project_cached(proj, hit, cache_dir=cache)
+            self.assertTrue(ok, info)
+            self.assertEqual(info["segments_reused"], 3)
+            # Core guarantee: a cached re-render is byte-identical
+            # to an uncached (cache-miss) render through the same path.
+            with open(miss, "rb") as fh:
+                miss_bytes = fh.read()
+            with open(hit, "rb") as fh:
+                self.assertEqual(miss_bytes, fh.read())
+            # And it matches the direct render in frame count, in
+            # every image/text frame, and in audio. Video frames
+            # (from frame 60, the video clip) differ by up to 8
+            # levels on saturated colours — a documented FFmpeg
+            # format-negotiation residual, NOT claimed identical.
+            direct_frames = self._framemd5_list(direct)
+            miss_frames = self._framemd5_list(miss)
+            self.assertEqual(len(direct_frames), len(miss_frames))
+            self.assertEqual(direct_frames[:60], miss_frames[:60])
+            self.assertEqual(self._pcm(direct), self._pcm(miss))
+            # Fingerprint: same inputs same hash, changed duration differs.
+            _e, vinfo = validate_project(proj)
+            fp1 = segment_fingerprint(vinfo["clips"][0], 0, proj, vinfo, 1.0)
+            altered = json.loads(json.dumps(proj))
+            altered["clips"][0]["duration"] = 3.5
+            _e2, vinfo2 = validate_project(altered)
+            fp2 = segment_fingerprint(vinfo2["clips"][0], 0, altered, vinfo2, 1.0)
+            self.assertIsNotNone(fp1)
+            self.assertNotEqual(fp1, fp2)
+            # Fallback: fade transitions do not qualify.
+            with open(os.path.join(BASE, "examples", "basic.json")) as fh:
+                basic = json.load(fh)
+            fb = os.path.join(tmp, "fb.mp4")
+            ok, info = render_project_cached(basic, fb, cache_dir=os.path.join(tmp, "c2"))
+            self.assertTrue(ok, info)
+            self.assertFalse(info["cached"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- Task 3: server ----
+    def test_refactor_atomic_write_and_concurrent_saves(self):
+        import tempfile
+        import threading
+        from agentcut.server import _atomic_write_json
+        tmp = tempfile.mkdtemp(prefix="agentcut-atomic-")
+        try:
+            path = os.path.join(tmp, "p.json")
+            _atomic_write_json(path, {"id": "x", "n": 1})
+            self.assertEqual(json.load(open(path)), {"id": "x", "n": 1})
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".agentcut-tmp-")])
+            errs = []
+
+            def _write(n):
+                try:
+                    _atomic_write_json(path, {"id": "x", "n": n})
+                except Exception as exc:  # noqa: BLE001
+                    errs.append(exc)
+
+            threads = [threading.Thread(target=_write, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errs, [])
+            data = json.load(open(path))
+            self.assertEqual(data["id"], "x")
+            self.assertIn(data["n"], range(8))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_refactor_background_jobs(self):
+        import tempfile
+        import time
+        from agentcut.server import BG_JOBS, call_tool
+        proj = self._tiny_img_project()
+        r = call_tool("start_render_job", {"project": proj})
+        job = json.loads(r["content"][0]["text"])
+        self.assertTrue(job["job_id"].startswith("bg_"))
+        deadline = time.time() + 60
+        status = None
+        while time.time() < deadline:
+            s = json.loads(call_tool("get_job_status", {"id": job["job_id"]})["content"][0]["text"])
+            status = s["status"]
+            if status in ("done", "failed"):
+                break
+            time.sleep(1)
+        self.assertEqual(status, "done", s)
+        self.assertTrue(os.path.isfile(s["output"]))
+        shutil.rmtree(os.path.dirname(s["output"]), ignore_errors=True)
+        r = call_tool("get_job_status", {"id": "bg_nope123"})
+        self.assertIn("JOB_NOT_FOUND", r["content"][0]["text"])
+        r = call_tool("cancel_job", {"id": job["job_id"]})
+        done = json.loads(r["content"][0]["text"])
+        self.assertEqual(done["status"], "done")
+        self.assertFalse(done["cancelled"])
+        r = call_tool("get_job", {"id": job["job_id"]})
+        self.assertIn("JOB_NOT_FOUND", r["content"][0]["text"])
+
+    # ---- Task 4: validate ----
+    def test_refactor_probe_cache_and_parallel(self):
+        from agentcut.validate import check_path_sandbox, probe_files_parallel, probe_media
+        p1 = probe_media(os.path.join(BASE, "data", "test_media", "clip1.mp4"))
+        p2 = probe_media(os.path.join(BASE, "data", "test_media", "clip1.mp4"))
+        self.assertEqual(p1, p2)
+        self.assertEqual(p1["duration"], 5.0)
+        out = probe_files_parallel([os.path.join(BASE, "data", "test_media", "clip1.mp4"),
+                                    os.path.join(BASE, "data", "test_media", "poster.png")])
+        self.assertTrue(all(v is not None for v in out.values()))
+        self.assertTrue(check_path_sandbox(os.path.join(BASE, "data", "test_media", "clip1.mp4")))
+        self.assertFalse(check_path_sandbox("/etc/passwd"))
+
+    def test_refactor_sandbox_symlink_escape_and_opt_in(self):
+        import tempfile
+        from agentcut.validate import check_path_sandbox, validate_project
+        tmp = tempfile.mkdtemp(prefix="agentcut-sbx-")
+        try:
+            outside = os.path.join(tmp, "outside.png")
+            shutil.copy(os.path.join(BASE, "data", "test_media", "poster.png"), outside)
+            link = os.path.join(BASE, "data", "test_media", "sbx-link.png")
+            try:
+                if os.path.lexists(link):
+                    os.unlink(link)
+                os.symlink(outside, link)
+                # The link lives inside the base dir but resolves outside it.
+                self.assertFalse(check_path_sandbox(link))
+            finally:
+                if os.path.lexists(link):
+                    os.unlink(link)
+            old = os.environ.get("AGENTCUT_SANDBOX")
+            os.environ["AGENTCUT_SANDBOX"] = "1"
+            try:
+                proj = {"id": "sbxtest", "version": 1,
+                        "output": {"width": 360, "height": 640, "fps": 24},
+                        "clips": [{"id": "c1", "kind": "image", "src": outside, "duration": 1.0}]}
+                errors, _info = validate_project(proj)
+                self.assertTrue(any(e["code"] == "PATH_OUTSIDE_SANDBOX" for e in errors), errors)
+            finally:
+                if old is None:
+                    os.environ.pop("AGENTCUT_SANDBOX", None)
+                else:
+                    os.environ["AGENTCUT_SANDBOX"] = old
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- Task 5: srt ----
+    def test_refactor_wrap_subtitle_and_ass(self):
+        from agentcut.srt import (batch_captions_by_window, cues_to_ass_text,
+                                  export_ass, wrap_lines, wrap_subtitle_text)
+        from agentcut.validate import wrap_caption_lines
+        ar = "هذا نص عربي طويل جدا يجب أن يلتف عند حدود الكلمات"
+        lines = wrap_subtitle_text(ar, 360, 48)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual(" ".join(lines).split(), ar.split())
+        self.assertEqual(wrap_caption_lines(ar, 48, 360 * 0.9), lines)
+        self.assertEqual(wrap_lines("one two three", 48, 1000), ["one two three"])
+        cues = [{"text": "Hello {world}", "start": 0.5, "end": 2.0},
+                {"text": "Second", "start": 65.0, "end": 67.5}]
+        wins = batch_captions_by_window(cues, 60.0)
+        self.assertEqual([w["index"] for w in wins], [0, 1])
+        self.assertEqual(len(wins[0]["cues"]), 1)
+        ass = cues_to_ass_text(cues, width=360, height=640)
+        self.assertIn("PlayResX: 360", ass)
+        self.assertIn("0:00:00.50", ass)
+        self.assertIn("0:01:05.00", ass)
+        # Delta: karaoke is now the default, so the two words are
+        # separated by a \k tag; escaping is still asserted
+        # per word (braces must not start an override tag).
+        self.assertIn("Hello", ass)
+        self.assertIn(r"\{world\}", ass)
+        self.assertIn("Alignment", ass)
+        with self.assertRaises(ValueError):
+            cues_to_ass_text([])
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-ass-")
+        try:
+            path = export_ass(cues, os.path.join(tmp, "out.ass"), width=360, height=640)
+            self.assertTrue(os.path.isfile(path))
+            with open(path) as fh:
+                self.assertIn("[Events]", fh.read())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- Task 6: package ----
+    def test_refactor_package_dedup_and_trim(self):
+        import tempfile
+        from agentcut.package import _collect_files, package_project
+        from agentcut.validate import validate_project
+        shutil.copy(os.path.join(BASE, "data", "test_media", "poster.png"),
+                    "/tmp/refactor-poster-copy.png")
+        proj = {"id": "packtest", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 24},
+                "clips": [
+                    {"id": "c1", "kind": "image",
+                     "src": os.path.join(BASE, "data", "test_media", "poster.png"),
+                     "duration": 1.0},
+                    {"id": "c2", "kind": "image", "src": "/tmp/refactor-poster-copy.png",
+                     "duration": 1.0},
+                    {"id": "c3", "kind": "video",
+                     "src": os.path.join(BASE, "data", "test_media", "clip1.mp4"),
+                     "trim_in": 1.0, "trim_out": 2.0}]}
+        errors, info = validate_project(proj)
+        self.assertEqual(errors, [])
+        collected = _collect_files(proj, info)
+        poster = os.path.join(BASE, "data", "test_media", "poster.png")
+        self.assertEqual(collected["/tmp/refactor-poster-copy.png"], poster)
+        tmp = tempfile.mkdtemp(prefix="agentcut-pack-")
+        try:
+            s = package_project(proj, os.path.join(tmp, "default"))
+            self.assertEqual(s["files_deduped"], 1)
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, "default", "media"))),
+                             ["clip1.mp4", "poster.png"])
+            s2 = package_project(proj, os.path.join(tmp, "trim"), trim_clips=True)
+            self.assertEqual(s2["files_trimmed"], 1)
+            packed = json.load(open(os.path.join(tmp, "trim", "project.json")))
+            c3 = [c for c in packed["clips"] if c["id"] == "c3"][0]
+            self.assertEqual((c3["trim_in"], c3["trim_out"]), (1.0, 2.0))
+            media = os.listdir(os.path.join(tmp, "trim", "media"))
+            self.assertEqual(len(media), 2)
+            trimmed = [f for f in media if f.startswith("clip1")][0]
+            dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                  "format=duration", "-of", "csv=p=0",
+                                  os.path.join(tmp, "trim", "media", trimmed)],
+                                 capture_output=True, text=True).stdout.strip()
+            self.assertAlmostEqual(float(dur), 3.0, delta=0.25)
+            # Default False preserves behaviour: packed project still
+            # references the full clip with original trims.
+            packed0 = json.load(open(os.path.join(tmp, "default", "project.json")))
+            c30 = [c for c in packed0["clips"] if c["id"] == "c3"][0]
+            self.assertEqual(c30["src"], "media/clip1.mp4")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.exists("/tmp/refactor-poster-copy.png"):
+                os.unlink("/tmp/refactor-poster-copy.png")
+
+
+class TestDelta(unittest.TestCase):
+    """Delta upgrade (Axis 1 gaps + Axis 2 polish), VERSION held
+    at 1.39.0: arc primitive, auto_duck precedence, final-master
+    loudnorm, ASS fades/karaoke, stamp feathering, eased stroke
+    progress, blur_pad, vintage/crisp, smooth-camera proof."""
+
+    def _graph(self, project):
+        from agentcut.render import build_ffmpeg_args
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(project, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        return " ".join(argv)
+
+    def _img_project(self, **kw):
+        p = {"id": "delta", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 2}]}
+        p.update(kw)
+        return p
+
+    def _vm_project(self, **kw):
+        p = self._img_project()
+        p["clips"][0]["duration"] = 4
+        p["audio"] = [
+            {"src": os.path.join(BASE, "data", "test_media", "clip1.mp4"),
+             "kind": "music", "volume": 0.8},
+            {"src": os.path.join(BASE, "data", "test_media", "clip2.mp4"),
+             "kind": "voice", "volume": 1.0, "start": 1.0}]
+        p.update(kw)
+        return p
+
+    # ---- Axis 1 gap: arc primitive ----
+    def test_delta_arc_geometry(self):
+        from agentcut.diagrams import stroke_to_points
+        pts, _c, _w, _a = stroke_to_points(
+            {"kind": "arc", "center": [100, 100], "radius": 50,
+             "start_angle": 0, "end_angle": 90})
+        # 0 degrees is east, positive is clockwise on screen
+        # (y grows down): 0 -> 90 runs east -> south.
+        self.assertAlmostEqual(pts[0][0], 150, delta=3)
+        self.assertAlmostEqual(pts[0][1], 100, delta=3)
+        self.assertAlmostEqual(pts[-1][0], 100, delta=3)
+        self.assertAlmostEqual(pts[-1][1], 150, delta=3)
+        # A zero sweep means a full circle, closing on itself.
+        full, _c, _w, _a = stroke_to_points(
+            {"kind": "arc", "center": [100, 100], "radius": 50,
+             "start_angle": 0, "end_angle": 0})
+        self.assertAlmostEqual(full[-1][0], full[0][0], delta=3)
+        self.assertAlmostEqual(full[-1][1], full[0][1], delta=3)
+        self.assertGreater(len(full), len(pts))
+
+    def test_delta_arc_validation(self):
+        p = self._img_project(diagrams=[
+            {"id": "d1", "start": 0, "end": 2, "strokes": [
+                {"kind": "arc", "center": [100, 100], "radius": 50,
+                 "start_angle": 0, "end_angle": 90}]}])
+        errors, _info = validate_project(p)
+        self.assertEqual(errors, [])
+        p["diagrams"][0]["strokes"][0]["radius"] = 500
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+        p["diagrams"][0]["strokes"][0]["radius"] = 50
+        del p["diagrams"][0]["strokes"][0]["end_angle"]
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+
+    # ---- Axis 2: stamp feathering + eased strokes ----
+    def test_delta_stamp_feathering_is_smoothstep(self):
+        import math
+        from agentcut.diagrams import _stamp_mask
+        mask = _stamp_mask(7, 0.0, 0.0)
+        band = False
+        differs_from_linear = False
+        for xx, yy, edge in mask:
+            d = math.hypot(xx, yy)
+            u = 1.0 if d <= 6 else max(0.0, (8 - d) / 2)
+            self.assertAlmostEqual(edge, u * u * (3 - 2 * u), places=9)
+            if 0 < edge < 1:
+                band = True
+                if abs(edge - u) > 0.05:
+                    differs_from_linear = True
+        self.assertTrue(band, "feather band must exist")
+        self.assertTrue(differs_from_linear,
+                        "falloff must be smoothstep, not linear")
+
+    def test_delta_stamp_idempotent_and_animator_eased(self):
+        from agentcut.diagrams import (Canvas, DiagramAnimator,
+                                       render_diagram_rgba)
+        strokes = [{"kind": "line", "points": [[0, 0], [400, 0]],
+                    "width": 7}]
+        c1, c2 = Canvas(900, 560), Canvas(900, 560)
+        c1.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
+        c2.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
+        c2.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
+        self.assertEqual(c1.bytes(), c2.bytes())
+        anim = DiagramAnimator(strokes, 900, 560, 10, 1.0)
+        total = len(anim.prepared[0][0])
+        fracs = []
+        last = None
+        for _ in range(10):
+            last = anim.next_frame()
+            fracs.append(sum(anim._drawn) / total)
+        # Smoothstep: early progress lags linear, late leads it.
+        self.assertLess(fracs[1], 0.2)
+        self.assertGreater(fracs[7], 0.8)
+        self.assertEqual(fracs[-1], 1.0)
+        # Final frame stays byte-identical to a direct full render.
+        self.assertEqual(last, render_diagram_rgba(strokes, 900, 560, 1.0))
+
+    # ---- Axis 2: auto_duck precedence ----
+    def test_delta_auto_duck_precedence(self):
+        g = self._graph(self._vm_project())
+        self.assertIn("sidechaincompress", g)
+        p = self._vm_project(auto_duck=False)
+        g = self._graph(p)
+        self.assertNotIn("sidechaincompress", g)
+        # Explicit ducking always wins, over True and over False.
+        for flag in (True, False):
+            p = self._vm_project(auto_duck=flag, ducking={
+                "voice_track": 1, "amount_db": 12, "fade": 0.25})
+            g = self._graph(p)
+            self.assertIn("eval=frame", g)
+            self.assertNotIn("sidechaincompress", g)
+        # No music: nothing to duck, no sidechain either way.
+        p = self._img_project()
+        p["audio"] = [{"src": os.path.join(BASE, "data", "test_media",
+                                           "clip2.mp4"),
+                       "kind": "voice", "volume": 1.0}]
+        g = self._graph(p)
+        self.assertNotIn("sidechaincompress", g)
+        # Non-bool auto_duck is a validation error, not silent.
+        p = self._vm_project(auto_duck="yes")
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+
+    # ---- Axis 2: final-master loudnorm ----
+    def test_delta_master_loudnorm(self):
+        p = self._vm_project()
+        p["output"]["master_loudnorm"] = True
+        g = self._graph(p)
+        self.assertIn("loudnorm=I=-14:TP=-1.5:LRA=11", g)
+        # Silent timeline (no audio tracks) skips mastering
+        # rather than failing on a -inf loudnorm measurement.
+        p = self._img_project()
+        p["output"]["master_loudnorm"] = True
+        g = self._graph(p)
+        self.assertNotIn("loudnorm=I=-14", g)
+        p = self._vm_project()
+        p["output"]["master_loudnorm"] = "yes"
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+        # Master loudnorm disqualifies segment caching: it
+        # measures the whole mix, not per-segment audio.
+        from agentcut.render import segment_cache_qualification
+        errs, info = validate_project(self._vm_project())
+        self.assertEqual(errs, [])
+        self.assertTrue(segment_cache_qualification(
+            self._vm_project(), info)[0])
+        p = self._vm_project()
+        p["output"]["master_loudnorm"] = True
+        errs, info = validate_project(p)
+        self.assertEqual(errs, [])
+        ok, reason = segment_cache_qualification(p, info)
+        self.assertFalse(ok)
+        self.assertIn("loudnorm", reason)
+
+    def test_delta_master_loudnorm_renders(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-delta-master-")
+        try:
+            p = self._vm_project()
+            p["output"]["master_loudnorm"] = True
+            out = os.path.join(tmp, "master.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            self.assertIn("audio", {s["codec_type"]
+                                    for s in probe["streams"]})
+            self.assertAlmostEqual(float(probe["format"]["duration"]),
+                                   4.0, delta=0.5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- Axis 2: ASS upgrades ----
+    def test_delta_ass_fades_karaoke(self):
+        from agentcut.srt import cues_to_ass_text
+        cues = [{"text": "Hello world", "start": 0.5, "end": 2.0,
+                 "word_timings": [
+                     {"word": "Hello", "start": 0.5, "end": 1.0},
+                     {"word": "world", "start": 1.0, "end": 2.0}]},
+                {"text": "Second cue here", "start": 3.0, "end": 5.0}]
+        ass = cues_to_ass_text(cues, width=360, height=640)
+        # Fade in/out by default, soft outline + drop shadow.
+        self.assertIn(r"{\fad(120,120)}", ass)
+        self.assertIn("Style: Default,", ass)
+        self.assertIn(",1,2,1,2,", ass)  # outline 2, shadow 1
+        # Measured karaoke: exact centisecond durations.
+        self.assertIn(r"{\k50}Hello", ass)
+        self.assertIn(r"{\k100}world", ass)
+        # Proportional split: labelled 'est', parts sum exactly.
+        self.assertIn(",Karaoke,est,", ass)
+        self.assertIn("proportional estimates", ass)
+        import re as _re
+        # Words are present but separated by \k tags, never contiguous.
+        for w in ("Second", "cue", "here"):
+            self.assertIn(w, ass)
+        ks = [int(x) for x in _re.findall(r"\\k(\d+)", ass)]
+        self.assertEqual(sum(ks[-3:]), 200)
+        # Fade off + karaoke off: plain dialogues, no Karaoke style.
+        plain = cues_to_ass_text(cues, width=360, height=640,
+                                 fade_ms=0, karaoke=None)
+        self.assertNotIn("fad(", plain)
+        self.assertNotIn("Karaoke", plain)
+        self.assertIn("Hello world", plain)
+        # Mismatched word_timings never apply to the wrong words:
+        # auto falls back to proportional (est), measured to plain.
+        bad = [{"text": "Other words", "start": 0.0, "end": 2.0,
+                "word_timings": [
+                    {"word": "Hello", "start": 0.0, "end": 1.0},
+                    {"word": "world", "start": 1.0, "end": 2.0}]}]
+        auto = cues_to_ass_text(bad, width=360, height=640)
+        self.assertIn(",Karaoke,est,", auto)
+        meas = cues_to_ass_text(bad, width=360, height=640,
+                                karaoke="measured")
+        self.assertNotIn("\\k", meas)
+        with self.assertRaises(ValueError):
+            cues_to_ass_text(cues, fade_ms=-1)
+        with self.assertRaises(ValueError):
+            cues_to_ass_text(cues, karaoke="bogus")
+
+    # ---- Axis 2: blur_pad + grades ----
+    def test_delta_blur_pad_and_grades(self):
+        p = self._img_project()
+        p["clips"][0]["fit"] = "blur_pad"
+        g = self._graph(p)
+        self.assertIn("boxblur=lr=20:lp=3:cr=20:cp=3", g)
+        p["clips"][0]["fit"] = "blur"
+        g = self._graph(p)
+        self.assertIn("gblur=sigma=20", g)
+        # Blur exclusions carry over to blur_pad.
+        p["clips"][0]["fit"] = "blur_pad"
+        p["clips"][0]["ken_burns"] = "zoom_in"
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+        p["clips"][0]["ken_burns"] = "none"
+        p["clips"][0]["chroma_key"] = {"color": "00FF00"}
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+        # Grades: vintage (faded + vignette), crisp (sharpened).
+        p = self._img_project()
+        p["clips"][0]["grade"] = "vintage"
+        g = self._graph(p)
+        self.assertIn("vignette", g)
+        self.assertIn("colorbalance", g)
+        p["clips"][0]["grade"] = "crisp"
+        g = self._graph(p)
+        self.assertIn("unsharp", g)
+        p["clips"][0]["grade"] = "nope"
+        errors, _info = validate_project(p)
+        self.assertNotEqual(errors, [])
+
+    def test_delta_blur_pad_and_grades_render(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-delta-render-")
+        try:
+            for fit, grade, name in (
+                    ("blur_pad", None, "pad.mp4"),
+                    (None, "vintage", "vintage.mp4"),
+                    (None, "crisp", "crisp.mp4")):
+                p = self._img_project()
+                if fit:
+                    p["clips"][0]["fit"] = fit
+                if grade:
+                    p["clips"][0]["grade"] = grade
+                out = os.path.join(tmp, name)
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                probe = ffprobe(out)
+                video = [s for s in probe["streams"]
+                         if s["codec_type"] == "video"][0]
+                self.assertEqual((video["width"], video["height"]),
+                                 (360, 640))
+                self.assertEqual(video["pix_fmt"], "yuv420p")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- Axis 2 task 5: smooth camera, proven not just named ----
+    def test_delta_kb_smoothstep_graph(self):
+        p = {"id": "kb", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 2, "ken_burns": "zoom_in"}]}
+        g = self._graph(p)
+        self.assertIn("zoompan", g)
+        self.assertIn("(3-2*(", g)  # smoothstep form, not linear
+        self.assertIn("scale=1440:2560", g)  # 2x pre-scale before zoompan
+        self.assertIn("s=720x1280", g)
+        self.assertIn("fps=30", g)
+
+    def test_delta_kb_even_output_dims(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-delta-even-")
+        try:
+            p = self._img_project()
+            p["output"]["width"] = 361
+            p["output"]["height"] = 641
+            out = os.path.join(tmp, "even.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            video = [s for s in probe["streams"]
+                     if s["codec_type"] == "video"][0]
+            self.assertEqual((video["width"], video["height"]),
+                             (360, 640))
+            self.assertEqual(video["r_frame_rate"], "30/1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_delta_kb_concat_with_scale_chain_renders(self):
+        # Delta fix (found by the delta proof render): a Ken
+        # Burns clip (zoompan outputs square pixels) refused
+        # to concat with a scale chain (scale rounds integer
+        # dimensions and compensates with SAR 5120:5121).
+        # Join inputs are now normalised to square pixels.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-delta-concat-")
+        try:
+            p = {"id": "kb-concat", "version": 1,
+                 "output": {"width": 720, "height": 1280, "fps": 30},
+                 "clips": [
+                     {"id": "b", "kind": "image",
+                      "src": os.path.join(BASE, "data", "test_media",
+                                          "board.png"),
+                      "duration": 2, "ken_burns": "zoom_in"},
+                     {"id": "c", "kind": "image",
+                      "src": os.path.join(BASE, "data", "test_media",
+                                          "poster.png"),
+                      "duration": 2, "fit": "cover"}]}
+            out = os.path.join(tmp, "kb-concat.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            self.assertAlmostEqual(float(probe["format"]["duration"]),
+                                   4.0, delta=0.5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestVisualLoop(unittest.TestCase):
+    """General visual-craft upgrade (v1.40.0): camera paths,
+    parallax overlays, kinetic texts + style presets, image
+    treatment, motion continuity, new transitions, produce
+    looks, and safer defaults. One class, one round at a time."""
+
+    def _graph(self, project):
+        from agentcut.render import build_ffmpeg_args
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(project, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        return " ".join(argv)
+
+    def _img_project(self, **kw):
+        p = {"id": "visual", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 2}]}
+        p.update(kw)
+        return p
+
+    # ---- Round 1: camera path ----
+    def test_camera_validates_and_wins_over_ken_burns(self):
+        from agentcut.render import timeline_summary
+        p = self._img_project()
+        p["clips"][0]["ken_burns"] = "zoom_in"
+        p["clips"][0]["camera"] = [
+            {"t": 0, "x": 0.3, "y": 0.5, "scale": 1.0},
+            {"t": 2.0, "x": 0.7, "y": 0.5, "scale": 1.2}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(any(w["code"] == "camera_overrides_ken_burns"
+                            for w in info["warnings"]))
+        ok, summary = timeline_summary(p)
+        self.assertTrue(ok, summary)
+        seg = summary["segments"][0]
+        self.assertEqual(seg["effective_ken_burns"], "none (camera)")
+        self.assertEqual(len(seg["camera"]), 2)
+
+    def test_camera_validation_errors(self):
+        def _errs(**clip_kw):
+            p = self._img_project()
+            p["clips"][0].update(clip_kw)
+            errors, _ = validate_project(p)
+            return errors
+        # Scale above the 1.25x comfort max.
+        self.assertTrue(_errs(camera=[{"t": 0, "x": 0.5, "y": 0.5,
+                                       "scale": 1.0},
+                                      {"t": 1.0, "x": 0.5, "y": 0.5,
+                                       "scale": 1.5}]))
+        # Centre fraction outside 0..1.
+        self.assertTrue(_errs(camera=[{"t": 0, "x": 1.5, "y": 0.5,
+                                       "scale": 1.0}]))
+        # Times must strictly increase.
+        self.assertTrue(_errs(camera=[{"t": 1.0, "x": 0.5, "y": 0.5,
+                                       "scale": 1.0},
+                                      {"t": 1.0, "x": 0.6, "y": 0.5,
+                                       "scale": 1.1}]))
+        # Time beyond the clip duration.
+        self.assertTrue(_errs(camera=[{"t": 0, "x": 0.5, "y": 0.5,
+                                       "scale": 1.0},
+                                      {"t": 3.0, "x": 0.6, "y": 0.5,
+                                       "scale": 1.1}]))
+        # Empty list, and camera + punch (a jump on a glide).
+        self.assertTrue(_errs(camera=[]))
+        self.assertTrue(_errs(
+            camera=[{"t": 0, "x": 0.5, "y": 0.5, "scale": 1.0}],
+            punch_in=True))
+        # Camera + blurred-background fit.
+        self.assertTrue(_errs(
+            camera=[{"t": 0, "x": 0.5, "y": 0.5, "scale": 1.0}],
+            fit="blur"))
+        # A single keyframe is a valid static framing.
+        self.assertEqual(_errs(
+            camera=[{"t": 0, "x": 0.5, "y": 0.5, "scale": 1.1}]), [])
+        # Camera + speed_curve on a video clip.
+        p = {"id": "visual", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "v", "kind": "video",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "clip1.mp4"),
+                        "trim_in": 0, "trim_out": 2,
+                        "speed_curve": [{"start": 0, "end": 2,
+                                         "speed": 1.0}],
+                        "camera": [{"t": 0, "x": 0.5, "y": 0.5,
+                                    "scale": 1.0}]}]}
+        errors, _ = validate_project(p)
+        self.assertTrue(errors, "camera + speed_curve must be rejected")
+
+    def test_camera_graph_uses_zoompan_smoothstep(self):
+        p = self._img_project()
+        p["clips"][0]["camera"] = [
+            {"t": 0, "x": 0.3, "y": 0.5, "scale": 1.0},
+            {"t": 2.0, "x": 0.7, "y": 0.5, "scale": 1.2}]
+        graph = self._graph(p)
+        self.assertIn("zoompan=", graph)
+        # Smoothstep shape (u*u*(3-2u)), not the KB fixed drift.
+        self.assertIn("3-2*", graph)
+        self.assertNotIn("1+0.12*", graph)
+        # The zoom-dependent centre clamp keeps edge keyframes
+        # in range at every zoom.
+        self.assertIn("1/(2*zoom)", graph)
+
+    def test_camera_renders_image_and_video(self):
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            p = {"id": "visual", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [
+                     {"id": "a", "kind": "image",
+                      "src": os.path.join(BASE, "data", "test_media",
+                                          "pattern.png"),
+                      "duration": 2,
+                      "camera": [{"t": 0, "x": 0.3, "y": 0.5,
+                                  "scale": 1.0},
+                                 {"t": 2.0, "x": 0.7, "y": 0.5,
+                                  "scale": 1.2}]},
+                     {"id": "b", "kind": "video",
+                      "src": os.path.join(BASE, "data", "test_media",
+                                          "clip1.mp4"),
+                      "trim_in": 0, "trim_out": 2,
+                      "camera": [{"t": 0, "x": 0.5, "y": 0.5,
+                                  "scale": 1.0},
+                                 {"t": 2.0, "x": 0.5, "y": 0.5,
+                                  "scale": 1.25}]}]}
+            out = os.path.join(tmp, "camera.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            self.assertAlmostEqual(float(probe["format"]["duration"]),
+                                   4.0, delta=0.5)
+            video = [s for s in probe["streams"]
+                     if s["codec_type"] == "video"][0]
+            self.assertEqual((video["width"], video["height"]),
+                             (360, 640))
+            self.assertEqual(video["pix_fmt"], "yuv420p")
+            # The glide really moves content: pattern.png is
+            # yellow-green on the left, blue on the right, so a
+            # left-to-right pan shifts the frame mean from
+            # green toward blue between the early and late frame.
+            early = _crop_mean(out, 0.3, 0, 0, 360, 640)
+            late = _crop_mean(out, 1.7, 0, 0, 360, 640)
+            self.assertGreater(early[1], late[1])
+            self.assertGreater(late[2], early[2])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    # ---- Round 2: parallax overlays ----
+    def _ov_project(self, depth=None, **clip_kw):
+        p = self._img_project()
+        p["clips"][0].update(clip_kw)
+        ov = {"id": "badge", "kind": "image",
+              "src": os.path.join(BASE, "data", "test_media",
+                                  "pattern.png"),
+              "start": 0, "duration": 2, "size": 0.22,
+              "x": 180, "y": 400}
+        if depth is not None:
+            ov["depth"] = depth
+        p["overlays"] = [ov]
+        return p
+
+    def test_parallax_depth_validates(self):
+        for good in (0, 0.5, 1):
+            errors, _ = validate_project(self._ov_project(depth=good))
+            self.assertEqual(errors, [], errors)
+        for bad in (-0.1, 1.5, "high"):
+            errors, _ = validate_project(self._ov_project(depth=bad))
+            self.assertTrue(errors, f"depth {bad!r} must be rejected")
+            self.assertTrue(any(e.get("field") == "overlays.depth"
+                                for e in errors))
+        # Depth on a static clip warns (no-op) but still validates.
+        errors, info = validate_project(self._ov_project(depth=0.5))
+        self.assertEqual(errors, [])
+        self.assertTrue(any(w["code"] == "parallax_depth_no_motion"
+                            for w in info["warnings"]))
+        # Depth on a camera clip does not warn.
+        errors, info = validate_project(self._ov_project(
+            depth=0.5,
+            camera=[{"t": 0, "x": 0.4, "y": 0.5, "scale": 1.0},
+                    {"t": 2.0, "x": 0.6, "y": 0.5, "scale": 1.1}]))
+        self.assertEqual(errors, [])
+        self.assertFalse(any(w["code"] == "parallax_depth_no_motion"
+                             for w in info["warnings"]))
+
+    def test_parallax_graph_terms(self):
+        cam = [{"t": 0, "x": 0.4, "y": 0.5, "scale": 1.0},
+               {"t": 2.0, "x": 0.6, "y": 0.5, "scale": 1.1}]
+        graph = self._graph(self._ov_project(depth=0.5, camera=cam))
+        # Camera term: depth * width * z * (fx0 - fx).
+        self.assertIn("0.5*360*(", graph)
+        graph0 = self._graph(self._ov_project(depth=0, camera=cam))
+        self.assertNotIn("0.5*360", graph0)
+        # Ken Burns pan term: closed form depth * W * 0.12.
+        graph_pan = self._graph(self._ov_project(
+            depth=0.5, ken_burns="pan_left"))
+        self.assertIn("0.5*360*0.12", graph_pan)
+        # Zoom-only motion yields no positional term.
+        graph_zoom = self._graph(self._ov_project(
+            depth=0.5, ken_burns="zoom_in"))
+        self.assertNotIn("0.5*360", graph_zoom)
+
+    def _magenta_centroid(self, path, t, w=360, h=640):
+        cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        data = subprocess.run(cmd, capture_output=True).stdout
+        self.assertEqual(len(data), w * h * 3)
+        xs, ys = [], []
+        for i in range(0, len(data) - 2, 3):
+            if data[i] > 200 and data[i + 1] < 100 and data[i + 2] > 200:
+                px = (i // 3) % w
+                xs.append(px)
+                ys.append((i // 3) // w)
+        self.assertTrue(xs, "no magenta overlay pixels found")
+        return sum(xs) / len(xs), sum(ys) / len(ys)
+
+    def test_parallax_moves_overlay_with_camera(self):
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            badge = os.path.join(tmp, "badge.png")
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "color=c=magenta:s=80x80",
+                 "-frames:v", "1", badge],
+                capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            def _render(depth):
+                p = {"id": "visual", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [{"id": "a", "kind": "image",
+                                "src": os.path.join(BASE, "data",
+                                                    "test_media",
+                                                    "pattern.png"),
+                                "duration": 2,
+                                "camera": [{"t": 0, "x": 0.4, "y": 0.5,
+                                            "scale": 1.0},
+                                           {"t": 2.0, "x": 0.6, "y": 0.5,
+                                            "scale": 1.1}]}],
+                     "overlays": [{"id": "badge", "kind": "image",
+                                   "src": badge, "start": 0, "duration": 2,
+                                   "size": 0.22, "x": 180, "y": 400,
+                                   "depth": depth}]}
+                out = os.path.join(tmp, f"parallax_{depth}.mp4")
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                return out
+            # Pinned control: the badge must not move.
+            out0 = _render(0)
+            ex0, ey0 = self._magenta_centroid(out0, 0.3)
+            lx0, ly0 = self._magenta_centroid(out0, 1.7)
+            self.assertAlmostEqual(ex0, 220, delta=8)
+            self.assertLess(abs(lx0 - ex0), 5)
+            self.assertLess(abs(ly0 - ey0), 5)
+            # Depth 0.5: the badge drifts left with the pan
+            # (content moves left as the camera pans right),
+            # about -35px between the two frames; y never moves
+            # (the path holds fy constant).
+            out5 = _render(0.5)
+            ex5, ey5 = self._magenta_centroid(out5, 0.3)
+            lx5, ly5 = self._magenta_centroid(out5, 1.7)
+            self.assertLess(lx5 - ex5, -20)
+            self.assertLess(abs(ly5 - ey5), 5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    # ---- Round 3: kinetic text + style presets ----
+    def _kinetic_project(self, **text_kw):
+        p = self._img_project()
+        text = {"text": "HELLO WORLD", "start": 0, "end": 2,
+                "size": 48, "x": "center", "y": 100,
+                "word_timings": [{"word": "HELLO", "start": 0.2,
+                                  "end": 1.0},
+                                 {"word": "WORLD", "start": 1.0,
+                                  "end": 1.8}]}
+        text.update(text_kw)
+        p["texts"] = [text]
+        return p
+
+    def test_kinetic_text_validates(self):
+        errors, _ = validate_project(self._kinetic_project())
+        self.assertEqual(errors, [])
+        # Emphasis on its own, and out-of-range factors.
+        p = self._kinetic_project(emphasis=True)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [])
+        p = self._kinetic_project(emphasis_factor=1.25)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [])
+        p = self._kinetic_project(emphasis_factor=2.0)
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        p = self._kinetic_project()
+        del p["texts"][0]["word_timings"]
+        p["texts"][0]["emphasis"] = True
+        errors, _ = validate_project(p)
+        self.assertTrue(errors, "emphasis without word_timings must fail")
+        # Mismatched words, and forbidden combinations.
+        p = self._kinetic_project(word_timings=[
+            {"word": "HELLO", "start": 0.2, "end": 1.0},
+            {"word": "THERE", "start": 1.0, "end": 1.8}])
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        p = self._kinetic_project(animation="pop")
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        p = self._kinetic_project(fade_in=0.2)
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        # Style names.
+        p = self._kinetic_project(style="title")
+        del p["texts"][0]["word_timings"]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        p["texts"][0]["style"] = "fancy"
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+
+    def test_text_style_presets_resolve(self):
+        # Title at 640px height: 0.055 * 640 = 35px, yellow.
+        p = self._img_project(texts=[{"text": "TITLE", "start": 0,
+                                      "end": 2, "x": "center", "y": 100,
+                                      "style": "title"}])
+        graph = self._graph(p)
+        self.assertIn("fontsize='35'", graph)
+        self.assertIn("fontcolor=yellow", graph)
+        # An explicit size always wins over the preset.
+        p["texts"][0]["size"] = 60
+        graph = self._graph(p)
+        self.assertIn("fontsize='60'", graph)
+        self.assertNotIn("fontsize='35'", graph)
+        # Caption preset at 640px height: 0.028 * 640 = 18px
+        # (presets are height ratios, so they scale with the
+        # output; at the 720x1280 default the caption preset
+        # is 36px, matching the old fixed caption default).
+        p = self._img_project(captions=[{"text": "hi", "start": 0,
+                                         "end": 2, "style": "caption"}])
+        graph = self._graph(p)
+        self.assertIn("fontsize='18'", graph)
+
+    def test_kinetic_text_renders_highlight_and_pop(self):
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            # Graph: base words at 48, highlight words popped to
+            # 60 (48 * 1.25), in the highlight colour with a box.
+            p = self._kinetic_project(emphasis=True)
+            graph = self._graph(p)
+            self.assertIn("fontsize='48'", graph)
+            self.assertIn("fontsize='60'", graph)
+            self.assertIn("fontcolor=yellow", graph)
+            out = os.path.join(tmp, "kinetic.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            probe = ffprobe(out)
+            self.assertAlmostEqual(float(probe["format"]["duration"]),
+                                   2.0, delta=0.5)
+            # The highlight switches words: frames inside one
+            # word's window are identical, frames across the
+            # switch differ.
+            def _frame(t):
+                cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", out,
+                       "-frames:v", "1", "-f", "image2pipe",
+                       "-vcodec", "png", "-"]
+                return subprocess.run(cmd, capture_output=True).stdout
+            self.assertEqual(_frame(0.5), _frame(0.9))
+            self.assertNotEqual(_frame(0.5), _frame(1.5))
+            # A non-kinetic control text does not switch.
+            p2 = self._kinetic_project()
+            del p2["texts"][0]["word_timings"]
+            out2 = os.path.join(tmp, "kinetic_control.mp4")
+            ok, info = render_project(p2, out2)
+            self.assertTrue(ok, info)
+            cmd = ["ffmpeg", "-v", "error", "-ss", "0.5", "-i", out2,
+                   "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
+            f05 = subprocess.run(cmd, capture_output=True).stdout
+            cmd[4] = "1.5"
+            f15 = subprocess.run(cmd, capture_output=True).stdout
+            self.assertEqual(f05, f15)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    # ---- Round 4: general image treatment ----
+    def test_treatment_validates(self):
+        def _errs(tr, project_level=False):
+            p = self._img_project()
+            if project_level:
+                p["treatment"] = tr
+            else:
+                p["clips"][0]["treatment"] = tr
+            errors, _ = validate_project(p)
+            return errors
+        self.assertEqual(_errs({"grain": 8, "vignette": 0.3,
+                                "shadow": 0.5}), [])
+        self.assertEqual(_errs({"grain": 8}, project_level=True), [])
+        self.assertTrue(_errs({"grain": 31}))
+        self.assertTrue(_errs({"vignette": 1.5}))
+        self.assertTrue(_errs({"shadow": -0.1}))
+        self.assertTrue(_errs({"glow": 1}))
+        self.assertTrue(_errs("heavy"))
+        self.assertTrue(_errs({"grain": "lots"}))
+
+    def test_treatment_graph(self):
+        p = self._img_project()
+        p["clips"][0]["treatment"] = {"grain": 8, "vignette": 0.5,
+                                      "shadow": 0.5}
+        graph = self._graph(p)
+        self.assertIn("noise=alls=8:allf=t", graph)
+        self.assertIn("vignette=angle=", graph)
+        self.assertIn("geq=", graph)
+        p2 = self._img_project(treatment={"grain": 8})
+        graph2 = self._graph(p2)
+        self.assertIn("noise=alls=8:allf=t", graph2)
+
+    def test_treatment_renders_visible_effects(self):
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            gray = os.path.join(tmp, "gray.png")
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "color=c=0x808080:s=360x640",
+                 "-frames:v", "1", gray],
+                capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            def _render(name, **kw):
+                p = {"id": "visual", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [{"id": "a", "kind": "image", "src": gray,
+                                "duration": 2}]}
+                p["clips"][0].update(kw.get("clip", {}))
+                if "project" in kw:
+                    p["treatment"] = kw["project"]
+                out = os.path.join(tmp, name)
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                return out
+            clean = _render("treat_clean.mp4")
+            cc = _crop_mean(clean, 0.5, 155, 295, 50, 50)[0]
+            corner = _crop_mean(clean, 0.5, 0, 0, 50, 50)[0]
+            edge = _crop_mean(clean, 0.5, 0, 0, 20, 640)[0]
+            self.assertGreater(corner / cc, 0.9)
+            self.assertGreater(edge / cc, 0.95)
+            # Clip vignette: corners darken hard, centre holds.
+            vig = _render("treat_vig.mp4",
+                          clip={"treatment": {"vignette": 1.0}})
+            vc = _crop_mean(vig, 0.5, 155, 295, 50, 50)[0]
+            vcorner = _crop_mean(vig, 0.5, 0, 0, 50, 50)[0]
+            self.assertLess(vcorner / vc, 0.6)
+            self.assertGreater(vc, 100)
+            # Clip shadow: the edge strip darkens, centre holds.
+            sh = _render("treat_shadow.mp4",
+                         clip={"treatment": {"shadow": 1.0}})
+            sc = _crop_mean(sh, 0.5, 155, 295, 50, 50)[0]
+            sedge = _crop_mean(sh, 0.5, 0, 0, 20, 640)[0]
+            self.assertLess(sedge / sc, 0.7)
+            self.assertGreater(sc, 100)
+            # Project vignette works through the joins too.
+            pvig = _render("treat_pvig.mp4",
+                           project={"vignette": 1.0})
+            pc = _crop_mean(pvig, 0.5, 155, 295, 50, 50)[0]
+            pcorner = _crop_mean(pvig, 0.5, 0, 0, 50, 50)[0]
+            self.assertLess(pcorner / pc, 0.6)
+            # Grain changes pixels (frame bytes differ from clean).
+            gr = _render("treat_grain.mp4",
+                         clip={"treatment": {"grain": 20}})
+            cmd = ["ffmpeg", "-v", "error", "-ss", "0.5", "-i", clean,
+                   "-frames:v", "1", "-f", "image2pipe",
+                   "-vcodec", "png", "-"]
+            f_clean = subprocess.run(cmd, capture_output=True).stdout
+            cmd[6] = gr
+            f_grain = subprocess.run(cmd, capture_output=True).stdout
+            self.assertNotEqual(f_clean, f_grain)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_scene_id_validates(self):
+        img = os.path.join(BASE, "data", "test_media", "pattern.png")
+
+        def _errs(clips):
+            errors, _info = validate_project(
+                {"id": "v", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": clips})
+            return errors
+        good = [{"id": "a", "kind": "image", "src": img, "duration": 1,
+                 "scene_id": "scene-1"},
+                {"id": "b", "kind": "image", "src": img, "duration": 1,
+                 "scene_id": "a_b"}]
+        self.assertEqual(_errs(good), [])
+        for bad in ("", "has space", "a/b", 123):
+            errs = _errs([{"id": "a", "kind": "image", "src": img,
+                           "duration": 1, "scene_id": bad}])
+            self.assertEqual(len(errs), 1)
+            self.assertEqual(errs[0]["field"], "clips.scene_id")
+            self.assertIn("fix", errs[0])
+
+    def test_continuity_rebases_scales(self):
+        img = os.path.join(BASE, "data", "test_media", "pattern.png")
+
+        def _clips(specs):
+            return [{"id": cid, "kind": "image", "src": img, "duration": 2,
+                     **kw} for cid, kw in specs]
+
+        def _info(clips):
+            errors, info = validate_project(
+                {"id": "v", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": clips})
+            self.assertEqual(errors, [])
+            return info
+        # Ken Burns chain: zoom_in, zoom_in, zoom_out, same scene.
+        info = _info(_clips([
+            ("a", {"ken_burns": "zoom_in", "scene_id": "s1"}),
+            ("b", {"ken_burns": "zoom_in", "scene_id": "s1"}),
+            ("c", {"ken_burns": "zoom_out", "scene_id": "s1"}),
+            ("d", {"ken_burns": "zoom_in", "scene_id": "s2"}),
+            ("e", {"scene_id": "s1"})]))
+        a, b, c, d, e = info["clips"]
+        self.assertNotIn("_kb_start", a)
+        self.assertAlmostEqual(b["_kb_start"], 1.12)
+        self.assertAlmostEqual(b["_kb_end"], 1.24)
+        self.assertTrue(b["_continuity"])
+        self.assertAlmostEqual(c["_kb_start"], 1.24)
+        self.assertAlmostEqual(c["_kb_end"], 1.12)
+        # A different scene breaks the chain; a clip after it does
+        # not rejoin the old scene.
+        self.assertNotIn("_kb_start", d)
+        self.assertNotIn("_continuity", e)
+        self.assertEqual(e["_motion_end"], 1.0)
+        # Static same-scene clip warns; the chain resets through it.
+        info = _info(_clips([
+            ("a", {"ken_burns": "zoom_in", "scene_id": "s1"}),
+            ("b", {"scene_id": "s1"}),
+            ("c", {"ken_burns": "zoom_in", "scene_id": "s1"})]))
+        a, b, c = info["clips"]
+        codes = [(w["code"], w["clip_id"]) for w in info["warnings"]]
+        self.assertIn(("scene_continuity_static", "b"), codes)
+        self.assertNotIn("_kb_start", c)
+        # Punch end feeds the next clip; the 1.25x max clamps.
+        info = _info(_clips([
+            ("a", {"punch_in": {"at": 1, "factor": 1.20},
+                   "scene_id": "s1"}),
+            ("b", {"ken_burns": "zoom_in", "scene_id": "s1"})]))
+        b = info["clips"][1]
+        self.assertAlmostEqual(b["_kb_start"], 1.20)
+        self.assertAlmostEqual(b["_kb_end"], 1.25)
+        # Camera: first-keyframe override, later-keyframe insert,
+        # and the raw project is never mutated.
+        raw = {"id": "v", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30},
+               "clips": _clips([
+                   ("a", {"camera": [{"t": 0, "x": 0.5, "y": 0.5,
+                                      "scale": 1.0},
+                                     {"t": 2, "x": 0.5, "y": 0.5,
+                                      "scale": 1.2}],
+                          "scene_id": "s1"}),
+                   ("b", {"camera": [{"t": 0, "x": 0.5, "y": 0.5,
+                                      "scale": 1.0},
+                                     {"t": 2, "x": 0.5, "y": 0.5,
+                                      "scale": 1.1}],
+                          "scene_id": "s1"}),
+                   ("c", {"camera": [{"t": 1, "x": 0.5, "y": 0.5,
+                                      "scale": 1.0},
+                                     {"t": 2, "x": 0.5, "y": 0.5,
+                                      "scale": 1.2}],
+                          "scene_id": "s1"})])}
+        errors, info = validate_project(raw)
+        self.assertEqual(errors, [])
+        a, b, c = info["clips"]
+        self.assertEqual(b["camera"][0]["scale"], 1.2)
+        self.assertTrue(b["_continuity"])
+        self.assertEqual(c["camera"][0], {"t": 0, "x": 0.5, "y": 0.5,
+                                          "scale": 1.1})
+        self.assertTrue(c["_continuity"])
+        self.assertEqual(raw["clips"][1]["camera"][0]["scale"], 1.0)
+
+    def test_continuity_graph_parameterizes_zoom(self):
+        img = os.path.join(BASE, "data", "test_media", "pattern.png")
+        project = {"id": "v", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 30},
+                   "clips": [
+                       {"id": "a", "kind": "image", "src": img,
+                        "duration": 2, "ken_burns": "zoom_in",
+                        "scene_id": "s1"},
+                       {"id": "b", "kind": "image", "src": img,
+                        "duration": 2, "ken_burns": "zoom_in",
+                        "scene_id": "s1"}]}
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [])
+        graph = self._graph(project)
+        b = info["clips"][1]
+        self.assertIn(f"{b['_kb_start']!r}+({b['_kb_end']!r}-{b['_kb_start']!r})",
+                      graph)
+        # The first clip keeps the legacy expression.
+        self.assertIn("1+0.12*", graph)
+
+    def test_continuity_renders_smooth_boundary(self):
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            img = os.path.join(BASE, "data", "test_media", "pattern.png")
+
+            def _render(name, scene_b):
+                p = {"id": "v", "version": 1,
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "clips": [
+                         {"id": "a", "kind": "image", "src": img,
+                          "duration": 2, "ken_burns": "zoom_in",
+                          "scene_id": "s1"},
+                         {"id": "b", "kind": "image", "src": img,
+                          "duration": 2, "ken_burns": "zoom_in",
+                          "scene_id": scene_b}]}
+                out = os.path.join(tmp, name)
+                ok, info = render_project(p, out)
+                self.assertTrue(ok, info)
+                return out
+            cont = _render("cont.mp4", "s1")
+            ctrl = _render("ctrl.mp4", "s2")
+            # Frames straddling the 2.0s boundary: with continuity
+            # the scale glides through it; without, clip b restarts
+            # at 1.0x after clip a ended at 1.12x. Measured on this
+            # build: continuous 1.12, control 6.17 — the control
+            # jump is ~5x the smooth-drift level, so the
+            # thresholds below carry real margin on both sides.
+            d_cont = _frame_mean_diff(cont, 1.9, 2.1)
+            d_ctrl = _frame_mean_diff(ctrl, 1.9, 2.1)
+            self.assertGreater(d_ctrl, 5.0)
+            self.assertLess(d_cont, d_ctrl * 0.5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_new_transitions_validate_graph_and_render(self):
+        # v1.40.0: zoom, wipe_tl and squeeze_h join the xfade set.
+        # Validation is automatic via the allowed set; the render
+        # passes the mapped xfade name straight through.
+        tmp = os.path.join(BASE, "data", "test_visual_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            img = os.path.join(BASE, "data", "test_media", "pattern.png")
+            poster = os.path.join(BASE, "data", "test_media", "poster.png")
+            p = {"id": "v", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [
+                     {"id": "a", "kind": "image", "src": img,
+                      "duration": 2},
+                     {"id": "b", "kind": "image", "src": poster,
+                      "duration": 2, "transition": "zoom",
+                      "transition_duration": 1.0},
+                     {"id": "c", "kind": "image", "src": img,
+                      "duration": 2, "transition": "wipe_tl",
+                      "transition_duration": 1.0},
+                     {"id": "d", "kind": "image", "src": poster,
+                      "duration": 2, "transition": "squeeze_h",
+                      "transition_duration": 1.0}]}
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [])
+            # 8s of clips minus three 1s overlaps.
+            self.assertAlmostEqual(info["total_duration"], 5.0, places=2)
+            graph = self._graph(p)
+            self.assertIn("xfade=transition=zoomin", graph)
+            self.assertIn("xfade=transition=wipetl", graph)
+            self.assertIn("xfade=transition=squeezeh", graph)
+            out = os.path.join(tmp, "transitions.mp4")
+            ok, rinfo = render_project(p, out)
+            self.assertTrue(ok, rinfo)
+            probe = ffprobe(out)
+            self.assertAlmostEqual(float(probe["format"]["duration"]),
+                                   5.0, delta=0.5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_explainer_look_validates(self):
+        # Unknown / non-string looks fail before any render.
+        from agentcut.render import produce_explainer
+        base = {"id": "look", "style": "blackboard",
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "background": os.path.join(BASE, "data", "test_media",
+                                           "poster.png"),
+                "scenes": [{"id": "s1", "title": "T",
+                            "narration": os.path.join(BASE, "data",
+                                                      "test_media",
+                                                      "one-button-voice.wav"),
+                            "captions": os.path.join(BASE, "examples",
+                                                     "one-button-explainer.srt")}]}
+        for bad in ("noir", 3, ["cinematic"]):
+            ok, info = produce_explainer(dict(base, look=bad),
+                                         "/tmp/look-bad.mp4")
+            self.assertFalse(ok)
+            self.assertIn("cinematic", info["fix"])
+            self.assertIn("vintage", info["fix"])
+
+    def test_explainer_look_applies_and_brief_wins(self):
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-look-")
+        try:
+            def _brief(**kw):
+                b = {"id": "look", "style": "blackboard",
+                     "output": {"width": 360, "height": 640, "fps": 30},
+                     "background": os.path.join(BASE, "data", "test_media",
+                                                "poster.png"),
+                     "scenes": [{"id": "s1", "title": "Scene One",
+                                 "narration": os.path.join(BASE, "data",
+                                                           "test_media",
+                                                           "one-button-voice.wav"),
+                                 "captions": os.path.join(BASE, "examples",
+                                                          "one-button-explainer.srt")}]}
+                b.update(kw)
+                return b
+
+            def _run(**kw):
+                out = os.path.join(tmp, f"look-{len(os.listdir(tmp))}.mp4")
+                ok, info = produce_explainer(_brief(**kw), out)
+                self.assertTrue(ok, info)
+                return info["project"]
+            # Cinematic on a NON-board background: treatment +
+            # grade on the scene clip, preset scene title.
+            proj = _run(look="cinematic")
+            clip = proj["clips"][0]
+            self.assertEqual(clip["treatment"],
+                             {"grain": 8, "vignette": 0.4})
+            self.assertEqual(clip["grade"], "cinematic")
+            self.assertTrue(proj["default_image_motion"])
+            stitle = [t for t in proj["texts"]
+                      if t["text"] == "Scene One"][0]
+            self.assertEqual(stitle.get("style"), "title")
+            self.assertNotIn("size", stitle)
+            # Still turns motion off; brief motion wins over it.
+            proj = _run(look="still")
+            self.assertFalse(proj["default_image_motion"])
+            proj = _run(look="still", motion="gentle")
+            self.assertTrue(proj["default_image_motion"])
+            # Clean is exactly today's defaults.
+            proj = _run(look="clean")
+            clip = proj["clips"][0]
+            self.assertNotIn("treatment", clip)
+            self.assertNotIn("grade", clip)
+            stitle = [t for t in proj["texts"]
+                      if t["text"] == "Scene One"][0]
+            self.assertEqual(stitle["size"], 52)
+            self.assertEqual(stitle["color"], "yellow")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_text_shadow_default_and_safe_area_warning(self):
+        # v1.40.0: plain texts get the subtle (2,2) shadow default
+        # when neither axis is set; an explicit axis still takes
+        # over (shadow_x=0 alone disables it).
+        img = os.path.join(BASE, "data", "test_media", "pattern.png")
+
+        def _proj(texts, captions=None):
+            return {"id": "v", "version": 1,
+                    "output": {"width": 360, "height": 640, "fps": 30},
+                    "clips": [{"id": "a", "kind": "image", "src": img,
+                               "duration": 2}],
+                    "texts": texts,
+                    "captions": captions or []}
+        base = {"text": "HELLO", "start": 0, "end": 2,
+                "size": 48, "x": "center", "y": 100, "color": "white"}
+        graph = self._graph(_proj([dict(base)]))
+        self.assertIn("shadowx=2:shadowy=2", graph)
+        graph = self._graph(_proj([dict(base, shadow_x=0)]))
+        self.assertNotIn("shadowx=", graph)
+        graph = self._graph(_proj([dict(base, shadow_x=5)]))
+        self.assertIn("shadowx=5:shadowy=0", graph)
+        # Safe-area warnings are warnings-only: an edge text
+        # warns, a centred text and a default caption do not,
+        # and nothing errors.
+        errors, info = validate_project(_proj(
+            [dict(base, x=0, text="EDGE")]))
+        self.assertEqual(errors, [])
+        codes = [w["code"] for w in info["warnings"]]
+        self.assertIn("text_outside_safe_area", codes)
+        errors, info = validate_project(_proj([dict(base)]))
+        self.assertEqual(errors, [])
+        self.assertNotIn("text_outside_safe_area",
+                         [w["code"] for w in info["warnings"]])
+        errors, info = validate_project(_proj(
+            [], captions=[{"text": "caption here", "start": 0, "end": 2}]))
+        self.assertEqual(errors, [])
+        self.assertNotIn("text_outside_safe_area",
+                         [w["code"] for w in info["warnings"]])
 
 
 if __name__ == "__main__":

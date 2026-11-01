@@ -1,432 +1,53 @@
-# AgentCut — an agent-first video editor
+# AgentCut 🎬
 
-AgentCut is not a human video editor. There is no timeline you drag clips
-on. An agent describes a project in JSON, validates it, previews frames,
-and renders a real MP4 with FFmpeg.
+### The video editor built for agents, not for hands.
 
-It is an original design. It is not a CapCut clone, it contains no CapCut
-code, assets, templates or effects, and it does not depend on CapCut in
-any way.
+[![CI](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![FFmpeg](https://img.shields.io/badge/engine-FFmpeg-green.svg)](https://ffmpeg.org/)
 
-## Clone and quickstart (public repo)
+**AgentCut turns a written brief into a finished, checked MP4 — no timeline to drag, no GUI to click, no footage to generate.** An agent describes the video in JSON, validates it before a single frame renders, previews its own frames, and delivers a real video with chapters, captions, diagrams, music and sound design.
+
+> **One sentence:** you write what the video should be; AgentCut makes sure it actually is — then proves it with frames and measurements.
+
+---
+
+## ⚡ Quickstart
 
 ```sh
 git clone https://github.com/ahmadshady747-create/agentcut.git
 cd agentcut
-./run.sh validate examples/basic.json
-./run.sh render examples/basic.json out.mp4   # 360x640, 8.0s, from the
-                                              # synthetic media in data/test_media/
-./run.sh serve                              # MCP server on stdio
-```
-
-A fresh clone needs only Python 3.10+ and `ffmpeg`/`ffprobe` on PATH;
-there are no Python dependencies. The test suite runs in CI on every
-push and pull request (`.github/workflows/test.yml`).
-
-## Run it
-
-```sh
-cd ~/workspace/agentcut
-./run.sh serve                              # MCP server on stdio
-./run.sh validate examples/basic.json
+./run.sh validate examples/basic.json   # validate first, always
 ./run.sh render examples/basic.json out.mp4
-./run.sh probe path/to/clip.mp4
-# The PYTHONPATH form (PYTHONPATH=src python3 -m agentcut ...) works too.
+./run.sh serve                          # MCP server on stdio
 ```
 
-Requirements: Python 3.10+, `ffmpeg` and `ffprobe` on PATH. No Python
-dependencies. No network access is used for media in v1: all `src` paths
-are local files.
+**Requirements:** Python 3.10+, `ffmpeg` and `ffprobe` on PATH. **Zero Python dependencies. Zero network calls for media.** All sources are local files.
 
-## Run it on your own device (on-device rendering)
+---
 
-The agent cannot run anything on your phone from here, so
-on-device rendering is user-driven: the agent builds a
-self-contained render pack and you render it on your phone:
+## 🎯 Why agent-first?
+
+Human editors are built for eyes and hands: drag, scrub, eyeball, repeat. An agent has none of those — so AgentCut gives it what it *can* use:
+
+- **A written spec, not a canvas.** One `project.json` is the whole video: clips, texts, captions, audio, overlays, diagrams, camera, grading.
+- **Validation before rendering.** Bad projects fail in seconds with a structured error — `code`, `field`, `clip_id` and a `fix` hint — instead of after a ten-minute render with a cryptic FFmpeg message.
+- **A verify loop the agent can close alone.** Render → inspect real frames → patch → re-render. No human needs to watch and report back.
+- **Determinism.** The same project renders the same video, so retries and series are safe.
+- **Local and free.** FFmpeg on your machine: no per-minute fees, no watermark, no footage leaving your disk.
+
+AgentCut is an original design. It is **not** a CapCut clone, contains no CapCut code, assets, templates or effects, and does not depend on CapCut in any way.
+
+---
+
+## 🪄 One button, one video: `produce_explainer`
+
+The flagship call. One brief in, one finished explainer out — no hand-written `project.json`:
 
 ```sh
-./run.sh package project.json mypack     # agent side
-# on the phone (Termux): pkg install python ffmpeg
-./render.sh                              # inside mypack -> output.mp4
+./run.sh produce-explainer examples/one-button-explainer.json out.mp4
 ```
-
-The pack holds the rewritten project, every media file, a copy
-of the AgentCut source, the bundled fonts and `render.sh`, and
-needs no network, no MCP server and no repo checkout. Fonts
-resolve in this order: `$AGENTCUT_FONT_DIR`, the bundled
-`fonts/` directory, Termux `$PREFIX` font dirs, then system
-paths; Arabic text with no Arabic font fails loudly with
-`FONT_NOT_FOUND` instead of rendering tofu boxes. Full guide,
-including heat/throttling honesty and troubleshooting, is in
-`docs/ON_DEVICE.md`; full-repo phone setup is
-`scripts/setup-termux.sh`.
-
-## Project format (v1)
-
-```json
-{
-  "version": 1,
-  "id": "my-first-cut",
-  "title": "My first cut",
-  "output": {"width": 360, "height": 640, "fps": 24},
-  "clips": [
-    {"id": "c1", "kind": "video", "src": "/path/clip1.mp4",
-     "trim_in": 0, "trim_out": 3, "transition": "fade"},
-    {"id": "c2", "kind": "image", "src": "/path/poster.png", "duration": 2}
-  ],
-  "texts": [
-    {"text": "Hello", "start": 0.5, "end": 2.5, "size": 48,
-     "x": "center", "y": 100}
-  ],
-  "captions": [
-    {"text": "First line", "start": 0, "end": 2}
-  ],
-  "audio": [
-    {"src": "/path/music.mp3", "kind": "music", "volume": 0.3},
-    {"src": "/path/voice.mp3", "kind": "voice", "volume": 1.0}
-  ]
-}
-```
-
-Rules, enforced by validation before any render:
-- `clips` must be non-empty and sequential. A video clip needs
-  `trim_in`/`trim_out` inside the source duration; an image clip needs
-  `duration`.
-- Output width/height are 16..1920, fps is 1..60, total duration is
-  at most 600 seconds in v1.
-- Text `x` is a pixel number or `"center"`; `y` is a pixel number.
-  Captions are rendered centred near the bottom.
-- Audio `kind` is `"voice"` or `"music"`, with an optional `start`
-  in seconds (default 0; a track starting at or after the timeline
-  end is a validation error). When voice and music are both present, music is ducked
-  with a real sidechain compressor keyed off the voice mix
-  (threshold 0.02, ratio 8, attack 200ms, release 1000ms) — unless
-  the project sets an explicit `ducking` object, which replaces
-  the sidechain with deterministic volume automation (see Pro pack).
-- Image clips may set `"ken_burns"` to `zoom_in`, `zoom_out`,
-  `pan_left` or `pan_right` (default `none`). It is image-only;
-  on a video clip, or with an unknown value, validation fails
-  with a structured error. Since 1.37.2 Ken Burns is a gentle
-  12% drift (zoom 1.00->1.12 or 1.12->1.00, pans at a constant
-  1.12x), eased with a smoothstep curve — the old 50% zoom
-  read as vibration and grotesque zoom in the 1.37.0 rhythm
-  proof, especially stacked with punch-in.
-- Transition `"fade"` means fade to/from black at clip boundaries
-  (0.3s). Transition `"crossfade"` is a true crossfade: video via
-  xfade and audio via acrossfade, 0.5s overlap, so a 3s + 3s timeline
-  with a crossfade renders as 5.5s. Both clips in a crossfade must be
-  longer than 0.6s, and text/caption times are in final-timeline
-  coordinates (after overlaps).
-
-## Examples that actually render
-
-- `examples/basic.json` — 360x640 vertical, 8.0s, video + image + text + captions.
-- `examples/crossfade.json` — true crossfade, 3s + 3s -> 5.5s.
-- `examples/landscape.json` — 1280x720, 8.0s.
-- `examples/square.json` — 720x720, 8.0s.
-- `examples/srt.json` + `examples/captions.srt` — captions from an SRT file.
-
-## MCP tools
-
-- `probe_media` — ffprobe a local file: duration, size, streams.
-- `create_project` — write a validated project JSON to the project store.
-- `get_project` — read a project back by id.
-- `list_projects` — list stored project ids.
-- `patch_project` — merge-patch a project (top-level fields and lists
-  replace; a clip with an existing id is replaced in place).
-- `validate_project` — validate without rendering.
-- `preview_project` — render a low-resolution proxy and extract frames
-  plus a contact sheet.
-- `render_project` — start an async render job.
-- `get_job` — poll a render/preview job: queued, running, done, failed,
-  with output path and ffprobe info on success, or a structured error.
-  Jobs run as detached processes and survive the client closing
-  stdio; a new connection can poll jobs from earlier sessions.
-
-Every error is a JSON object with `code` and `message`, plus `field`
-and `clip_id` when they apply. Error codes: `INVALID_SCHEMA`,
-`FILE_NOT_FOUND`, `CLIP_OUT_OF_RANGE`, `EMPTY_TIMELINE`,
-`INVALID_DIMENSION`, `DURATION_TOO_LONG`, `FONT_NOT_FOUND`,
-`RENDER_FAILED`, `JOB_NOT_FOUND`, `PROJECT_NOT_FOUND`.
-
-## Trust model (read this)
-
-This server runs locally and trusts the agent that runs it, exactly like
-other local MCP servers. It reads local files the agent names and runs
-FFmpeg on them. Do not expose it unauthenticated over a network, and
-do not point it at media you have not checked. That is a v1 boundary,
-not a bug to work around silently: a hosted version needs a sandbox,
-an allow-list, quotas and authentication first.
-
-## Version
-
-See `VERSION`. Changelog entries live in `STATE.md` round log.
-
-Crop-fill: a clip may set `fit` to `contain` (default, pad with black bars) or `cover` (scale up and centre-crop to fill the frame). Ken Burns implies cover.
-
-Transitions: `none`, `fade` (to/from black), and xfade transitions with acrossfaded audio (default 0.5s overlap; set `transition_duration` per incoming clip, max 2.0s, less than both clip durations): `crossfade`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `slide_left`, `slide_right`, `slide_up`, `slide_down`.
-
-Text styling: texts/captions accept `color`, and `fade_in`/`fade_out` seconds (sum less than the text duration); texts/captions accept (#RRGGBB or a named colour) and `box` (true/false); texts accept `size` 8..240 pixels, `x` (`center` or >= 0) and `y` (>= 0); texts also accept `position` presets (top_left, top_center, top_right, center, bottom_left, bottom_center, bottom_right) which override x/y. Captions must not set x/y (render ignores them — use `position` or `caption_position`). Texts/captions accept a drop shadow: `shadow_x`/`shadow_y` (-20..20) and `shadow_color` (named or #RRGGBB); captions default to a subtle (2,2) black shadow, plain texts to none — setting either axis takes over both. A rounded background pill replaces the rectangular box: `box_radius` (0..100), `box_color` (default black), `box_opacity` (default 0.5), `box_padding` (default 12); it requires `box: true` and cannot combine with animation or fades.
-
-Loudness: audio tracks accept `loudnorm` (true/false), single-pass normalisation to -16 LUFS before mixing.
-
-Audio fades: tracks accept `fade_in`/`fade_out` in seconds (sum must be less than the timeline). Clip speed: video clips accept `speed` 0.25..4.0; effective duration is trim duration divided by speed.
-
-Per-clip filters: a clip may set `brightness` (-1..1), `contrast` (0..2), `saturation` (0..3) or `grayscale` (true/false).
-
-Caption styling: project fields `caption_color`, `caption_size` and `caption_position` are defaults for every caption (including SRT cues, which carry no styling of their own); a caption that sets its own value keeps it. Wrapped captions: a cue wider than the frame is automatically word-wrapped into centred lines fitting `caption_max_width` (default 0.9 of frame width) at `caption_line_spacing` (default 1.35), stacked upward from the caption baseline; wrapping is on the logical text with BiDi applied per line, so Arabic words stay whole and joined and timing is unchanged. A single word wider than the frame stays whole and clips with a warning (the documented fallback).
-
-Scrim gradients: project field `scrims` with optional `top`/`bottom` sides — each `true` (opacity 0.6, depth 0.35 of frame height) or `{opacity 0..1, depth 0.05..0.6}`. A black gradient fading to transparent, over the clips and under overlays and texts. Default off.
-
-Poster: `./run.sh poster <json> <png> [seconds]` exports one full-resolution frame (default: middle of the timeline), or the `poster_frame` MCP tool.
-
-Large images: image clips are pre-scaled to output size before the main filter graph (2x for Ken Burns), so the graph decodes small files; a failed pre-scale falls back to the original.
-
-Robustness: image clips are probed (a video file passed as a still is rejected); images over 2560px on the long side are downscaled before the main scale. Video clips need a video stream and usable dimensions (an audio-only file, or garbage probed as 0x0, is rejected); video clips must not set `duration` and image clips must not set trim fields, since render ignores both. Validation warnings (never blocking) live in `info["warnings"]`: `layer_text_overlap_warning` when an overlay path crosses a text/caption region, and `text_overflow_warning` when a text's estimated width exceeds the frame, or a caption holds a single word wider than the frame (wrappable captions wrap instead of warning; split the text or shrink it). New in 1.37.0: `static_shot_warning` for a still longer than 4.5s with no motion of any kind, and `active_chunk_overflow_warning` for an active-caption chunk wider than the frame. Overlapping SRT cues render stacked. A `loudnorm` track that is digitally silent is a structured render error (remove `loudnorm` from it). Jobs and outputs persist under `data/jobs/` and `data/outputs/` with no auto-cleanup; old entries may be deleted by hand.
-
-## Producer: one call, any agent
-
-AgentCut is built so that Muse, Claude, Cursor, or any other MCP
-client can act as a video producer, not just as a renderer. The
-producer call takes a short brief, not a full project:
-
-```sh
-./run.sh produce examples/producer-brief.json out.mp4
-```
-
-A brief needs only a format preset (`vertical`, `square` or
-`landscape`), a list of media paths, and optionally a title, texts
-or audio. Ready-made starting briefs live in `examples/`:
-`brief-montage` (square photo montage), `brief-highlight`
-(landscape video highlights), `brief-announcement` (vertical
-announcement) and `brief-showcase` (square product-style showcase).
-Copy one, swap in your own media paths, and produce. A brief
-also accepts a `soundtrack` shortcut (a path, or a dict with
-volume/fades) and `sections` — titled groups of clips that each
-get an auto title card at the section's start. Image clips default to 3s, video clips default to their
-full duration, and later clips crossfade by default. The call
-validates, renders, and returns review frames from the finished
-video, so the producing agent reviews its own frames, patches what
-is wrong, and re-produces. For all three shapes at once, use
-`./run.sh produce-variants <brief.json> <dir>` (MCP tool
-`produce_variants`): vertical, square and landscape renders of
-the same brief, each with its own review frames and `qa` block.
-The produce result also carries a `qa` block:
-duration/resolution/pix_fmt checks plus black-frame and silence
-detection, reported as warnings (a silent image montage, for
-example, is reported as silent throughout rather than failing).
-AgentCut itself does not generate
-footage, voices or music: the producing agent supplies local media,
-and AgentCut turns it into a finished, checked video.
-
-## Licence
-
-AgentCut is licensed under the Business Source License 1.1 — see
-[LICENSE](LICENSE). In short: you may copy, modify and use it,
-including in production, except to provide a competing agent-first
-video editor service to third parties. On the Change Date
-(2030-10-28) this version converts to the Apache License, Version
-2.0. BSL 1.1 is not an Open Source licence.
-
-## Overlays (picture-in-picture)
-
-A project may carry an `overlays` list on top of the main timeline.
-Each overlay has an id, a kind (`video` or `image`), a local src, a
-start second and a duration inside the timeline, a size as a
-fraction of the output width (default 0.35), a position preset
-(`top_left`, `top_center`, `top_right`, `center`, `bottom_left`,
-`bottom_center`, `bottom_right`) or x/y pixel offsets, and an
-opacity 0..1. When an overlay sets both a preset and x/y, the
-explicit x/y win per axis (texts differ: a text `position`
-overrides its x/y). Video overlays trim like clips and loop when shown
-longer than their trimmed source. An overlay video may also set
-`volume` (0..2, default 0.0 muted): its audio is then mixed in
-at the overlay's start, for its shown duration, alongside the
-project audio tracks. Volume above zero on an image overlay or
-a silent video is a validation error with a fix hint. See
-examples/overlay.json. Overlay validation errors carry a `fix`
-hint, so an agent can correct the project directly.
-
-## Overlay keyframes
-
-An overlay may carry `keyframes`: a list of at least 2 entries with
-a `time` in seconds since the overlay starts, plus any of `x`, `y`
-(pixels), `scale` (fraction of output width) and `opacity` (0..1).
-Values interpolate linearly between keyframes; a field a keyframe
-omits keeps the previous keyframe's value, or the overlay's base
-value. Position, opacity and scale all animate smoothly per
-frame (scale uses FFmpeg scale eval=frame; note that a format
-filter after a varying scale pins the stream to its first
-frame's size, so the format conversion sits before the scale).
-Scale keyframes on a looping video overlay are rejected —
-shorten the overlay to its trimmed source duration, or drop the
-scale keyframes — and so is chroma_key with scale keyframes,
-because colorkey cannot handle per-frame size changes on this
-FFmpeg build.
-
-## Split, reverse, freeze, loop
-
-Video clips accept `reverse` (play backwards), `freeze_at` (a
-second inside the trim range; that frame holds for the whole
-trim duration, silently) and `loop_count` 2..8 (repeat the
-trimmed segment, video and audio). These three do not combine
-with each other or with `speed` on one clip; validation says so
-with a fix hint. `split_clip` (MCP tool, or `./run.sh split
-<json> <clip_id> <seconds>`) splits one clip at a time inside
-its rendered duration: the first part keeps the incoming
-transition, the second part continues with none, and the
-timeline total does not change. Store the returned project
-with create_project to keep the split.
-
-## Chroma key, masks, blurred fit
-
-Clips and overlays accept `chroma_key` (a colour name such as
-`green`, or a #RRGGBB value) with optional `chroma_similarity`
-and `chroma_blend`: the keyed colour becomes transparent.
-`mask_shape` is `rect` (mask_x, mask_y, mask_w, mask_h) or
-`circle` (mask_x, mask_y centre, mask_r radius), with an
-optional `mask_feather` in pixels for a soft edge; masked main
-clips show black outside the mask. A clip may use
-`fit: "blur"` instead of contain/cover: a blurred, darkened
-copy of the clip fills the frame behind the contained clip.
-Mask coordinates are frame pixels. Mask and chroma_key now
-intersect on clips and overlays: the keyed colour stays
-transparent inside the mask, and everything outside the mask
-stays hidden. Do not combine mask with scale
-keyframes (rejected with a fix).
-
-## More transitions and effects
-
-Besides crossfade, fade, wipe and slide, clips accept dissolve,
-fade_black, fade_white, pixelize, radial, circle_open,
-circle_close, smooth directions, diagonal directions, cover and
-reveal directions, distance and rect_crop — all as incoming
-transitions with an optional transition_duration. Clips and
-overlays accept generic effects: `blur` (sigma), `sharpen`,
-`vignette` (true/false), `hue` (degrees) and `pixelize` (block
-size). Effect ranges are validated with fix hints.
-
-## Speed curves and denoise
-
-A video clip may carry `speed_curve`: segments with `start`,
-`end` and `speed` that partition the trimmed source range
-exactly, with no gaps or overlaps. The clip duration is the
-sum of each segment's duration divided by its speed. A curve
-does not combine with `speed`, `freeze_at`, `loop_count`,
-`reverse` or blurred-background fit. `split_clip` on a curved
-clip maps the rendered split time back through the curve and
-splits the curve, keeping the total duration. Audio noise
-reduction is `denoise: true` on a video clip or an audio
-track (FFmpeg afftdn).
-
-## Animated text and stroke
-
-Texts (and captions) accept `animation`: `slide_in` (slides in
-from the left), `slide_out` (slides out to the right),
-`slide_in_out`, or `pop` (grows from half size to full size),
-with `animation_duration` in seconds (default 1.0, must fit
-the text window). `stroke` (0..10) and `stroke_color` add an
-outline around the text.
-
-## Text & graphics polish (1.36.0)
-
-See `examples/text-polish.json`: wrapped captions, a bottom
-scrim, a shadowed title with a rounded pill background, a
-pop keyword with shadow, and a bordered/rounded/shadowed
-overlay, in one render. Overlay dressing: overlays accept
-`border_width` (0..20) and `border_color`, `corner_radius`
-(0..200, at most half the smaller displayed side), and a drop
-shadow (`shadow_dx`/`shadow_dy` -100..100, `shadow_blur`
-0..30, `shadow_opacity` 0..1) — the shadow is active only
-when an offset or a blur is set. All dressing defaults off.
-
-## Visual rhythm, part 1 (1.37.0)
-
-See `examples/visual-rhythm.json`: procedural SFX bound to a
-title, a transition and an overlay; default micro-motion on
-two stills; a punch-in on a panel; an Arabic active caption.
-- SFX: texts, captions, clips and overlays accept `sfx` —
-  one of `pop`, `whoosh`, `cash`, `chime` (same ring as
-  cash), `click`, `ding`, `thud` — or a local audio file
-  path, plus optional `sfx_volume` (0..2, default 0.35).
-  The sound fires at the element's start automatically and
-  mixes into the final audio, even with no other audio.
-  Unknown names, bad volumes and missing files are
-  structured validation errors. 1.37.1 fix: built-ins are
-  time-gated full-timeline sources and file SFX use adelay
-  alone, so timing holds with `default_image_motion` on
-  and off — the 1.37.0 code played every SFX from t=0
-  under motion because atrim after adelay discarded the
-  delay silence (see CHANGELOG).
-- Micro-motion: project `default_image_motion: true`
-  auto-animates stills (alternating zoom_in / zoom_out by
-  clip index) unless a clip sets its own `ken_burns`; clips
-  accept `punch_in` (true, or `{at, factor}` with factor
-  1.18..1.25) for a centre punch at a frame boundary.
-  Since 1.37.2 punch_in WINS over Ken Burns and never stacks
-  with it: a punched clip is static until its punch time,
-  then holds its punch factor to clip end, so the punch
-  factor is the TOTAL scale (max 1.25x, never 1.8x).
-  `timeline_summary` shows `effective_ken_burns` (a punched
-  clip reports `none (punch_in)`), `punch_at` / `punch_factor`
-  and `sfx` per segment. A clip that sets BOTH an explicit
-  `ken_burns` and `punch_in` warns (`punch_in_overrides_
-  ken_burns`, warnings only); default motion + punch does
-  not warn, because punch winning over a default is the
-  designed rule.
-  A still longer than 4.5s with no motion of any kind
-  warns (`static_shot_warning`, warnings only).
-- Active captions: a caption with `word_timings` (one
-  `{word, start, end}` per word, absolute seconds, matching
-  the caption words) renders in 2–4 word chunks with the
-  current word highlighted (`highlight_color`, default
-  yellow; `highlight_mode: "chunk"` highlights the whole
-  active chunk instead). Word widths are measured by
-  FFmpeg at render time, so the highlight sits exactly on
-  its word; Arabic joining and RTL order are preserved.
-  Over-wide chunks warn instead of silently clipping.
-
-## Animated stroke diagrams (1.38.0)
-
-A project may carry a `diagrams` list: hand-drawn
-educational art that draws itself on screen, as a general
-element any project can use. A diagram is custom strokes
-(`polyline`, `arrow`, `circle`, `ellipse`, `rect`, in
-diagram-local coordinates, canvas default 900x560) or one
-built-in template with parameters — `chart` (values:
-axes, faint grid, arrowed rising curve, yellow tip),
-`basket` (coins: basket with coins), `balance` (left/
-right: beam tilts toward the heavier side), `causes`
-(rows: badge + arrow per row). Templates take parameters
-only, never text: every label on screen is an AgentCut
-text (drawtext), so Arabic labels keep the BiDi-verified
-path and no text is ever baked into a diagram image.
-
-Placement mirrors overlays: `size` as a fraction of the
-output width, a `position` preset, or x/y pixel offsets
-winning per axis, over a `start`..`end` window. The
-diagram draws stroke by stroke, in list order, over
-`draw` seconds (default min(4s, window)), then holds the
-complete diagram until `end` — the hold freezes the last
-frame, it never replays the draw, and the final frame
-equals the complete diagram exactly. Artwork rules:
-clean geometry, one consistent chalk weight per stroke
-(`width` 2..20, 7 standard), subtle chalk texture with
-slightly irregular edges that are static per stroke
-(never animated jitter), white chalk with yellow for
-emphasis only. Stroke `weight` defaults to path length
-(long strokes take longer); give long faint lines a
-small explicit weight or they will eat the draw window.
-See `examples/stroke-diagram.json` (chart + basket over
-a board still) and SKILL.md for the full schema.
-
-## One-button board explainer (1.39.0)
-
-`produce_explainer` (MCP tool, or
-`./run.sh produce-explainer <brief.json> <mp4>`) is the
-one call for a finished board explainer: one brief in,
-one video out, no hand-written project.json. The brief
-shape, verbatim:
 
 ```json
 {
@@ -437,164 +58,108 @@ shape, verbatim:
   "title": "مغالطة رجل القش",
   "chapters": true,
   "motion": "gentle",
-  "music": null,
   "scenes": [
     {"id": "s1", "title": "ما هي؟",
      "narration": "/path/voice_s1.mp3", "captions": "/path/s1.srt",
-     "diagram": {"template": "causes", "params": {"rows": 2}, "draw": 3.5, "size": 0.72, "x": 101, "y": 330},
+     "diagram": {"template": "causes", "params": {"rows": 2}, "draw": 3.5},
      "keywords": [{"text": "رجل القش", "start": 5.0, "end": 9.0, "sfx": "pop"}]}
   ]
 }
 ```
 
-Everything is derived, nothing hand-assembled: scene
-clip durations come from ffprobe of the narration audio
-(never from hand-supplied durations); scenes play
-back-to-back in list order and the total is their sum.
-Per-scene SRT cues are scene-relative and are offset by
-the scene start into one merged captions track. A scene
-diagram defaults to the whole scene window (draw defaults
-to min(4s, window)); an explicit diagram start/end is a
-scene-relative offset and must stay inside the scene.
-The brief title stays fixed across the whole video and
-each scene title shows during its scene; keyword texts
-show at their scene-relative windows with the existing
-text SFX mechanism (a keyword may also set `x`, `y`,
-`size`, `color` or `position` to sit above or below its
-diagram instead of at the default spot). `chapters: true` writes one chapter
-per scene title at the scene start. Blackboard style
-turns scrims top+bottom on; `motion: "gentle"` turns
-`default_image_motion` on (gentle Ken Burns ≤1.12x).
-`punch_in` anywhere in the brief is rejected with a fix
-hint — gentle motion only, zero punch-ins. Optional
-`music` adds a music track with 12 dB ducking windows
-equal to the narration spans. Structured errors with fix
-hints cover missing narration/captions files, narration
-with no measurable duration, a diagram outside its scene
-window, and unknown templates. A runnable example with
-repo media only: `examples/one-button-explainer.json`
-(+ `examples/one-button-explainer.srt`).
+Scene durations come from the narration audio itself, SRT cues are merged into one captions track, diagrams draw inside their scenes, chapters land on scene starts, and motion stays gentle — `punch_in` is rejected by design. Add `look` (`clean`, `cinematic`, `vintage`, `bold`, `still`) for a full treatment + grade + motion profile on any background.
 
-## Export cap and stabilisation
+For simpler jobs, `produce_video` takes a short brief (format preset + media + title + audio) and `produce_variants` renders vertical, square and landscape from one brief.
 
-Outputs go up to 3840 wide (and tall). A video clip may set
-`stabilize: true` for real two-pass vidstab stabilisation:
-a detect pass at the clip's final scale, then a transform
-pass in the main render. Stabilisation does not combine
-with freeze, loop, reverse, speed changes or blurred fit
-on the same clip.
+---
 
-## Agent integration
+## ✨ What it can do
 
-AgentCut does not generate, transcribe or synthesise media:
-the producing agent supplies plans, captions, audio and media
-as local files, and AgentCut edits deterministically and
-verifies the result. Integration tools: `timeline_summary`
-(MCP tool, or `./run.sh summary <json>`) for reasoning about
-a timeline; `check_brief` for verifying a produced project
-against its brief (produce results also carry a
-`conformance` block, and briefs may set `target_duration`
-and `overlays`); and `snapshot_project` /
-`rollback_project` / `list_snapshots` for safe
-experimentation — snapshot, patch, preview, roll back on a
-bad result. Validation errors on new features carry a
-`fix` hint with the field and clip id.
+### 🎥 Timeline & editing
+Sequential clips (video trims, image durations), transitions (`crossfade`, `fade`, wipes, slides, `dissolve`, `zoom`, `wipe_tl`, `squeeze_h` and more), split / reverse / freeze / loop, speed and speed curves, overlays with keyframes, masks, chroma key, blurred-background fit (`blur`, `blur_pad`), two-pass stabilization, and outputs up to 3840 wide with timelines up to 600 seconds.
 
-## Templates
+### 🎬 Camera & motion — new in 1.40.0
+- **Camera paths:** `camera: [{t, x, y, scale}]` — a smooth multi-stop pan/zoom glide on any clip, capped at 1.25× so it never feels like the old 50% zoom.
+- **Parallax:** overlays drift with `depth` 0..1 against camera motion — foreground faster than background.
+- **Motion continuity:** clips sharing a `scene_id` chain their scales across cuts, so a scene glides instead of jumping.
+- **Gentle by default:** Ken Burns is a 12% eased drift, punch-ins are absolute (never stacked), and stills get automatic micro-motion unless you say otherwise.
 
-Ready projects and produce briefs an agent can copy:
+### ✍️ Text & captions
+Word-reveal texts, animated texts (`slide_in`, `slide_out`, `pop`), kinetic word-highlight captions with measured word widths, ASS export with fades and karaoke, wrapped captions, scrims, rounded pills, borders, shadows and safe-area warnings. **Arabic is first-class:** Noto Naskh Arabic shaping verified by eye, BiDi-correct line order (digit-led lines included), word-only reveal so letters stay joined. Write percents as ٪ (U+066A) — `%` and `#` have no glyph in the Arabic fonts here.
 
-- Blackboard: `examples/blackboard.json` (project) and
-  `examples/brief-blackboard.json` (brief) — a synthetic dark
-  board with a wooden frame (`data/test_media/board.png`) and
-  chalk-style white/yellow texts, including an Arabic line.
-- Animated slideshow: `examples/animated.json` and
-  `examples/brief-animated.json` — Ken Burns images, dissolve
-  and circle_open transitions, and a picture-in-picture overlay.
+### 🎵 Audio
+Voice + music with a real sidechain compressor, or deterministic ducking windows, or `auto_duck` — with one exact precedence: an explicit `ducking` object always wins, otherwise voice + music gets the sidechain, and `auto_duck: false` passes music through untouched. Per-track loudnorm (−16 LUFS), a final-master option (−14 LUFS), procedural SFX (`pop`, `whoosh`, `cash`, `click`, `ding`, `thud`) fired at element starts, and producer QA reporting loudness, peak and freeze segments.
 
-## Word reveal
+### ✏️ Diagrams that draw themselves
+Stroke diagrams (`polyline`, `arrow`, `circle`, `ellipse`, `rect`, `line`, `arc`) or templates (`chart`, `basket`, `balance`, `causes`, `primitives`) that draw stroke-by-stroke with feathered chalk edges and eased progress — then hold the finished frame exactly. Labels are always AgentCut text, never baked into the art, so Arabic stays on the verified BiDi path.
 
-A text may set `reveal: "word"`. At render time it expands into
-cumulative word prefixes staggered across its window in
-proportion to word length: only the first word is visible early,
-the full text is visible by the window end. Reveal is word-only
-by design — Arabic letters join, so per-character reveal would
-break joining. Reveal cannot combine with `animation` on one text.
+### 📦 Delivery & verification
+Chapters in file metadata, delivery presets (`youtube_1080`, `shorts_720`, `instagram_square`) that never override your explicit settings, poster-frame export, preview proxies with title-safe / action-safe guides and timecode, and a `qa` block on every produce result (duration, resolution, pixel format, black-frame and silence checks — warnings, never silent failures).
 
-## Pro pack (1.32.0): easing, grading, ducking, chapters, delivery, review aids
+### 📱 On your own phone
+The agent can't run code on your phone, so it builds a self-contained render pack — project, media, source, fonts, `render.sh` — and you render it in Termux with no network, no server, no checkout. Full guide: [`docs/ON_DEVICE.md`](docs/ON_DEVICE.md).
 
-- Easing keyframes: an overlay keyframe may set `easing` to
-  `linear` (default), `ease_in`, `ease_out` or `ease_in_out`.
-  It shapes scale, position and opacity interpolation between
-  keyframes (FFmpeg time expressions on normalised segment
-  time). Set it on either keyframe of a segment; if both set
-  a non-linear easing, the later keyframe wins. Example:
-  `{"time": 0, "x": 0, "easing": "ease_in"}, {"time": 4, "x": 200, "easing": "ease_in"}`.
-  Unknown values fail validation with a fix hint.
-- Colour grading: a clip may set `grade` to `cinematic`,
-  `teal_orange`, `warm`, `cool` or `noir`. These are plain
-  eq/colorbalance/saturation combinations (see CHANGELOG for
-  each definition) — they are not film stocks and do not
-  emulate any film process. A clip may also set `lut` to a
-  local `.cube` file, rendered via FFmpeg lut3d; the file
-  must exist and end in `.cube`. Grade and LUT may combine.
-- Deterministic ducking: a project may set `ducking`, e.g.
-  `{"voice_track": 1, "amount_db": 12, "fade": 0.25}` where
-  `voice_track` is the index of the voice track in `audio`
-  (or that track's src), `amount_db` is how far music drops
-  (0..30 dB) and `fade` is the ramp time in seconds (0..2).
-  Optional explicit `windows` (`[{start, end}]`) override
-  the derived window (voice start + probed voice duration).
-  This is volume automation from time windows, not sidechain
-  compression and not level detection. Without `ducking`,
-  voice+music still uses the sidechain compressor as before.
-  See `examples/ducking.json` and `examples/brief-ducking.json`.
-- Producer QA now also reports measured loudness (LUFS via
-  loudnorm), sample-peak level (astats; warned above -1 dB)
-  and freeze-frame segments (freezedetect) — warnings only,
-  never changes to the render.
-- Chapters: a project `chapters` list, e.g.
-  `[{"title": "Intro", "start": 0}, {"title": "End", "start": 4}]`,
-  is written into the output file's metadata and can be
-  verified with `ffprobe -show_chapters`. Produce briefs
-  accept `chapters`, and section briefs get chapters from
-  section titles when no explicit list is given.
-- Delivery presets: `youtube_1080`, `shorts_720` and
-  `instagram_square` (size, fps, video bitrate and loudness
-  target each — see CHANGELOG). Use `delivery_preset` in a
-  produce brief, or `delivery_presets` (a list) in a
-  produce-variants brief. Resolution rule, enforced and
-  reported in `delivery_preset_applied`: an explicit
-  width/height or format in the brief always wins over a
-  preset's size; a preset never silently overrides an
-  explicit request. Presets are delivery settings, not
-  platform guarantees — platforms may re-encode on upload.
-- Review aids: preview proxies draw title-safe (10% margin)
-  and action-safe (5% margin) guide boxes by default, and
-  may burn in a running timecode on request; the preview
-  result flags both. Final renders have no guides and no
-  timecode unless the project explicitly sets
-  `timecode: true`.
+---
 
-## Arabic text
+## 🧰 MCP tools (22)
 
-When a text contains Arabic characters, AgentCut uses Noto Naskh
-Arabic (or Noto Sans Arabic as fallback) instead of DejaVu, which
-has no Arabic glyphs. On this FFmpeg build (libfribidi +
-libharfbuzz) Arabic shaping was verified by eye on rendered
-frames: letters join correctly. Word ORDER is a separate issue
-that shaping alone does not fix (1.33.0): drawtext picks the
-paragraph direction from the first strong character, so a
-digit-led line renders LTR unless forced. AgentCut therefore
-renders every Arabic line (texts and captions alike) wrapped in
-RLE...PDF with RLM before trailing punctuation (see
-`bidi_display_text` in render.py); stored project text stays in
-logical order, Latin-only lines are untouched, and the review
-timecode is not affected. Frame-verified: "2 دولار" shows
-دولار left of 2, "80٪ هواء!" shows ! far left, sentence
-punctuation ، sits far left. Font limits: "%" and "#" have no
-glyph in either Arabic font here (tofu boxes) — write rendered
-percents as ٪ (U+066A, which does render) and titles without #.
-On a build without that shaping support, Arabic may render
-disconnected; the font rule still applies, but the shaping
-result depends on the local FFmpeg build.
+**Projects:** `create_project`, `get_project`, `list_projects`, `patch_project`, `validate_project`, `preview_project`, `render_project`, `poster_frame`
+**Produce:** `produce_video`, `produce_explainer`, `produce_variants`, `split_clip`, `timeline_summary`, `check_brief`
+**Snapshots:** `snapshot_project`, `rollback_project`, `list_snapshots`
+**Jobs:** `get_job` (detached jobs that survive the client closing stdio), `start_render_job`, `get_job_status`, `cancel_job` (in-process `bg_` jobs)
+**Media:** `probe_media`
+
+Every error is a JSON object with `code` and `message`, plus `field` and `clip_id` when they apply. The full agent guide lives in [`SKILL.md`](SKILL.md).
+
+---
+
+## 📐 Project format (v1)
+
+```json
+{
+  "version": 1,
+  "id": "my-first-cut",
+  "output": {"width": 720, "height": 1280, "fps": 30},
+  "clips": [
+    {"id": "c1", "kind": "video", "src": "/path/clip1.mp4",
+     "trim_in": 0, "trim_out": 3, "transition": "crossfade"},
+    {"id": "c2", "kind": "image", "src": "/path/poster.png", "duration": 2,
+     "camera": [{"t": 0, "x": 0.5, "y": 0.5, "scale": 1.0},
+                {"t": 2, "x": 0.5, "y": 0.4, "scale": 1.2}]}
+  ],
+  "texts": [{"text": "Hello", "start": 0.5, "end": 2.5, "size": 48}],
+  "captions": [{"text": "First line", "start": 0, "end": 2}],
+  "audio": [{"src": "/path/voice.mp3", "kind": "voice", "volume": 1.0}]
+}
+```
+
+Rules that matter: video clips need `trim_in`/`trim_out` inside the source duration; image clips need `duration`; output is 16..3840 per side, fps 1..60, total at most 600s; captions must not set `x`/`y` (use `position`); warnings (overlap, overflow, static shots, safe-area) never block a render — errors do.
+
+---
+
+## 🗂️ Examples that actually render
+
+- `examples/basic.json` — vertical 360×640, 8.0s, video + image + text + captions
+- `examples/one-button-explainer.json` — the one-button producer, repo media only
+- `examples/stroke-diagram.json` — chart + basket diagrams over a board still
+- `examples/visual-rhythm.json` — SFX, micro-motion, punch-in, active Arabic caption
+- `examples/text-polish.json` — wrapped captions, scrims, pill titles, dressed overlays
+- `examples/blackboard.json` / `examples/animated.json` — board and slideshow templates
+
+---
+
+## 🔒 Trust model
+
+This server runs locally and trusts the agent that runs it, exactly like other local MCP servers. It reads local files the agent names and runs FFmpeg on them. Do not expose it unauthenticated over a network, and do not point it at media you have not checked. A hosted version would need a sandbox, an allow-list, quotas and authentication first. An opt-in path sandbox exists (`AGENTCUT_SANDBOX=1`); segment caching is a qualified Python-only API, not a general render path.
+
+---
+
+## 📜 Licence
+
+AgentCut is licensed under the **Business Source License 1.1** — see [LICENSE](LICENSE). In short: you may copy, modify and use it, including in production, except to provide a competing agent-first video editor service to third parties. On the Change Date (**2030-10-28**) this version converts to the **Apache License, Version 2.0**. BSL 1.1 is not an Open Source licence.
+
+---
+
+## 📌 Version
+
+**Current: 1.40.0** — general visual craft (camera paths, parallax, kinetic text, treatment, continuity, new transitions, look profiles) on top of the architectural refactoring and the cinematic/audio polish. Test suite: **159/159**, run in CI on every push and pull request. Full history: [CHANGELOG.md](CHANGELOG.md).

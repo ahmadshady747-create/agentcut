@@ -1,3 +1,303 @@
+## 1.40.0 — General visual-craft upgrade
+
+All eight features are general: they work on video, image,
+solid/gradient and board clips alike, and the proof video
+uses non-board backgrounds only. Additive only — every
+1.39.0 project renders identically unless it opts into a
+new field (one intentional default change, see below).
+21 new tests (TestVisualLoop) join the existing 138, for
+159 total.
+
+- Camera path: clip-level `camera: [{t, x, y, scale}]` —
+  multi-stop pan/zoom with smoothstep interpolation and
+  even-size-safe math, on video AND image AND generated
+  backgrounds. Explicit camera wins over ken_burns (warning
+  `camera_overrides_ken_burns`); punch_in stays absolute and
+  separate; camera rejects punch_in, blur fit, stabilize and
+  speed_curve; max total scale stays 1.25x by construction.
+- Parallax: overlay `depth` 0..1 — overlays drift relative
+  to camera/background motion (foreground faster than
+  background), with camera paths and Ken Burns pans
+  (zoom-only motion has a constant centre, so no positional
+  parallax by design). Depth on a motionless clip warns
+  (`parallax_depth_no_motion`) and is a no-op, never an
+  error.
+- Kinetic text: any text accepts `word_timings` + highlight
+  colour + `emphasis` (bool) / `emphasis_factor` (1.0..1.5)
+  pop on the current word, mirroring the caption system
+  (chunking, measured ink widths, RTL reversal). Text style
+  presets `title`/`heading`/`label`/`caption` (size ratios,
+  shadow, stroke, spacing) usable anywhere via `style`;
+  explicit values always win.
+- General image treatment: clip- and project-level
+  `treatment: {grain 0..30, vignette 0..1, shadow 0..1}` —
+  temporal film grain, vignette, soft inner-edge shadow —
+  FFmpeg filters on ANY footage. No segment-cache change:
+  clip treatment is inside the fingerprinted clip dict,
+  project treatment applies once in the assembly pass.
+- Motion continuity: sequential clips sharing a `scene_id`
+  chain scales (clip N's end = clip N+1's start), fixing
+  the 1.37.2 same-scene boundary step (up to 0.25x). Camera
+  keyframes are adjusted by deep copy, Ken Burns start/end
+  are stored only when they differ from legacy defaults
+  (old graphs stay byte-identical), punch end feeds the
+  chain but punch start is never re-based, static clips
+  reset the chain to 1.0. A static same-scene clip warns
+  (`scene_continuity_static`). 1.25x max holds.
+- Transitions: `zoom` (zoomin), `wipe_tl` (wipetl) and
+  `squeeze_h` (squeezeh) join the xfade set; name validation
+  is automatic via the allowed set, existing
+  transition_duration rules apply. REJECTED: circlecrop as
+  "iris" — on this build its midpoint renders essentially
+  black (a 1-2px dot) with real videos and solid colours
+  alike, so it is not exposed.
+- Produce look: `produce_explainer` gains a brief `look`
+  option — clean, cinematic, vintage, bold, still — a
+  profile combining treatment + grade + scene-title preset
+  + motion default, orthogonal to `style` (which stays
+  blackboard-only for scrims) and applicable to ANY
+  background. Brief fields always win (brief motion beats
+  look motion; scene titles use the look's preset only
+  when the look sets one; keywords keep explicit
+  size/colour). Unknown looks are rejected with the known
+  list.
+- Defaults upgrade (the one intentional default change):
+  plain texts now get the subtle (2,2) shadow default when
+  neither shadow axis is set, mirroring captions — so
+  titles read over bright panels out of the box. Explicit
+  shadow axes still take over (shadow_x=0 alone disables
+  the default); no existing test pinned the old shadowless
+  default. Plus warnings-only safe-area notes
+  (`text_outside_safe_area`) for texts/captions whose
+  estimated box crosses the 5% action-safe rect — never
+  errors or clamps; default positions already sit inside.
+
+## Unreleased — Delta upgrade: Axis 1 gaps + Axis 2 polish (audit pending; VERSION stays 1.39.0)
+
+No new release yet: the parent assigns the version at audit.
+Axis 1 was already implemented by a previous builder in this
+tree; the delta verifies it, fills genuine gaps, and builds
+Axis 2. Stdlib + FFmpeg only, full backward compatibility
+for every existing project (new options are optional or
+smart-defaulted to today's behaviour). 13 new tests
+(TestDelta) join the existing 125, for 138 total. The one existing-test
+change: the ASS assertion that pinned contiguous escaped
+caption text now asserts per-word escaping, because karaoke
+is the ASS default and separates words with \k tags (see
+below) — escaping itself is still asserted, not weakened.
+
+- Axis 1 gaps, settled: (a) `arc` stroke kind added
+  (centre + radius + start/end angles in degrees; 0 = east,
+  positive = clockwise on screen; a zero sweep means a full
+  circle; same chalk path as other strokes). (b) The concat
+  demuxer stays rejected: its container-duration offsets
+  leave a proven one-frame audio gap at segment boundaries;
+  the cached path keeps concat-filter assembly and the
+  demuxer remains a utility for same-duration streams only.
+  (c) `render_project_cached` stays a Python API, NOT an
+  MCP tool or CLI command: it covers a qualified subset
+  only (transition-free, unstabilized) and carries the video
+  residual below, so exposing it would imply a generality
+  it does not have. (d) The segment-cache video residual
+  (up to 8 levels on saturated colours, FFmpeg graph
+  negotiation) stays a documented limitation.
+- Audio, auto-ducking: new project option `auto_duck`
+  (default true). Precedence, exactly: an explicit
+  `ducking` object always wins; otherwise, when `auto_duck`
+  is true AND a voice track AND a music track both exist
+  AND no explicit ducking is given, music is ducked with
+  the existing sidechaincompress path; when `auto_duck` is
+  false, the auto path is disabled and music passes through
+  unducked. Default true equals today's behaviour, so no
+  existing project changes output. Non-bool `auto_duck`
+  fails validation with a fix hint.
+- Audio, final master: new `output.master_loudnorm` (bool,
+  default false). When true, the finished mix is mastered
+  with loudnorm I=-14:TP=-1.5:LRA=11 (single pass, so the
+  measured value lands near -14, not exactly). Distinct
+  from per-track loudnorm (default -16) and from delivery
+  presets; it is a mastering choice, not a platform
+  guarantee. Applied only when the project has audio
+  tracks (a silent timeline skips mastering rather than
+  failing on a -inf measurement). It also disqualifies
+  segment caching (a whole-mix measurement cannot be
+  applied per segment), falling back to a plain render.
+- Captions, ASS upgrade (additional output, never replacing
+  drawtext captions): every dialogue now fades in/out with
+  \fad(120,120) by default (`fade_ms`, 0 disables); styles
+  carry a soft outline (2) plus a drop shadow (Shadow=1)
+  by default (both adjustable, 0..4); and dialogues are
+  karaoke by default — a separate Karaoke style (yellow
+  highlight over the white base) with \k tags per word,
+  measured from a cue's `word_timings` when present and
+  matching the cue text, else a proportional split by word
+  length labelled with the dialogue Name `est` plus a
+  header note (estimates, never measured timings).
+  `karaoke=None` disables karaoke (plain dialogues);
+  `karaoke="measured"` restricts it to measured timings.
+  Word_timings that do not match the cue text never apply
+  to the wrong words (auto falls back to proportional,
+  measured to plain).
+- Diagrams: stamp edges now use a smoothstep falloff over
+  the same 2px band the old linear ramp used (softer
+  diagonal lines and circles, same stamp reach, same cache
+  keying); stamping stays idempotent. Stroke progress in
+  DiagramAnimator now eases (smoothstep ease_in_out) for
+  hand-like pacing — gentle acceleration, slowing at stroke
+  ends — while the final frame stays byte-identical to a
+  direct full render (existing test) and explicit
+  render_diagram_rgba(progress) stays linear (explicit
+  progress means explicit progress).
+- Render, blurred fill: new `fit: "blur_pad"` (split +
+  scale + boxblur + overlay) for mismatched aspect ratios.
+  It is the same blurred-background fill as `fit: "blur"`
+  (same cover/contain composite, same -0.2 darkening) with
+  a boxblur kernel (lr=20:lp=3:cr=20:cp=3) instead of gblur
+  (sigma=20). All blur exclusions (Ken Burns, chroma_key,
+  stabilize, speed_curve, prescale skip, default-motion
+  exclusion) apply to both names. `blur` itself is
+  unchanged.
+- Colour presets: `grade` gains `vintage` (faded: contrast
+  0.92, brightness +0.04, saturation 0.70, warm highlights,
+  soft vignette) and `crisp` (contrast 1.12, saturation
+  1.15, luma unsharp). Per-clip as before; per-scene
+  coverage comes via per-clip use. Like all presets, these
+  are settings, not film stocks.
+- Smooth camera, verified not rewritten: Ken Burns already
+  had 2x pre-scale, smoothstep easing, fixed fps and
+  even-rounded dimensions (1.37.2) — kept, and now proven
+  by measurement tests (graph contains the smoothstep form
+  and the 2x pre-scale; odd-dimension projects render at
+  even dimensions with constant fps). Element-keyframe
+  easing defaults stay `linear`: flipping them to
+  ease_in_out would change existing projects' output and
+  break backward compatibility, so the default is
+  documented, not flipped.
+- Join fix, found by the delta proof render (a real
+  pre-existing defect, not a delta regression): a Ken Burns
+  clip refused to concat with a scale-based clip
+  (`Parsed_concat ... Failed to configure output pad`).
+  Root cause, proven by ablation: scale with
+  force_original_aspect_ratio rounds integer dimensions
+  and compensates with SAR (e.g. 5120:5121 for a 640x360
+  source covering 720x1280), while zoompan outputs square
+  pixels — and concat/xfade refuse mismatched SARs.
+  (An earlier setsar-on-the-KB-chain attempt was proven
+  useless by the same ablation: the KB side was already
+  1:1, the scale side was the odd one.) Fix: every join
+  input is normalised with setsar=1 (metadata-only,
+  pixels untouched) before concat/xfade; single-clip
+  projects bypass the join entirely and are unaffected.
+  Regression test: KB + cover concat now renders.
+
+## Unreleased — Architectural refactoring (audit pending; VERSION stays 1.39.0)
+
+No new release yet: the parent assigns the version at audit.
+All six tracks below are implemented locally, stdlib + FFmpeg
+only, with full backward compatibility (every CLI command and
+every pre-existing MCP tool keeps identical inputs/outputs;
+the one test change is a mock update, see below). 15 new
+tests (TestRefactoring) join the existing 110.
+
+- diagrams.py: chalk-grain stamp masks are pre-computed per
+  (radius, fractional center) and cached (bounded at 1024
+  entries) instead of per-pixel math per frame; stamping the
+  same stamp twice is now idempotent (pixels already at the
+  stamp alpha are skipped). New `line` stroke kind (exactly
+  2 points, same chalk path as polyline, no arrowhead) and
+  new `primitives` template (arbitrary stroke lists with an
+  explicit canvas, default 900x560, bounds 100..1920 per
+  side) alongside chart/basket/balance/causes, untouched.
+  The animator-last-frame equals direct-full-render property
+  still holds (existing test).
+- render.py: filter graphs are written to a temp file and
+  passed via `-filter_complex_script` in render_project (the
+  string option stays in build_ffmpeg_args for tests/compat).
+  Segment caching via `render_project_cached` (render_project
+  unchanged by default): per-clip SHA-256 fingerprint over
+  the clip settings plus source file stat (path, mtime_ns,
+  size) plus LUT stat plus output geometry/fps plus motion
+  flags, versioned `agentcut-segment-v3`; segments render
+  losslessly (libx264 crf 0, pcm_f32le, chain-native ranges)
+  into `.agentcut_cache/` next to the output (a pure cache,
+  safe to delete, excluded from any sync set) and are joined
+  by the multi-clip concat filter (the concat demuxer was
+  tried and rejected: its container-duration offsets leave a
+  one-frame audio gap at segment boundaries). Qualification:
+  only transition-free, unstabilized projects; anything else
+  falls back to plain render_project with a note. PROVEN:
+  cache-hit equals cache-miss byte-identical; image-only
+  projects equal the direct render byte-identical; video
+  projects match in frame count, all image/text frames, and
+  audio bytes. RESIDUAL, stated honestly: video frames differ
+  by up to 8 levels on saturated colours because FFmpeg
+  filter-graph format negotiation differs between the direct
+  graph (scales stay unknown/unknown) and the assembly graph
+  (image segments decode as yuvj420p pc and pull negotiation
+  to bt470bg/pc). Full segmented-versus-direct byte-identity
+  for video projects is NOT claimed. HW detection:
+  `detect_hw_encoders` lists h264_nvenc/h264_videotoolbox/
+  h264_vaapi from `ffmpeg -encoders`; `choose_video_codec`
+  smoke-tests candidates and falls back to libx264 (on this
+  machine the build lists nvenc and vaapi but both smoke
+  tests fail — no GPU, no /dev/dri — so `auto` falls back to
+  libx264, and an explicit broken codec retries once with
+  libx264). Default output stays libx264-identical unless
+  the caller opts into HW. Smart errors: failures return the
+  failing filter/node lines from the stderr tail, not the
+  raw log. Temp hygiene: SIGINT/SIGTERM handlers remove
+  registered temp dirs, plus `cleanup_stale_temp_dirs`
+  (pattern-matched `agentcut-*`/`agentcut_tmp_*`/
+  `.agentcut-tmp-*` names older than 2 hours only).
+- server.py: `_save_project` and snapshots use atomic writes
+  (temp file in the same directory + os.replace) with
+  fcntl.flock where available (documented fallback: replace
+  stays atomic, simultaneous writers race last-wins). New
+  MCP tools `start_render_job`, `get_job_status`,
+  `cancel_job`: background jobs on a ThreadPoolExecutor
+  (ids `bg_` + hex, states queued/running/done/failed/
+  cancelled; a running background render cannot be
+  interrupted, so cancel reports cancelled=False for it).
+  The detached `render_project`/`get_job` system is
+  unchanged; bg ids and detached ids do not collide.
+- validate.py: ffprobe results cached in memory + on disk
+  at `data/.probe-cache.json` (key: resolved path, mtime_ns,
+  size; 2000-entry bound; a changed file re-probes, a
+  missing file is never cached), warmed in parallel via
+  ThreadPoolExecutor at validate time. Path Sandbox
+  Validation (opt-in, `AGENTCUT_SANDBOX=1`): `Path.resolve()`
+  rejects traversal and symlink escapes outside the allowed
+  roots (project dir + cwd + AgentCut base + `AGENTCUT_MEDIA_DIRS`);
+  a rejected clip src yields new code `PATH_OUTSIDE_SANDBOX`.
+  Default off, because enforcing by default would reject
+  existing valid projects whose media lives elsewhere under
+  ~/workspace — backward compatibility wins over strictness.
+- srt.py: `wrap_subtitle_text(text, width, font_size)`
+  (default 90% width, the 1.36.0 caption rule) is now the
+  single word-wrap source of truth; `wrap_caption_lines`
+  delegates to it. New ASS exporter (`cues_to_ass_text`,
+  `export_ass`: one unified file, PlayRes matching video
+  size, bottom-centre style, 5% side margins) and
+  `batch_captions_by_window` (indexed time windows, cues
+  assigned by start, never split). ASS is ADDITIONAL, not a
+  replacement for caption drawtext rendering.
+- package.py: `_collect_files` deduplicates identical files
+  by SHA-256 (same content under different paths is copied
+  once; summary gains `files_deduped`). New option
+  `trim_clips=False` (default off, plus CLI flag
+  `--trim-clips`): trims only used video-clip portions via
+  stream copy (`-ss`/`-to`, 1.0s safety margin each side),
+  re-bases trim_in/trim_out (plus freeze_at and speed_curve
+  bounds) into the trimmed copy, and gives each distinct
+  trim window its own file. Default False preserves pack
+  behaviour exactly (apart from the two new summary keys).
+- Test maintenance (one change, documented): the atomic-
+  render-failure test mocked ffmpeg calls containing
+  `-filter_complex`; the render path now passes
+  `-filter_complex_script`, so the mock intercepts both
+  flags. The atomicity contract it guards is unchanged and
+  still verified.
+
 ## 1.39.0 — One-button board explainer (produce_explainer)
 
 New MCP tool `produce_explainer` + CLI

@@ -11,6 +11,15 @@ import json
 import os
 import re
 import sys
+import tempfile
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import fcntl
+except ImportError:  # Windows / platforms without fcntl
+    fcntl = None
 
 from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_project, split_clip, timeline_summary
 from .validate import probe_media, validate_project
@@ -32,13 +41,149 @@ def _project_path(pid):
     return os.path.join(PROJECTS, f"{pid}.json")
 
 
+def _atomic_write_json(path, data):
+    """Write JSON atomically: NamedTemporaryFile in the same
+    directory, then os.replace, so a reader never sees a
+    half-written file (it sees the old file or the new file,
+    never a torn mix). Concurrent writers are serialised with
+    an flock on path + ".lock" when fcntl is available; the
+    lock is held across write + replace, so two writers cannot
+    interleave replaces. PLATFORM FALLBACK: where fcntl is
+    unavailable (e.g. Windows), the lock is skipped — the
+    replace is still atomic, so readers stay safe, but two
+    simultaneous writers could race (last replace wins); that
+    is documented, not hidden, and the server is normally
+    single-writer per project id."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    lock_fh = None
+    if fcntl is not None:
+        try:
+            lock_fh = open(path + ".lock", "a")
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        except OSError:
+            lock_fh = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".agentcut-tmp-",
+                                   suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
 def _save_project(project):
     pid = project["id"]
     if not _ID_RE.match(pid):
         return {"code": "INVALID_SCHEMA", "message": "project id must match [A-Za-z0-9_-]+"}
-    with open(_project_path(pid), "w") as fh:
-        json.dump(project, fh, indent=2)
+    _atomic_write_json(_project_path(pid), project)
     return None
+
+
+class _BackgroundJobs:
+    """In-process background renders (ThreadPoolExecutor).
+
+    This is SEPARATE from the detached JobStore system (get_job):
+    detached jobs survive stdio close and are pollable from a new
+    connection because their state lives on disk; background jobs
+    live only in this server process (they die with it) and are
+    polled with get_job_status. The two id namespaces do not
+    collide: detached ids are bare uuid hex, background ids are
+    "bg_" + uuid hex, so a bg id passed to get_job correctly
+    reports JOB_NOT_FOUND instead of a wrong record, and vice
+    versa. A queued background job can be cancelled (its future
+    is cancelled before it starts); a RUNNING job cannot be
+    interrupted — its ffmpeg child is mid-render, and killing
+    the thread would leave a partial output — so cancel_job on
+    a running job reports cancelled=False and the job runs to
+    completion. That limit is by design, not a silent failure.
+    """
+
+    def __init__(self, max_workers=2):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._lock = threading.Lock()
+        self._jobs = {}  # job_id -> {status, future, output, result, error}
+
+    def start(self, project):
+        job_id = "bg_" + uuid.uuid4().hex[:12]
+        out_dir = os.path.join(OUTPUTS, job_id)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "output.mp4")
+        with self._lock:
+            self._jobs[job_id] = {"status": "queued", "future": None,
+                                  "output": out_path, "result": None,
+                                  "error": None}
+        future = self._executor.submit(self._run, job_id, project, out_path)
+        with self._lock:
+            if job_id in self._jobs:
+                self._jobs[job_id]["future"] = future
+        return job_id
+
+    def _run(self, job_id, project, out_path):
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if rec is None or rec["status"] == "cancelled":
+                return
+            rec["status"] = "running"
+        try:
+            ok, info = render_project(project, out_path)
+        except Exception as exc:  # never leave a job stuck running
+            ok, info = False, {"code": "RENDER_FAILED", "message": str(exc)}
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                return
+            if ok:
+                rec["status"] = "done"
+                rec["result"] = info
+            else:
+                rec["status"] = "failed"
+                rec["error"] = info
+
+    def status(self, job_id):
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                return None
+            return {"job_id": job_id, "status": rec["status"],
+                    "output": rec["output"], "result": rec["result"],
+                    "error": rec["error"]}
+
+    def cancel(self, job_id):
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                return None
+            if rec["status"] == "queued":
+                future = rec.get("future")
+                cancelled = bool(future and future.cancel())
+                if cancelled:
+                    rec["status"] = "cancelled"
+                return {"job_id": job_id, "status": rec["status"],
+                        "cancelled": cancelled}
+            if rec["status"] in ("done", "failed", "cancelled"):
+                return {"job_id": job_id, "status": rec["status"],
+                        "cancelled": False}
+            return {"job_id": job_id, "status": "running",
+                    "cancelled": False,
+                    "note": "a running background render cannot be "
+                            "interrupted; it runs to completion"}
+
+
+BG_JOBS = _BackgroundJobs()
 
 
 def _load_project(pid):
@@ -158,6 +303,18 @@ TOOLS = [
      "description": "Poll a render or preview job by id. Job state lives on disk, so this works from a new connection for jobs launched in earlier sessions; a job whose worker died without finishing reports failed.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "start_render_job",
+     "description": "Start a background render in this server process (ThreadPoolExecutor) of a stored project (by id) or a project dict (project). Returns a bg_ job id at once; poll with get_job_status. Unlike render_project/get_job (detached subprocess, disk state, survives stdio close), background jobs live only in this server process and die with it; a queued job can be cancelled with cancel_job, a running one cannot be interrupted.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "project": {"type": "object"}}}},
+    {"name": "get_job_status",
+     "description": "Poll a background render job started with start_render_job by its bg_ id. Returns status (queued/running/done/failed/cancelled), output path, and result or error when finished.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "cancel_job",
+     "description": "Cancel a background render job by its bg_ id. A queued job is cancelled; a running job cannot be interrupted and reports cancelled=False; a finished job reports its final status.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}}, "required": ["id"]}},
 ]
 
 
@@ -188,6 +345,8 @@ def call_tool(name, args):
     if name == "rollback_project" and (_bad_id(args.get("id")) or _bad_id(args.get("snapshot_id"))):
         return _id_error("id and snapshot_id")
     if name == "get_job" and _bad_id(args.get("id")):
+        return _id_error()
+    if name in ("get_job_status", "cancel_job") and _bad_id(args.get("id")):
         return _id_error()
     if name == "probe_media":
         info = probe_media(args["src"])
@@ -301,8 +460,7 @@ def call_tool(name, args):
             return _tool_error({"code": "INVALID_SCHEMA", "message": "snapshot label must match [A-Za-z0-9_-]+"})
         import uuid as _uuid
         sid = label or _uuid.uuid4().hex[:12]
-        with open(_snapshot_path(args["id"], sid), "w") as fh:
-            json.dump(project, fh, indent=2)
+        _atomic_write_json(_snapshot_path(args["id"], sid), project)
         return _text({"id": args["id"], "snapshot_id": sid, "saved": True})
     if name == "rollback_project":
         path = _snapshot_path(args["id"], args["snapshot_id"])
@@ -328,6 +486,33 @@ def call_tool(name, args):
         record = dict(record)
         record.pop("project", None)
         return _text(record)
+    if name == "start_render_job":
+        if args.get("project") is not None:
+            project = args["project"]
+            errors, _info = validate_project(project)
+            if errors:
+                return _tool_error({"code": "INVALID_PROJECT", "errors": errors})
+        elif args.get("id"):
+            if _bad_id(args.get("id")):
+                return _id_error()
+            project = _load_project(args["id"])
+            if project is None:
+                return _tool_error({"code": "PROJECT_NOT_FOUND", "message": args["id"]})
+        else:
+            return _tool_error({"code": "INVALID_SCHEMA",
+                                "message": "start_render_job needs id or project"})
+        job_id = BG_JOBS.start(project)
+        return _text({"job_id": job_id, "status": "queued"})
+    if name == "get_job_status":
+        rec = BG_JOBS.status(args["id"])
+        if rec is None:
+            return _tool_error({"code": "JOB_NOT_FOUND", "message": args["id"]})
+        return _text(rec)
+    if name == "cancel_job":
+        rec = BG_JOBS.cancel(args["id"])
+        if rec is None:
+            return _tool_error({"code": "JOB_NOT_FOUND", "message": args["id"]})
+        return _text(rec)
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

@@ -7,19 +7,24 @@ core, not a replacement of it.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
-from .validate import (GRADE_PRESETS, SFX_NAMES, XFADE_TRANSITIONS,
-                       chunk_word_timings, effective_ken_burns, find_font,
-                       find_font_for_text, probe_media, resolve_path,
-                       validate_project, wrap_caption_lines)
+from .validate import (GRADE_PRESETS, SFX_NAMES, TEXT_STYLES,
+                       XFADE_TRANSITIONS, chunk_word_timings,
+                       effective_ken_burns, find_font, find_font_for_text,
+                       probe_media, resolve_path, validate_project,
+                       wrap_caption_lines)
 
 
 # Text overlays use drawtext textfile=, not text=. A literal apostrophe,
@@ -48,6 +53,189 @@ POS_MAP = {
 
 def _even(n):
     return int(n) if int(n) % 2 == 0 else int(n) - 1
+
+
+# --- Hardware encoder detection + smart errors + temp hygiene
+# (architectural refactoring; defaults unchanged) ----------------
+
+HW_ENCODERS_PREFERENCE = ("h264_nvenc", "h264_videotoolbox", "h264_vaapi")
+
+
+def detect_hw_encoders():
+    """H.264 hardware encoders this FFmpeg build offers, in
+    preference order (nvenc > videotoolbox > vaapi). Listing alone
+    does not prove an encoder runs (a driver may be missing), so
+    callers that need certainty use encoder_smoke_test; render
+    fallback covers the rest. Returns [] when FFmpeg is absent or
+    lists nothing (the expected result on a CPU-only VM)."""
+    try:
+        proc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    found = set()
+    for line in proc.stdout.splitlines():
+        for token in line.split():
+            if token in HW_ENCODERS_PREFERENCE:
+                found.add(token)
+    return [name for name in HW_ENCODERS_PREFERENCE if name in found]
+
+
+def encoder_smoke_test(codec, timeout=60):
+    """True when FFmpeg can encode one null frame with `codec`.
+
+    A fast, real probe: listing an encoder is not proof it runs.
+    Used by tests and by operators; the render path itself does
+    not smoke-test on every render (detection + libx264 fallback
+    on failure is cheaper and covers the same cases)."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "nullsrc=s=64x64:d=0.1", "-c:v", codec,
+             "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def choose_video_codec(preference="libx264"):
+    """Resolve a video codec request: "libx264" stays libx264
+    (the deterministic default), "auto" picks the best detected
+    hardware encoder that actually encodes a probe frame
+    (listing an encoder is not proof it runs — this build lists
+    nvenc/vaapi with no GPU behind them), or libx264 when none
+    works, and any other name passes through unchanged (the
+    render fallback still applies if it fails at render time)."""
+    if preference == "auto":
+        for name in detect_hw_encoders():
+            if encoder_smoke_test(name):
+                return name
+        return "libx264"
+    return preference
+
+
+_ERROR_HINTS = ("error", "failed", "invalid", "no such", "not found",
+                "unknown", "cannot", "unable", "denied", "mismatch",
+                "required", "missing", "unsupported", "could not")
+
+
+def extract_ffmpeg_error(stderr_text, max_lines=25):
+    """The actually-failing lines from FFmpeg stderr.
+
+    FFmpeg logs are long and mostly progress chatter; the old code
+    returned the last 2000 characters raw, which usually cut a
+    message in half. This returns the error-bearing lines from the
+    tail (they carry the filter/node address, e.g.
+    "[Parsed_xfade_... @ 0x...]"), capped at max_lines, plus the
+    very last line for context when it is not already included.
+    Falls back to the raw tail when no line looks like an error.
+    Pure string work: no FFmpeg call, safe on any input."""
+    if not stderr_text:
+        return "ffmpeg failed with no output"
+    lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
+    if not lines:
+        return "ffmpeg failed with no output"
+    tail = lines[-80:]
+    picked = [ln for ln in tail
+              if any(hint in ln.lower() for hint in _ERROR_HINTS)]
+    if not picked:
+        picked = lines[-10:]
+    elif lines[-1] not in picked:
+        picked.append(lines[-1])
+    return "\n".join(picked[-max_lines:])
+
+
+_TEMP_DIR_REGISTRY = set()
+_TEMP_HANDLERS_INSTALLED = False
+_TEMP_PREFIXES = ("agentcut-", "agentcut_tmp_", ".agentcut-tmp-")
+
+
+def register_temp_dir(path):
+    """Track a temp dir for signal-time cleanup (best-effort)."""
+    if path:
+        _TEMP_DIR_REGISTRY.add(path)
+
+
+def unregister_temp_dir(path):
+    _TEMP_DIR_REGISTRY.discard(path)
+
+
+def _temp_signal_handler(signum, _frame):
+    """SIGINT/SIGTERM: remove this process's temp dirs, then
+    restore the default disposition and re-raise the signal, so
+    the process still dies by the signal it received — cleanup
+    never swallows an interrupt."""
+    for path in list(_TEMP_DIR_REGISTRY):
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.isfile(path):
+                os.unlink(path)
+        except OSError:
+            pass
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def install_signal_handlers():
+    """Install the temp-cleanup signal handlers once, best-effort.
+
+    Idempotent. When signals cannot be installed (not the main
+    thread, or a platform without SIGTERM), this silently does
+    nothing: the finally blocks in render_project still clean up
+    on normal and error exits."""
+    global _TEMP_HANDLERS_INSTALLED
+    if _TEMP_HANDLERS_INSTALLED:
+        return
+    try:
+        signal.signal(signal.SIGINT, _temp_signal_handler)
+        signal.signal(signal.SIGTERM, _temp_signal_handler)
+        _TEMP_HANDLERS_INSTALLED = True
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def cleanup_stale_temp_dirs(tmp_root=None, max_age_seconds=7200):
+    """Remove AgentCut temp dirs/files older than max_age_seconds
+    (default 2 hours) from the temp root.
+
+    ONLY names starting with agentcut-, agentcut_tmp_ or
+    .agentcut-tmp- are ever removed — the prefix allowlist is
+    the safety property; nothing else in the temp directory is
+    touched. Returns the list of removed paths. Fresh dirs (an
+    in-flight render's working dirs) are always kept."""
+    root = tmp_root or tempfile.gettempdir()
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+    now = time.time()
+    removed = []
+    for name in entries:
+        if not name.startswith(_TEMP_PREFIXES):
+            continue
+        path = os.path.join(root, name)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age < max_age_seconds:
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+            removed.append(path)
+        except OSError:
+            continue
+    return removed
 
 
 # --- Built-in procedural SFX (v1.37.0, timing fixed v1.37.1) ------
@@ -284,13 +472,44 @@ def _ff_color(color):
     return color
 
 
-def _scale_part(fit, width, height):
-    """Scale (and pad/crop) string for a clip at the output size."""
+def _scale_part(fit, width, height, chain_scale_out=None):
+    """Scale (and pad/crop) string for a clip at the output size.
+
+    chain_scale_out is (out_range, out_color_matrix) or None:
+    when given, the scale filter forces that output range /
+    colorspace (segment renders use it so a segment's scale
+    reproduces the direct graph's scale output exactly, instead
+    of negotiating a different format in isolation — see
+    render_project_cached). None keeps the old behaviour."""
+    suffix = ""
+    if chain_scale_out:
+        suffix = (f":out_range={chain_scale_out[0]}"
+                  f":out_color_matrix={chain_scale_out[1]}")
     if fit == "cover":
-        return (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        return (f"scale={width}:{height}:force_original_aspect_ratio=increase{suffix},"
                 f"crop={width}:{height}")
-    return (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+    return (f"scale={width}:{height}:force_original_aspect_ratio=decrease{suffix},"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+
+
+def _chain_scale_suffix(chain_scale_out):
+    """Suffix for a clip-chain scale filter, or '' when unset."""
+    if not chain_scale_out:
+        return ""
+    return (f":out_range={chain_scale_out[0]}"
+            f":out_color_matrix={chain_scale_out[1]}")
+
+
+def _blur_filter(fit):
+    """Blur kernel for a blurred-background fit (delta).
+
+    'blur' keeps the original gblur fill; 'blur_pad' uses a
+    boxblur kernel (split + scale + boxblur + overlay). Both
+    share the cover/contain composite and the -0.2 darkening.
+    """
+    if fit == "blur_pad":
+        return "boxblur=lr=20:lp=3:cr=20:cp=3"
+    return "gblur=sigma=20"
 
 
 def _input_count(argv):
@@ -374,6 +593,97 @@ def _interp_value(points, t):
         if t0 <= t <= t1:
             return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
     return points[-1][1]
+
+
+def _camera_interp_expr(keyframes, field, var_t):
+    """Smoothstep-interpolated expression for one camera field.
+
+    keyframes are validated {t, x, y, scale} dicts, var_t is an
+    FFmpeg expression for clip-local seconds (on/fps for zoompan
+    image clips, in/fps for video clips). Between keyframes the
+    value eases with the same smoothstep the Ken Burns drift
+    uses (slow start, faster middle, slow landing); outside the
+    range the first/last value holds, so a path that starts
+    after 0 holds its first framing until then."""
+    if len(keyframes) == 1:
+        return repr(float(keyframes[0][field]))
+    expr = repr(float(keyframes[-1][field]))
+    for i in range(len(keyframes) - 2, -1, -1):
+        t0 = float(keyframes[i]["t"])
+        v0 = float(keyframes[i][field])
+        t1 = float(keyframes[i + 1]["t"])
+        v1 = float(keyframes[i + 1][field])
+        u = f"(({var_t})-{t0!r})/({t1!r}-{t0!r})"
+        seg = f"{v0!r}+({v1!r}-{v0!r})*({u})*({u})*(3-2*({u}))"
+        expr = f"if(lt({var_t},{t1!r}),{seg},{expr})"
+    return (f"if(lt({var_t},{float(keyframes[0]['t'])!r}),"
+            f"{float(keyframes[0][field])!r},{expr})")
+
+
+def _camera_zoompan_filter(keyframes, var_t, width, height, d, fps):
+    """The zoompan filter for a camera path (v1.40.0).
+
+    The crop centre follows the interpolated (x, y) centre
+    fractions and the crop size follows the interpolated scale.
+    zoompan's own x/y expressions may reference zoom, so the
+    centre is clamped to the zoom-dependent valid range
+    [1/(2*zoom), 1-1/(2*zoom)] per axis: a keyframe at the frame
+    edge (x=0 or 1) stays a valid crop at every zoom instead of
+    running off the frame. Scales are validated 1.0..1.25, so
+    the 1.37.2 comfort max holds by construction."""
+    z = _camera_interp_expr(keyframes, "scale", var_t)
+    fx = _camera_interp_expr(keyframes, "x", var_t)
+    fy = _camera_interp_expr(keyframes, "y", var_t)
+    x_expr = (f"(min(max({fx},1/(2*zoom)),1-1/(2*zoom)))*iw"
+              f"-(iw/zoom)/2")
+    y_expr = (f"(min(max({fy},1/(2*zoom)),1-1/(2*zoom)))*ih"
+              f"-(ih/zoom)/2")
+    return (f"zoompan=z='{z}':x='{x_expr}':y='{y_expr}':"
+            f"d={d}:s={width}x{height}:fps={fps}")
+
+
+def _treatment_filters(treatment):
+    """FFmpeg filter chain for a treatment dict (v1.40.0).
+
+    Returns "" when nothing is set (all default off, so old
+    projects render identically). Grain is temporal noise (alls
+    is the integer strength, allf=t so it shimmers per frame);
+    vignette maps strength 0..1 to the lens angle PI/40..PI/4
+    (measured on this build on flat grey: corner/centre 0.99
+    at PI/40, 0.33 at PI/4); shadow is a soft inner edge shadow
+    via geq — distance-to-edge falloff over 12% of the smaller
+    side, smoothstepped — which needs rgba, so the chain
+    converts to rgba and back (the clip chain continues in
+    yuv420p afterwards, and the project chain feeds overlays
+    that expect yuv420p)."""
+    if not isinstance(treatment, dict):
+        return ""
+    parts = []
+    grain = float(treatment.get("grain", 0) or 0)
+    g = int(round(grain))
+    if g > 0:
+        parts.append(f"noise=alls={g}:allf=t")
+    vig = float(treatment.get("vignette", 0) or 0)
+    if vig > 0:
+        import math as _math
+        angle = _math.pi * (0.025 + 0.225 * vig)
+        parts.append(f"vignette=angle={angle!r}")
+    sh = float(treatment.get("shadow", 0) or 0)
+    if sh > 0:
+        # No a() term: this build's geq has no a(X,Y) function
+        # (verified: "Unknown function in 'a(X,Y)'"), and the
+        # chain converts straight back to yuv420p below, which
+        # discards alpha anyway — so the alpha plane needs no
+        # expression here (unlike overlay masks, where alpha is
+        # the point and the expression is a constant).
+        d = "min(min(X,W-1-X),min(Y,H-1-Y))"
+        u = f"min(max(1-({d})/(0.12*min(W,H)),0),1)"
+        f = f"({u})*({u})*(3-2*({u}))"
+        parts.append(
+            f"format=rgba,geq=r='r(X,Y)*(1-{sh}*({f}))':"
+            f"g='g(X,Y)*(1-{sh}*({f}))':"
+            f"b='b(X,Y)*(1-{sh}*({f}))',format=yuv420p")
+    return ",".join(parts)
 
 
 def _bitrate_kbps(value):
@@ -460,10 +770,37 @@ def _active_caption_y(item, size, height):
     return float(height - 120)
 
 
+def _resolve_text_style(item, height):
+    """Fill a text/caption's unset fields from its style preset
+    (v1.40.0). Only missing keys are filled — an explicit size,
+    colour, box or shadow always wins, so old projects (which
+    never set style) render identically. Shadow fills only when
+    neither axis is set, mirroring the drawtext loop's rule that
+    setting either axis takes over both. Returns the item itself
+    when it has no (valid) style, else a copy."""
+    style = TEXT_STYLES.get(item.get("style")) \
+        if isinstance(item.get("style"), str) else None
+    if style is None:
+        return item
+    out = dict(item)
+    if "size" not in out:
+        out["size"] = int(round(style["size_frac"] * height))
+    if "color" not in out:
+        out["color"] = style["color"]
+    if "box" not in out:
+        out["box"] = style["box"]
+    if "shadow_x" not in out and "shadow_y" not in out:
+        out["shadow_x"], out["shadow_y"] = style["shadow"]
+    return out
+
+
 def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                       metadata_path=None, guides=False,
-                      review_timecode=False):
-    """Return (argv, total_duration) for a validated project.
+                      review_timecode=False, filter_script_dir=None,
+                      video_codec="libx264", video_crf=None,
+                      audio_codec="aac", final_range_convert=True,
+                      t_override=None, chain_scale_out=None):
+    """Return (argv, total_duration, text_dir) for a validated project.
 
     metadata_path is an ffmetadata file carrying chapters (or None).
     guides draws title-safe/action-safe boxes (preview only, never
@@ -471,6 +808,38 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     a running timecode into this render; final renders pass False
     here unless the project itself sets timecode (see
     render_project), so a normal final render is unaffected.
+
+    Refactoring options (all default to the old behaviour, so a
+    plain call produces exactly the old argv):
+    filter_script_dir writes the filter graph to
+    filter_complex.txt in that directory and passes
+    -filter_complex_script instead of the inline -filter_complex
+    string — the graph content is identical, only the transport
+    changes, which avoids argv length limits on very long
+    projects. video_codec / video_crf / audio_codec select the
+    output codecs (segment caching uses lossless libx264 crf 0 +
+    pcm_f32le; an explicit video_bitrate still wins over crf, as
+    before). final_range_convert=False replaces the final
+    out_range=tv conversion with a passthrough, so a segment's
+    frames match the chain-native frames exactly (the assembly
+    pass converts once, as a direct render does). t_override
+    replaces ONLY the -t output flag (segment/assembly renders
+    pass total + one frame so the fps filter's EOF-flushed
+    boundary frame survives -t: with -t exactly at the clip
+    duration that frame is dropped — verified: a 2.51s clip
+    yields 60 frames with -t 2.51 but 61 without it); every
+    other use of total (SFX durations, fade windows, silence
+    padding) still uses total, so the timeline is unchanged and
+    -t slack can never add content beyond the graph's EOF.
+    chain_scale_out is (out_range, out_color_matrix) or None:
+    when given, every clip-chain scale filter forces that
+    output range/colorspace. Segment renders pass it so their
+    scales reproduce the direct graph's scale outputs (a
+    single-clip render negotiates a different format than the
+    multi-clip direct graph — measured: image segments decoded
+    as yuvj420p pulled the assembly's scales to bt470bg/pc
+    and re-converted video frames with a second rounding).
+    None keeps the old behaviour.
     """
     width = _even(info["width"] * scale_factor)
     height = _even(info["height"] * scale_factor)
@@ -480,11 +849,13 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     argv = ["ffmpeg", "-y", "-v", "error"]
     # Inputs: clips first, then audio tracks.
     for _ci, clip in enumerate(clips):
-        if clip["kind"] == "image" and effective_ken_burns(clip, _ci, project) not in (None, "none"):
+        if clip["kind"] == "image" and (effective_ken_burns(clip, _ci, project) not in (None, "none")
+                                       or clip.get("camera")):
             # Ken Burns uses zoompan on a SINGLE input frame: zoompan
             # itself generates d output frames. A looped input would
             # make zoompan emit d frames per input frame and blow up
-            # the clip duration.
+            # the clip duration. A camera path (v1.40.0) is the same
+            # zoompan mechanism, so it takes the same branch.
             pass
         elif clip["kind"] == "image":
             argv += ["-loop", "1", "-t", str(clip["duration"])]
@@ -544,6 +915,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         metadata_idx = _input_count(argv)
         argv += ["-i", metadata_path]
     filters = []
+    # Clip-chain scale output force (segment renders only; None
+    # keeps the old behaviour everywhere else).
+    cs = _chain_scale_suffix(chain_scale_out)
     # Per-clip video and audio. vlabels[i] is the label the chain
     # must use for clip i (v{i}, or vout{i} when chroma-keyed).
     vlabels = []
@@ -584,16 +958,32 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             else:
                 pre = (f"trim=start={clip['trim_in']}:end={clip['trim_out']},"
                        f"setpts=PTS-STARTPTS{speed_part}")
-            if clip.get("_stab_trf"):
+            if clip.get("camera"):
+                # Camera path on video (v1.40.0): the same 2x
+                # pre-scale + zoompan mechanism as Ken Burns,
+                # but the crop follows the multi-stop path.
+                # zoompan d=1 emits one frame per input frame
+                # and `in` counts the fps-normalised stream,
+                # so in/fps is clip-local seconds. Validation
+                # rejects blur fits, stabilize and speed_curve
+                # with camera, so the plain pre (trim/speed/
+                # freeze/reverse/loop) is the whole input here;
+                # framing is cover by construction, like KB.
+                vf = (f"[{i}:v]{pre},scale={2 * width}:{2 * height}:"
+                      f"force_original_aspect_ratio=increase,"
+                      f"crop={2 * width}:{2 * height},fps={fps},"
+                      f"{_camera_zoompan_filter(clip['camera'], f'(in/{fps})', width, height, 1, fps)},"
+                      f"setpts=PTS-STARTPTS,format=yuv420p")
+            elif clip.get("_stab_trf"):
                 # Two-pass vidstab: pass 1 (detect) ran in
                 # render_project at this same scale; pass 2
                 # transforms the scaled frames.
                 vf = (f"[{i}:v]trim=start={clip['trim_in']}:end={clip['trim_out']},"
                       f"setpts=PTS-STARTPTS,"
-                      f"{_scale_part(clip.get('fit'), width, height)},"
+                      f"{_scale_part(clip.get('fit'), width, height, chain_scale_out)},"
                       f"vidstabtransform=input={clip['_stab_trf']},"
                       f"fps={fps},format=yuv420p")
-            elif clip.get("fit") == "blur":
+            elif clip.get("fit") in ("blur", "blur_pad"):
                 # Blurred background: the same stream twice — once
                 # scaled to cover and blurred/darkened as the
                 # background, once scaled to contain as the
@@ -601,24 +991,38 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 filters.append(f"[{i}:v]{pre},split=2[ba{i}][bb{i}]")
                 filters.append(
                     f"[ba{i}]scale={width}:{height}:"
-                    f"force_original_aspect_ratio=increase,"
-                    f"crop={width}:{height},gblur=sigma=20,"
+                    f"force_original_aspect_ratio=increase{cs},"
+                    f"crop={width}:{height},{_blur_filter(clip.get('fit'))},"
                     f"eq=brightness=-0.2[bg{i}]")
                 filters.append(
                     f"[bb{i}]scale={width}:{height}:"
-                    f"force_original_aspect_ratio=decrease[fg{i}]")
+                    f"force_original_aspect_ratio=decrease{cs}[fg{i}]")
                 vf = (f"[bg{i}][fg{i}]overlay=(main_w-overlay_w)/2:"
                       f"(main_h-overlay_h)/2,fps={fps},format=yuv420p")
             elif clip.get("fit") == "cover":
                 vf = (f"[{i}:v]{pre},scale={width}:{height}:"
-                      f"force_original_aspect_ratio=increase,"
+                      f"force_original_aspect_ratio=increase{cs},"
                       f"crop={width}:{height},"
                       f"fps={fps},format=yuv420p")
             else:
                 vf = (f"[{i}:v]{pre},scale={width}:{height}:"
-                      f"force_original_aspect_ratio=decrease,"
+                      f"force_original_aspect_ratio=decrease{cs},"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                       f"fps={fps},format=yuv420p")
+        elif clip.get("camera"):
+            # Camera path on a still (v1.40.0): zoompan on a
+            # single input frame generates d frames, exactly
+            # like Ken Burns, but along the multi-stop path.
+            # Camera wins over ken_burns (branch order) and
+            # over default motion; the input loop above skips
+            # -loop for camera images for the same reason.
+            frames = max(1, int(round(dur * fps)))
+            pre = (f"{downscale}scale={2 * width}:{2 * height}:"
+                   f"force_original_aspect_ratio=increase,"
+                   f"crop={2 * width}:{2 * height}")
+            vf = (f"[{i}:v]{pre},"
+                  f"{_camera_zoompan_filter(clip['camera'], f'(on/{fps})', width, height, frames, fps)},"
+                  f"setpts=PTS-STARTPTS,format=yuv420p")
         elif effective_ken_burns(clip, i, project) not in (None, "none"):
             # v1.37.2: the branch is driven by the EFFECTIVE motion
             # alone. A clip with punch_in has effective motion
@@ -642,41 +1046,51 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # softly. s is the smoothstep of the frame progress.
             _p = f"on/{frames}"
             _s = f"({_p})*({_p})*(3-2*({_p}))"
+            # v1.40.0: continuity — a same-scene clip whose
+            # scales were re-based in validation uses the
+            # parameterized z (start + (end-start)*s, which
+            # reproduces the legacy expressions at the legacy
+            # defaults); otherwise the legacy expressions run
+            # byte-identical to before.
+            _cs = _ce = None
+            if "_kb_start" in clip and "_kb_end" in clip:
+                _cs = float(clip["_kb_start"])
+                _ce = float(clip["_kb_end"])
             if kb == "zoom_in":
-                z = f"1+0.12*{_s}"
+                z = f"{_cs!r}+({_ce!r}-{_cs!r})*{_s}" if _cs is not None else f"1+0.12*{_s}"
                 x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
             elif kb == "zoom_out":
-                z = f"1.12-0.12*{_s}"
+                z = f"{_cs!r}+({_ce!r}-{_cs!r})*{_s}" if _cs is not None else f"1.12-0.12*{_s}"
                 x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
             elif kb == "pan_left":
-                z = "1.12"
+                z = f"{_cs!r}" if _cs is not None else "1.12"
                 x_expr, y_expr = f"(iw-iw/zoom)*{_s}", "(ih-ih/zoom)/2"
             else:  # pan_right
-                z = "1.12"
+                z = f"{_cs!r}" if _cs is not None else "1.12"
                 x_expr, y_expr = f"(iw-iw/zoom)*(1-{_s})", "(ih-ih/zoom)/2"
             vf = (f"[{i}:v]{pre},zoompan=z='{z}':x='{x_expr}':y='{y_expr}':"
                   f"d={frames}:s={width}x{height}:fps={fps},"
                   f"setpts=PTS-STARTPTS,format=yuv420p")
-        elif clip.get("fit") == "blur":
+        elif clip.get("fit") in ("blur", "blur_pad"):
             filters.append(f"[{i}:v]{downscale}split=2[ba{i}][bb{i}]")
             filters.append(
                 f"[ba{i}]scale={width}:{height}:"
-                f"force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},gblur=sigma=20,"
+                f"force_original_aspect_ratio=increase{cs},"
+                f"crop={width}:{height},{_blur_filter(clip.get('fit'))},"
                 f"eq=brightness=-0.2[bg{i}]")
             filters.append(
                 f"[bb{i}]scale={width}:{height}:"
-                f"force_original_aspect_ratio=decrease[fg{i}]")
+                f"force_original_aspect_ratio=decrease{cs}[fg{i}]")
             vf = (f"[bg{i}][fg{i}]overlay=(main_w-overlay_w)/2:"
                   f"(main_h-overlay_h)/2,fps={fps},format=yuv420p")
         elif clip.get("fit") == "cover":
             vf = (f"[{i}:v]{downscale}scale={width}:{height}:"
-                  f"force_original_aspect_ratio=increase,"
+                  f"force_original_aspect_ratio=increase{cs},"
                   f"crop={width}:{height},"
                   f"fps={fps},format=yuv420p")
         else:
             vf = (f"[{i}:v]{downscale}scale={width}:{height}:"
-                  f"force_original_aspect_ratio=decrease,"
+                  f"force_original_aspect_ratio=decrease{cs},"
                   f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                   f"fps={fps},format=yuv420p")
         if clip["kind"] == "video" and clip.get("speed_curve"):
@@ -691,11 +1105,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 seg_pre = f"trim=start={ss}:end={se},setpts=PTS-STARTPTS{sp_part}"
                 if clip.get("fit") == "cover":
                     seg_scale = (f"scale={width}:{height}:"
-                                 f"force_original_aspect_ratio=increase,"
+                                 f"force_original_aspect_ratio=increase{cs},"
                                  f"crop={width}:{height}")
                 else:
                     seg_scale = (f"scale={width}:{height}:"
-                                 f"force_original_aspect_ratio=decrease,"
+                                 f"force_original_aspect_ratio=decrease{cs},"
                                  f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
                 filters.append(f"[{i}:v]{seg_pre},{seg_scale},fps={fps},format=yuv420p[sc{si}]")
                 seg_labels.append(f"[sc{si}]")
@@ -731,6 +1145,13 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             lut_esc = str(lut_path).replace("\\", "\\\\")
             vf += (f",format=rgb24,lut3d=file='{lut_esc}',"
                    f"format=yuv420p")
+        # General image treatment (v1.40.0): after colour
+        # (grade/LUT), before fades, so fades operate on the
+        # treated image. All default off, so old clips render
+        # identically.
+        _tr = _treatment_filters(clip.get("treatment"))
+        if _tr:
+            vf += "," + _tr
         fades = []
         if clip.get("transition") == "fade":
             ftd = float(clip.get("transition_duration", 0.3))
@@ -859,7 +1280,21 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # Chain clips: true crossfade (xfade/acrossfade, 0.5s) where the
     # incoming clip asks for it, plain concat otherwise. The chain
     # duration therefore equals info["total_duration"].
-    vcur_chain = vlabels[0]
+    # Delta fix (found by the delta proof render): clip chains
+    # can carry different link SARs — scale with
+    # force_original_aspect_ratio rounds integer dimensions
+    # and compensates with SAR (e.g. 5120:5121 for a 640x360
+    # source covering 720x1280), while zoompan outputs square
+    # pixels — and concat/xfade refuse to join mismatched
+    # SARs. Every join input is therefore normalised to
+    # square pixels first (setsar is metadata-only; pixels
+    # are untouched). Single-clip projects bypass the join
+    # entirely, so their chains are unaffected.
+    vjoin = []
+    for i in range(len(clips)):
+        filters.append(f"[{vlabels[i]}]setsar=1[vs{i}]")
+        vjoin.append(f"vs{i}")
+    vcur_chain = vjoin[0]
     cur_dur = clips[0]["duration"]
     for i in range(1, len(clips)):
         dur = clips[i]["duration"]
@@ -867,12 +1302,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             xname = XFADE_TRANSITIONS[clips[i]["transition"]]
             xtd = float(clips[i].get("transition_duration", 0.5))
             filters.append(
-                f"[{vcur_chain}][{vlabels[i]}]xfade=transition={xname}:duration={xtd:.3f}:"
+                f"[{vcur_chain}][{vjoin[i]}]xfade=transition={xname}:duration={xtd:.3f}:"
                 f"offset={cur_dur - xtd:.3f}[x{i}]")
             vcur_chain = f"x{i}"
             cur_dur += dur - xtd
         else:
-            filters.append(f"[{vcur_chain}][{vlabels[i]}]concat=n=2:v=1:a=0[c{i}]")
+            filters.append(f"[{vcur_chain}][{vjoin[i]}]concat=n=2:v=1:a=0[c{i}]")
             vcur_chain = f"c{i}"
             cur_dur += dur
     acur_chain = "a0"
@@ -938,6 +1373,13 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         "bottom_center": ("(main_w-overlay_w)/2", "main_h-overlay_h-20"),
         "bottom_right": ("main_w-overlay_w-20", "main_h-overlay_h-20"),
     }
+    # General image treatment, project level (v1.40.0): on the
+    # joined timeline after scrims, before overlays/texts, so
+    # graphics stay clean and grain covers the whole picture.
+    _ptr = _treatment_filters(project.get("treatment"))
+    if _ptr:
+        filters.append(f"[{vcur_chain}]{_ptr}[vtr]")
+        vcur_chain = "vtr"
     vcur = vcur_chain
     for si, (ov, seg_start, seg_end, idx, _audio_idx) in enumerate(overlay_segments):
         ostart = float(ov["start"])
@@ -1086,6 +1528,59 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             px, py = OVERLAY_POS[ov.get("position", "bottom_right")]
             x_expr = str(ov["x"]) if "x" in ov else px
             y_expr = str(ov["y"]) if "y" in ov else py
+        # Parallax (v1.40.0): an overlay with depth > 0 drifts
+        # with the camera/background motion of the clip under
+        # its start — foreground faster than background, depth 1
+        # glued to the content, depth 0 the old screen-pinned
+        # behaviour. The term is a translation in output pixels:
+        # for a camera path it is W*z(tau)*(fx0-fx(tau))
+        # horizontally (and H analogously vertically), where
+        # fx/z are the path's interpolated centre/scale at
+        # clip-local time tau = t - clip_start; for a Ken Burns
+        # pan it is the closed form -/+depth*W*0.12*smoothstep
+        # (tau/dur) (a pan moves content by exactly 0.12*W at
+        # z=1.12). Zoom-only motion has a constant centre, so
+        # it yields no positional parallax, by design. The term
+        # adds to keyframed positions too, and flows into the
+        # drop shadow below (which reuses x_expr/y_expr).
+        # Outside the clip (an overlay spanning past its clip)
+        # the camera interpolation holds its last value and
+        # the pan u clamps to [0,1], so the term freezes
+        # instead of extrapolating. The clip under an overlay
+        # is the last clip whose start is <= the overlay start
+        # (during an xfade overlap that is the incoming, on-top
+        # clip).
+        _depth = float(ov.get("depth", 0) or 0)
+        if _depth > 0:
+            _starts = info.get("clip_starts") or []
+            _ci = 0
+            for _j, _cs in enumerate(_starts):
+                if _cs <= ostart:
+                    _ci = _j
+            if clips and _ci < len(clips):
+                _cclip = clips[_ci]
+                _cstart = _starts[_ci] if _ci < len(_starts) else 0.0
+                _tau = f"(t-{_cstart!r})"
+                _term_x = _term_y = None
+                if _cclip.get("camera"):
+                    _cam = _cclip["camera"]
+                    _fx = _camera_interp_expr(_cam, "x", _tau)
+                    _fy = _camera_interp_expr(_cam, "y", _tau)
+                    _fz = _camera_interp_expr(_cam, "scale", _tau)
+                    _term_x = f"{_depth!r}*{width}*({_fz})*({float(_cam[0]['x'])!r}-({_fx}))"
+                    _term_y = f"{_depth!r}*{height}*({_fz})*({float(_cam[0]['y'])!r}-({_fy}))"
+                else:
+                    _kb = effective_ken_burns(_cclip, _ci, project)
+                    if _kb in ("pan_left", "pan_right"):
+                        _cdur = float(_cclip["duration"])
+                        _u = f"min(max(({_tau})/({_cdur!r}),0),1)"
+                        _s = f"({_u})*({_u})*(3-2*({_u}))"
+                        _sign = "-" if _kb == "pan_left" else ""
+                        _term_x = f"{_sign}{_depth!r}*{width}*0.12*({_s})"
+                if _term_x is not None:
+                    x_expr = f"({x_expr})+({_term_x})"
+                if _term_y is not None:
+                    y_expr = f"({y_expr})+({_term_y})"
         # Drop shadow: a black, blurred copy of the dressed stream
         # composited underneath at an offset. Active only when an
         # offset or a blur is set (and opacity > 0); setting only
@@ -1163,6 +1658,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     render_items = []
     for _item, _is_cap in ([(t, False) for t in (project.get("texts") or [])]
                            + [(c, True) for c in merged_captions]):
+        # v1.40.0: style presets resolve before expansion, so
+        # expanded word items inherit the resolved size/colour.
+        _item = _resolve_text_style(_item, height)
         # Active word-timed captions (v1.37.0): the agent supplies
         # per-word timings; AgentCut renders short chunks (2–4
         # words) with the current word highlighted. Chunk mode
@@ -1234,6 +1732,112 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                                 "end": float(_w["end"]), "x": _xs[_li],
                                 "y": _cap_y, "color": _hi_color, "box": True,
                                 "shadow_x": 2, "shadow_y": 2})
+                    _hi.pop("word_timings", None)
+                    _hi.pop("position", None)
+                    for _k in ("box_radius", "box_color", "box_opacity", "box_padding"):
+                        _hi.pop(_k, None)
+                    render_items.append((_hi, False))
+            continue
+        # Kinetic text (v1.40.0): the caption word-mode
+        # mechanism generalized to any text. Same chunking,
+        # measured ink widths and RTL reversal, but anchored to
+        # the text's own position: numeric x wins, position
+        # presets map to left/centre/right anchors (40px margins,
+        # mirroring the pill geometry), x == "center" (or absent)
+        # centres the chunk; y mirrors the text bands (top 40,
+        # bottom height-40-size*1.4, centre centred, else the
+        # item y, default 100). The highlight word pops to
+        # size * emphasis_factor (default 1.25 with emphasis,
+        # else 1.0), re-centred on its slot so it grows in place
+        # instead of shoving its neighbours. Validation rejects
+        # word_timings combined with reveal/animation/fades, so
+        # this branch never meets those. Like captions, the
+        # expanded items drop word_timings and position (the
+        # drawtext loop would otherwise override their x/y with
+        # the preset) and drop box_radius fields (the pill is
+        # static and cannot follow a moving highlight).
+        if not _is_cap and _item.get("word_timings"):
+            _wt = _item["word_timings"]
+            _chunks = chunk_word_timings(_wt)
+            _size = float(_item.get("size", 48))
+            _pos = _item.get("position")
+            if _pos in ("top_left", "top_center", "top_right"):
+                _kin_y = 40.0
+            elif _pos in ("bottom_left", "bottom_center", "bottom_right"):
+                _kin_y = float(height - 40 - _size * 1.4)
+            elif _pos == "center":
+                _kin_y = float((height - _size * 1.4) / 2)
+            else:
+                _kin_y = float(_item.get("y", 100))
+            if _item.get("highlight_mode", "word") == "chunk":
+                for _ch in _chunks:
+                    _sub = dict(_item)
+                    _sub["text"] = " ".join(w["word"] for w in _ch)
+                    _sub["start"] = float(_ch[0]["start"])
+                    _sub["end"] = float(_ch[-1]["end"])
+                    _sub["color"] = _item.get("highlight_color", "yellow")
+                    _sub.pop("word_timings", None)
+                    _sub.pop("position", None)
+                    render_items.append((_sub, False))
+                continue
+            _word_cache = {}
+            _space_w = _size * 0.30
+            _factor = float(_item.get(
+                "emphasis_factor",
+                1.25 if _item.get("emphasis") else 1.0))
+            for _ch in _chunks:
+                _cstart = float(_ch[0]["start"])
+                _cend = float(_ch[-1]["end"])
+                _widths = []
+                for _w in _ch:
+                    _font_w = find_font_for_text(str(_w["word"]))
+                    _mw = _measure_word_ink(str(_w["word"]), _font_w, _size,
+                                            text_dir, _word_cache) \
+                        if _font_w else None
+                    _widths.append(float(_mw) if _mw else
+                                   max(10.0, len(str(_w["word"])) * _size * 0.6))
+                _total_w = sum(_widths) + _space_w * (len(_ch) - 1)
+                _xv = _item.get("x", "center")
+                if isinstance(_xv, (int, float)):
+                    _left = float(_xv)
+                elif _pos in ("top_left", "bottom_left"):
+                    _left = 40.0
+                elif _pos in ("top_right", "bottom_right"):
+                    _left = float(width - _total_w - 40)
+                else:
+                    _left = (width - _total_w) / 2
+                _is_rtl = bool(_ARABIC_RE.search(" ".join(w["word"] for w in _ch)))
+                _xs = {}
+                for _li, _w in enumerate(_ch):
+                    _vis = (len(_ch) - 1 - _li) if _is_rtl else _li
+                    _x = _left
+                    for _vj in range(_vis):
+                        _src_li = (len(_ch) - 1 - _vj) if _is_rtl else _vj
+                        _x += _widths[_src_li] + _space_w
+                    _xs[_li] = int(round(_x))
+                _base_color = _item.get("color", "white")
+                _hi_color = _item.get("highlight_color", "yellow")
+                for _li, _w in enumerate(_ch):
+                    _base = dict(_item)
+                    _base.update({"text": str(_w["word"]), "start": _cstart,
+                                  "end": _cend, "x": _xs[_li], "y": _kin_y,
+                                  "color": _base_color, "box": False,
+                                  "shadow_x": 2, "shadow_y": 2})
+                    _base.pop("word_timings", None)
+                    _base.pop("position", None)
+                    for _k in ("box_radius", "box_color", "box_opacity", "box_padding"):
+                        _base.pop(_k, None)
+                    render_items.append((_base, False))
+                for _li, _w in enumerate(_ch):
+                    _hw = _widths[_li] * _factor
+                    _hx = int(round(_xs[_li] - (_hw - _widths[_li]) / 2))
+                    _hi = dict(_item)
+                    _hi.update({"text": str(_w["word"]),
+                                "start": float(_w["start"]),
+                                "end": float(_w["end"]), "x": _hx,
+                                "y": _kin_y, "color": _hi_color, "box": True,
+                                "shadow_x": 2, "shadow_y": 2,
+                                "size": int(round(_size * _factor))})
                     _hi.pop("word_timings", None)
                     _hi.pop("position", None)
                     for _k in ("box_radius", "box_color", "box_opacity", "box_padding"):
@@ -1364,19 +1968,18 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if isinstance(sc, str) and sc.startswith("#"):
                 sc = "0x" + sc[1:]
             stroke_part = f":borderw={stroke}:bordercolor={sc}"
-        # Text shadow (v1.36.0): drawtext shadowx/shadowy. When
-        # neither axis is set, captions get a subtle default
-        # shadow (2,2) so they read over bright panels, while
-        # plain texts default to no shadow. Setting either axis
-        # takes over both (the missing axis reads as 0), so
-        # shadow_x=0 alone disables the caption default.
+        # Text shadow (v1.36.0, extended v1.40.0): drawtext
+        # shadowx/shadowy. When neither axis is set, captions
+        # AND plain texts get a subtle default shadow (2,2) so
+        # they read over bright panels — the v1.40.0 defaults
+        # upgrade (plain texts used to default to no shadow).
+        # Setting either axis takes over both (the missing axis
+        # reads as 0), so shadow_x=0 alone disables the default.
         if "shadow_x" in item or "shadow_y" in item:
             sx = int(item.get("shadow_x", 0))
             sy = int(item.get("shadow_y", 0))
-        elif is_caption:
-            sx, sy = 2, 2
         else:
-            sx, sy = 0, 0
+            sx, sy = 2, 2
         shadow_part = ""
         if sx or sy:
             shadow_part = (f":shadowcolor={_ff_color(item.get('shadow_color', 'black'))}"
@@ -1527,6 +2130,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     has_voice = any(t.get("kind") == "voice" for t in audio_tracks)
     has_music = any(t.get("kind") == "music" for t in audio_tracks)
     duck = info.get("ducking")
+    # Delta: explicit auto-duck switch (precedence contract in
+    # validate.py). Default True is the pre-delta behaviour;
+    # False disables only the auto sidechain path.
+    auto_duck = info.get("auto_duck", True)
     mix_inputs = [f"[{acur_chain}]"]
     base = len(clips)
     for j, track in enumerate(audio_tracks):
@@ -1589,7 +2196,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             filters.append(
                 f"[t{j}]volume='{gain_expr}':eval=frame[td{j}]")
             mix_inputs.append(f"[td{j}]")
-    elif has_voice and has_music:
+    elif auto_duck and has_voice and has_music:
         voice_labels = [f"[t{j}]" for j, t in enumerate(audio_tracks)
                         if t.get("kind") == "voice"]
         filters.append(
@@ -1712,22 +2319,50 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:"
             f"duration=longest:normalize=0[aout]")
         aout = "aout"
+    # Delta: final-master loudnorm (opt-in, output.master_loudnorm).
+    # Distinct from per-track loudnorm: this masters the finished
+    # mix at -14 LUFS / -1.5 dBTP / LRA 11 (single pass, so the
+    # measured value lands near -14, not exactly). Applied only
+    # when the project has audio tracks: on an all-silence
+    # timeline loudnorm measures -inf and fails, so silent
+    # projects skip mastering rather than erroring.
+    if info.get("master_loudnorm") and audio_tracks:
+        filters.append(f"[{aout}]loudnorm=I=-14:TP=-1.5:LRA=11[aoutm]")
+        aout = "aoutm"
     # Final range conversion: -pix_fmt alone can leave yuvj420p (full
     # range) from JPEG inputs; scale out_range=tv converts to
     # limited-range yuv420p, the format phone players expect.
-    filters.append(f"[{vout}]scale=out_range=tv,format=yuv420p[vfinal]")
+    # With final_range_convert=False the stage is a passthrough,
+    # so segment frames stay exactly the chain-native frames.
+    if final_range_convert:
+        filters.append(f"[{vout}]scale=out_range=tv,format=yuv420p[vfinal]")
+    else:
+        filters.append(f"[{vout}]null[vfinal]")
     filter_complex = ";".join(filters)
-    argv += ["-filter_complex", filter_complex,
-             "-map", "[vfinal]", "-map", f"[{aout}]",
-             "-c:v", "libx264", "-preset", "veryfast"]
+    if filter_script_dir:
+        os.makedirs(filter_script_dir, exist_ok=True)
+        script_path = os.path.join(filter_script_dir, "filter_complex.txt")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(filter_complex)
+        argv += ["-filter_complex_script", script_path,
+                 "-map", "[vfinal]", "-map", f"[{aout}]",
+                 "-c:v", video_codec, "-preset", "veryfast"]
+    else:
+        argv += ["-filter_complex", filter_complex,
+                 "-map", "[vfinal]", "-map", f"[{aout}]",
+                 "-c:v", video_codec, "-preset", "veryfast"]
     # Pro pack delivery bitrate: a preset (or an explicit
     # output.video_bitrate) sets a target bitrate instead of the
     # default constant-quality crf 23. Without it, crf 23 is
     # unchanged, so every existing project renders as before.
+    # An explicit video_crf replaces the crf 23 default (a
+    # video_bitrate still wins over crf, as before).
     if info.get("video_bitrate"):
         kbps = _bitrate_kbps(info["video_bitrate"])
         argv += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k",
                  "-bufsize", f"{2 * kbps}k"]
+    elif video_crf is not None:
+        argv += ["-crf", str(video_crf)]
     else:
         argv += ["-crf", "23"]
     argv += [
@@ -1735,7 +2370,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
              # image inputs (JPEG yuvj) can leak through xfade as
              # yuvj444p / High 4:4:4, which most phone players refuse.
              "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "128k", "-t", str(total)]
+             "-c:a", audio_codec]
+    if audio_codec == "aac":
+        argv += ["-b:a", "128k"]
+    # -t slack (see t_override doc): total truncates the timeline
+    # exactly, but the fps filter's EOF-flushed boundary frame is
+    # dropped when -t equals the timeline end, so callers that
+    # must keep every chain frame pass a slightly larger -t.
+    argv += ["-t", str(t_override if t_override is not None else total)]
     if metadata_idx is not None:
         # Chapters (and only chapters: -map_chapters takes the
         # chapter list from the ffmetadata input; the output's
@@ -1755,7 +2397,11 @@ def _remove_quietly(path):
 
 
 def render_project(project, output_path, scale_factor=1.0, timeout=600,
-                   guides=False, review_timecode=False):
+                   guides=False, review_timecode=False,
+                   video_codec="libx264", video_crf=None,
+                   audio_codec="aac", final_range_convert=True,
+                   use_filter_script=True, t_override=None,
+                   chain_scale_out=None):
     """Render a project dict. Returns (ok, info_or_error).
 
     Atomic output: ffmpeg writes to a temp file in the output
@@ -1767,7 +2413,24 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     pass False for final renders). Timecode is burned in when
     review_timecode is True OR the project itself sets
     timecode: true; otherwise a final render has no timecode.
+
+    Refactoring options (defaults preserve the old behaviour):
+    video_codec "auto" picks the best detected hardware encoder
+    (choose_video_codec) and falls back to libx264 with one retry
+    when a hardware encode fails; any other non-libx264 codec
+    gets the same single libx264 retry. video_crf / audio_codec /
+    final_range_convert pass through to build_ffmpeg_args (used
+    by segment caching). use_filter_script writes the filter
+    graph to a temp file and passes -filter_complex_script
+    (identical graph, no argv length limit); False keeps the
+    inline -filter_complex string. Signal handlers clean temp
+    dirs on SIGINT/SIGTERM (best-effort, main thread only).
+    t_override passes through to build_ffmpeg_args (see there);
+    it affects only the -t flag, never the timeline.
+    chain_scale_out passes through to build_ffmpeg_args (see
+    there); segment caching uses it for segment renders.
     """
+    install_signal_handlers()
     errors, info = validate_project(project)
     if errors:
         return False, {"code": "INVALID_PROJECT", "errors": errors}
@@ -1804,6 +2467,7 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     stab_clips = [c for c in info["clips"] if c.get("stabilize") and c["kind"] == "video"]
     if stab_clips:
         stab_dir = tempfile.mkdtemp(prefix="agentcut-stab-")
+        register_temp_dir(stab_dir)
         tw = _even(info["width"] * scale_factor)
         th = _even(info["height"] * scale_factor)
         for si, clip in enumerate(stab_clips):
@@ -1820,7 +2484,7 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
                 if stab_dir:
                     shutil.rmtree(stab_dir, ignore_errors=True)
                 return False, {"code": "RENDER_FAILED",
-                               "message": f"stabilisation detect failed for clip {clip.get('id')}: {proc.stderr[-500:]}"}
+                               "message": f"stabilisation detect failed for clip {clip.get('id')}: {extract_ffmpeg_error(proc.stderr, max_lines=10)}"}
             clip["_stab_trf"] = trf
     # Pre-scale image clips before the main filter graph: the main
     # graph (especially xfade chains) then decodes small files instead
@@ -1831,16 +2495,26 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     image_clips = [(ci, c) for ci, c in enumerate(info["clips"]) if c["kind"] == "image"]
     if image_clips:
         prescale_dir = tempfile.mkdtemp(prefix="agentcut-prescale-")
+        register_temp_dir(prescale_dir)
         tw = _even(info["width"] * scale_factor)
         th = _even(info["height"] * scale_factor)
         for ci, clip in image_clips:
-            if clip.get("fit") == "blur":
+            if clip.get("fit") in ("blur", "blur_pad"):
                 # Blurred-background clips need the unpadded source
                 # in the main graph (background cover + foreground
                 # contain); a contain prescale would bake black bars
                 # into the background.
                 continue
-            if effective_ken_burns(clip, ci, project) not in (None, "none"):
+            if clip.get("camera") or effective_ken_burns(clip, ci, project) not in (None, "none"):
+                # Camera paths (v1.40.0) need the same 2x cover
+                # prescale as Ken Burns: their main-graph chain
+                # zooms from a 2x frame, and a contain prescale
+                # would bake black bars into that frame (caught
+                # by the round-1 camera render: letterboxed
+                # frames with a dark mean instead of the cover
+                # crop). The main-graph 2x scale is then a no-op
+                # on the already-2x frame, so framing is identical
+                # to rendering from the original.
                 pw, ph = 2 * tw, 2 * th
                 vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
                       f"crop={pw}:{ph}")
@@ -1876,6 +2550,7 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     metadata_path = None
     if info.get("chapters"):
         meta_dir = tempfile.mkdtemp(prefix="agentcut-meta-")
+        register_temp_dir(meta_dir)
         metadata_path = os.path.join(meta_dir, "chapters.txt")
         lines = [";FFMETADATA1"]
         for ch in info["chapters"]:
@@ -1895,6 +2570,7 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     if info.get("diagrams"):
         from .diagrams import encode_diagram_video
         diagram_dir = tempfile.mkdtemp(prefix="agentcut-diagrams-")
+        register_temp_dir(diagram_dir)
         for di, dg in enumerate(info["diagrams"]):
             dg_video = os.path.join(diagram_dir, f"diagram_{di}.mov")
             try:
@@ -1910,27 +2586,71 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
                     shutil.rmtree(meta_dir, ignore_errors=True)
                 return False, {"code": "RENDER_FAILED", "message": str(exc)}
             dg["_video"] = dg_video
+    filter_dir = None
+    if use_filter_script:
+        filter_dir = tempfile.mkdtemp(prefix="agentcut-filter-")
+        register_temp_dir(filter_dir)
     effective_timecode = bool(review_timecode or project.get("timecode"))
-    try:
-        argv, total, text_dir = build_ffmpeg_args(
-            project, info, tmp_path, scale_factor,
-            metadata_path=metadata_path, guides=guides,
-            review_timecode=effective_timecode)
-    except ValueError as exc:
-        # Font failures raised by the filter builder (defence in
-        # depth behind validation) become structured errors, never
-        # tracebacks and never a render with tofu boxes.
-        if str(exc).startswith("FONT_NOT_FOUND"):
-            _remove_quietly(tmp_path)
-            if diagram_dir:
-                shutil.rmtree(diagram_dir, ignore_errors=True)
-            return False, {"code": "INVALID_PROJECT", "message": str(exc),
-                           "fix": "use the bundled fonts/ directory, or set "
-                                  "AGENTCUT_FONT_DIR to a directory with the "
-                                  "needed font"}
-        raise
+
+    def _build(codec):
+        """Build argv for `codec`. Returns (True, (argv, total,
+        text_dir)) or (False, structured_error) for font failures
+        (defence in depth behind validation); other ValueErrors
+        still propagate, as before."""
+        try:
+            built = build_ffmpeg_args(
+                project, info, tmp_path, scale_factor,
+                metadata_path=metadata_path, guides=guides,
+                review_timecode=effective_timecode,
+                filter_script_dir=filter_dir,
+                video_codec=codec, video_crf=video_crf,
+                audio_codec=audio_codec,
+                final_range_convert=final_range_convert,
+                t_override=t_override,
+                chain_scale_out=chain_scale_out)
+        except ValueError as exc:
+            if str(exc).startswith("FONT_NOT_FOUND"):
+                return False, {"code": "INVALID_PROJECT", "message": str(exc),
+                               "fix": "use the bundled fonts/ directory, or set "
+                                      "AGENTCUT_FONT_DIR to a directory with the "
+                                      "needed font"}
+            raise
+        return True, built
+
+    codec_used = choose_video_codec(video_codec)
+    built_ok, built = _build(codec_used)
+    if not built_ok:
+        _remove_quietly(tmp_path)
+        if diagram_dir:
+            shutil.rmtree(diagram_dir, ignore_errors=True)
+        if filter_dir:
+            shutil.rmtree(filter_dir, ignore_errors=True)
+            unregister_temp_dir(filter_dir)
+        return False, built
+    argv, total, text_dir = built
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0 and codec_used != "libx264":
+            # Hardware fallback: the detected encoder failed at
+            # runtime (missing driver, unsupported profile, ...).
+            # Rebuild the identical graph with libx264 and retry
+            # exactly once; a second failure is reported, never
+            # retried again. The first build's text/filter dirs
+            # are removed first (the rebuild writes fresh ones),
+            # and the finally below cleans the rebuild's dirs.
+            if text_dir:
+                shutil.rmtree(text_dir, ignore_errors=True)
+            if filter_dir:
+                shutil.rmtree(filter_dir, ignore_errors=True)
+                unregister_temp_dir(filter_dir)
+                filter_dir = tempfile.mkdtemp(prefix="agentcut-filter-")
+                register_temp_dir(filter_dir)
+            rebuilt_ok, rebuilt = _build("libx264")
+            if not rebuilt_ok:
+                _remove_quietly(tmp_path)
+                return False, rebuilt
+            argv, total, text_dir = rebuilt
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         _remove_quietly(tmp_path)
         return False, {"code": "RENDER_FAILED", "message": "render timed out"}
@@ -1939,15 +2659,22 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
             shutil.rmtree(text_dir, ignore_errors=True)
         if prescale_dir:
             shutil.rmtree(prescale_dir, ignore_errors=True)
+            unregister_temp_dir(prescale_dir)
         if stab_dir:
             shutil.rmtree(stab_dir, ignore_errors=True)
+            unregister_temp_dir(stab_dir)
         if meta_dir:
             shutil.rmtree(meta_dir, ignore_errors=True)
+            unregister_temp_dir(meta_dir)
         if diagram_dir:
             shutil.rmtree(diagram_dir, ignore_errors=True)
+            unregister_temp_dir(diagram_dir)
+        if filter_dir:
+            shutil.rmtree(filter_dir, ignore_errors=True)
+            unregister_temp_dir(filter_dir)
     if proc.returncode != 0:
         _remove_quietly(tmp_path)
-        return False, {"code": "RENDER_FAILED", "message": proc.stderr[-2000:]}
+        return False, {"code": "RENDER_FAILED", "message": extract_ffmpeg_error(proc.stderr)}
     try:
         os.replace(tmp_path, output_path)
     except OSError as exc:
@@ -1958,6 +2685,411 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     return True, {"output": output_path, "duration": total,
                   "width": info["width"], "height": info["height"],
                   "fps": info["fps"], "probe": probe}
+
+
+# --- Segment caching (architectural refactoring) ----------------
+
+# Bump this whenever the segment encoding changes (codec, range
+# handling, audio format, t slack, chain scale force): the version
+# is part of every fingerprint, so old segments are never reused
+# after a change.
+# v3 (2026-10-31): chain scales forced to the direct graph's
+# common format (see _first_clip_chain_format); v2 segments were
+# unforced (image segments came out pc) and must not be reused.
+# v2 (2026-10-31): chain-native ranges (final_range_convert=False)
+# + multi-clip filter-concat assembly; v1 segments were tv-converted
+# for a demuxer join and must not be reused by v2.
+SEGMENT_CACHE_VERSION = "agentcut-segment-v3"
+SEGMENT_CONTAINER = "mkv"
+_SEGMENT_VOLATILE_KEYS = {"probe", "_stab_trf", "_video"}
+
+
+def _file_stat_fingerprint(path):
+    """Identity + staleness of one file: absolute path, mtime_ns,
+    size. mtime_ns (not seconds) so a rewrite within the same
+    second still invalidates; size so a same-mtime rewrite of
+    different length still invalidates. Returns None when the
+    file cannot be stat'ed (caller treats that as uncacheable)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {"path": os.path.abspath(path),
+            "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+
+
+def _first_clip_chain_format(info):
+    """(out_range, out_color_matrix) the direct graph's clip-chain
+    scales produce, predicted from the FIRST clip alone: the
+    concat filter negotiates one common format, and FFmpeg's
+    negotiation follows the first input. An image first clip
+    decodes to RGB, and its scale outputs unknown/unknown
+    (measured on the direct graph: rgb24 gbr/pc -> yuv420p
+    unknown/unknown). A video first clip keeps its probed
+    flags (a phone bt709/tv clip negotiates bt709/tv; an
+    unknown-flag clip negotiates unknown). Values are
+    normalised to scale-filter spellings (jpeg->pc,
+    mpeg->tv, bt601->bt470bg); anything unrecognised falls
+    back to unknown, which preserves the input (no
+    conversion) — the safe default. Segment renders force
+    their scales to this format so segment pixels equal the
+    direct chain's pixels exactly; without the force, a
+    single-clip segment render negotiates differently (image
+    segments came out pc and decoded as yuvj420p, pulling the
+    assembly's scales to bt470bg/pc and re-converting video
+    frames with a second 8-bit rounding)."""
+    clips = info.get("clips") or []
+    if not clips:
+        return ("unknown", "2")
+    first = clips[0]
+    if first.get("kind") != "video":
+        return ("unknown", "2")
+    probe = first.get("probe") or {}
+    raw = probe.get("raw") or {}
+    stream = None
+    for st in raw.get("streams", []) or []:
+        if st.get("codec_type") == "video":
+            stream = st
+            break
+    if not stream:
+        return ("unknown", "2")
+    r = str(stream.get("color_range") or "unknown").lower()
+    c = str(stream.get("color_space") or "unknown").lower()
+    r = {"jpeg": "pc", "mpeg": "tv", "full": "pc", "limited": "tv"}.get(r, r)
+    c = {"bt601": "bt470bg"}.get(c, c)
+    if r not in ("tv", "pc", "unknown"):
+        r = "unknown"
+    # The scale filter's out_color_matrix has no "unknown" name
+    # (it accepts auto/-1 and the named spaces); the numeric
+    # value 2 is UNSPECIFIED, which is what ffprobe reports as
+    # "unknown" and what the direct graph's scales output.
+    if c not in ("bt709", "fcc", "bt470bg", "smpte170m",
+                 "smpte240m", "bt2020nc", "bt2020c", "smpte2085",
+                 "chromium", "ycgco"):
+        c = "2"
+    return (r, c)
+
+
+def segment_fingerprint(clip, index, project, info, scale_factor):
+    """SHA-256 hex identifying one clip's rendered segment, or
+    None when the clip cannot be fingerprinted.
+
+    The fingerprint covers EVERYTHING that affects the segment's
+    frames: the clip dict (minus volatile keys), the clip's
+    timeline index (default_image_motion alternates by index),
+    the source file's stat, a LUT file's stat when present, the
+    output geometry/fps, the scale factor, and the
+    default_image_motion flag. probe is deliberately EXCLUDED:
+    it is derived from the source file, whose stat is already
+    fingerprinted, and it must never carry anything volatile.
+    A stale cache can therefore only win if a file changed
+    without changing mtime_ns or size AND the clip settings are
+    identical — i.e. the file is byte-identical for rendering
+    purposes. The version marker lets a future format change
+    invalidate every old segment at once."""
+    clean = {k: v for k, v in clip.items()
+             if k not in _SEGMENT_VOLATILE_KEYS}
+    src_stat = _file_stat_fingerprint(clip["src"])
+    if src_stat is None:
+        return None
+    lut_stat = None
+    if clip.get("lut"):
+        lut_stat = _file_stat_fingerprint(resolve_path(clip["lut"]))
+        if lut_stat is None:
+            return None
+    payload = {
+        "version": SEGMENT_CACHE_VERSION,
+        "clip": clean,
+        "index": index,
+        "src": src_stat,
+        "lut": lut_stat,
+        "width": info["width"], "height": info["height"],
+        "fps": info["fps"],
+        "scale_factor": scale_factor,
+        "default_image_motion": bool((project or {}).get("default_image_motion")),
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                      default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def segment_cache_qualification(project, info):
+    """(qualifies, reason) for segment caching a validated project.
+
+    Qualifies only when every clip is transition-free and
+    non-stabilized. Transitions join clips inside the graph
+    (xfade/fade need both neighbours at once, so the clips are
+    not independently renderable segments); stabilized clips
+    recompute a vidstab transform per render, which is not a
+    cacheable unit. Everything else — texts, captions, overlays,
+    diagrams, audio tracks, ducking, scrims, chapters — is
+    timeline-level and applies identically in the assembly pass,
+    so it does not affect qualification, except final-master
+    loudnorm (see below). A project that does not qualify is
+    not an error: render_project_cached falls back to a plain
+    render_project with a note."""
+    for clip in info["clips"]:
+        if clip.get("transition") not in (None, "none"):
+            return False, (f"clip {clip.get('id')} uses transition "
+                           f"{clip.get('transition')!r}; segment caching "
+                           f"needs transition-free clips")
+        if clip.get("stabilize"):
+            return False, (f"clip {clip.get('id')} uses stabilization; "
+                           f"its transform is recomputed per render")
+    if info.get("master_loudnorm"):
+        # Delta: final-master loudnorm measures the finished mix
+        # as a whole; applying it per segment would master each
+        # segment separately, which is not the same mix. Such
+        # projects fall back to a plain render (correct output,
+        # just uncached).
+        return False, ("output.master_loudnorm is set; final-master "
+                       "loudnorm measures the whole mix, so segment "
+                       "caching is skipped")
+    return True, ""
+
+
+def _concat_escape(path):
+    """Escape one path for an ffmpeg concat-demuxer list file."""
+    return path.replace("'", "'\\''")
+
+
+def _join_segments(segment_paths, joined_path, timeout=600):
+    """Join rendered segments into one file with the concat
+    demuxer, stream copy (no re-encode: frames and samples are
+    already final). Returns (ok, error_or_None). The list file
+    is written next to the output and removed afterwards.
+
+    NOTE: render_project_cached does NOT use this join for its
+    assembly (it uses multi-clip assembly instead). Measured
+    2026-10-31: the demuxer offsets each segment by the file
+    duration, and a segment's video stream runs one frame
+    longer than its audio (the t slack), so the next
+    segment's audio starts one frame late and the assembly's
+    atrim then cuts the last frame of tail audio (0.032s at
+    24fps). Kept as a utility for callers that join
+    same-duration streams, where the gap cannot occur."""
+    list_path = joined_path + ".list.txt"
+    try:
+        with open(list_path, "w", encoding="utf-8") as f:
+            for path in segment_paths:
+                f.write(f"file '{_concat_escape(path)}'\n")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", list_path, "-map", "0:v", "-map", "0:a?", "-c", "copy",
+             joined_path],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, {"code": "RENDER_FAILED",
+                       "message": "segment join timed out"}
+    finally:
+        _remove_quietly(list_path)
+    if proc.returncode != 0:
+        return False, {"code": "RENDER_FAILED",
+                       "message": f"segment join failed: "
+                                  f"{extract_ffmpeg_error(proc.stderr, max_lines=10)}"}
+    return True, None
+
+
+def render_project_cached(project, output_path, scale_factor=1.0,
+                          timeout=600, cache_dir=None, use_cache=True,
+                          video_codec="libx264", video_crf=None,
+                          audio_codec="aac", final_range_convert=True,
+                          use_filter_script=True):
+    """Render a project with per-clip segment caching.
+
+    Returns (ok, info_or_error) like render_project, plus
+    cached (bool), cache_note (str), segments_reused and
+    segments_rendered counts on success. The video_codec /
+    video_crf / audio_codec / final_range_convert /
+    use_filter_script arguments pass through to the ASSEMBLY
+    render (and to the plain-render fallback); segment renders
+    always use lossless libx264 crf 0 + pcm_f32le with
+    chain-native ranges (final_range_convert=False),
+    regardless of these arguments. Segment bytes therefore
+    never depend on a user setting: the fingerprint (clip
+    settings + source stats + output geometry + scale factor)
+    covers everything that can change a segment, so a stale
+    segment cannot win.
+
+    How it works: each transition-free clip is rendered once
+    as a lossless segment (libx264 crf 0 + pcm_f32le,
+    chain-native ranges, so segment frames are exactly the
+    clip chain's output and segment audio samples are
+    exactly the resampler's float output — s16 would
+    quantize them by ~1 LSB) into
+    <cache_dir>/seg_<sha256>.mkv. Segment and assembly
+    renders pass -t slack of one frame (see t_override):
+    without it the fps filter's EOF-flushed boundary frame
+    is dropped and a cached render comes out one frame
+    short. Unchanged clips reuse their cached segment; the
+    assembly is then a project whose clips ARE the segment
+    files (one video clip per segment, trimmed to the
+    original clip duration), carrying the original texts,
+    captions, overlays, diagrams, audio, ducking, scrims,
+    chapters and output settings. Default cache_dir is
+    .agentcut_cache next to the output file; it is a pure
+    cache (safe to delete any time) and must be excluded
+    from any sync set. Segment scales are forced to the
+    direct graph's common chain format (see
+    _first_clip_chain_format): without the force, a
+    single-clip segment render negotiates a different scale
+    output than the multi-clip direct graph, and the
+    assembly's scales then re-convert with a second 8-bit
+    rounding (measured: up to 8 levels on saturated video
+    colours). With the force, segment pixels equal direct
+    chain pixels, and the assembly graph is the direct graph
+    with segment files standing in for original sources.
+
+    Why multi-clip assembly, not a demuxer join: the
+    segments are first joined with the concat demuxer
+    (stream copy) during development, and it was measured
+    to shift audio by one video frame at every boundary
+    (0.032s at 24fps): a segment's video stream runs one
+    frame longer than its audio (the t slack), and the
+    demuxer offsets the next segment by the file duration,
+    so the next segment's audio starts a frame late and
+    the assembly's atrim then cuts the last frame of tail
+    audio. The concat FILTER joins by frame/sample count,
+    not container duration, so it aligns audio exactly —
+    and it is also what the direct graph uses, so the
+    assembly graph is structurally the direct graph with
+    segment files standing in for original sources. With
+    chain-native segments the assembly's concat sees the
+    same mixed ranges the direct graph's concat sees (pc
+    for images, unknown for video), and the assembly's
+    final range conversion therefore reproduces the direct
+    render's conversion exactly. Each segment file holds
+    one track, so its range flag is uniform — there is no
+    mixed-range problem inside a segment file.
+
+    Safety: a cache problem never fails a render — an
+    unusable cache dir, an unstatable source, or a
+    non-qualifying project falls back to plain render_project
+    with cached=False and a note. A segment that fails to
+    render IS a render failure (the same clip would fail a
+    direct render too) and is reported, not hidden behind a
+    fallback. Segments are written to a temp file and moved
+    into place atomically, so a crashed render never leaves a
+    partial segment for a later render to reuse."""
+    errors, info = validate_project(project)
+    if errors:
+        return False, {"code": "INVALID_PROJECT", "errors": errors}
+
+    def _plain(note):
+        ok, rinfo = render_project(project, output_path,
+                                   scale_factor=scale_factor,
+                                   timeout=timeout,
+                                   video_codec=video_codec,
+                                   video_crf=video_crf,
+                                   audio_codec=audio_codec,
+                                   final_range_convert=final_range_convert,
+                                   use_filter_script=use_filter_script)
+        if ok:
+            rinfo = dict(rinfo, cached=False, cache_note=note,
+                         segments_reused=0, segments_rendered=0)
+        return ok, rinfo
+
+    qualifies, reason = segment_cache_qualification(project, info)
+    if not qualifies or not use_cache:
+        return _plain(reason or "cache disabled")
+    if cache_dir is None:
+        cache_dir = os.path.join(
+            os.path.dirname(os.path.abspath(output_path)), ".agentcut_cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError as exc:
+        return _plain(f"cache dir unavailable: {exc}")
+
+    segment_paths = []
+    reused = 0
+    rendered = 0
+    for ci, clip in enumerate(info["clips"]):
+        fp = segment_fingerprint(clip, ci, project, info, scale_factor)
+        if fp is None:
+            return _plain(f"clip {clip.get('id')} cannot be fingerprinted")
+        seg_path = os.path.join(cache_dir, f"seg_{fp}.{SEGMENT_CONTAINER}")
+        if os.path.isfile(seg_path) and os.path.getsize(seg_path) > 0:
+            reused += 1
+        else:
+            # Resolve the clip's effective motion into the
+            # segment project: default_image_motion alternates
+            # by timeline index, but a segment project has one
+            # clip at index 0, so an explicit ken_burns carries
+            # the original index's motion into the segment.
+            # The segment clip comes from the RAW project clip
+            # (matched by id), not the validated info clip:
+            # info clips carry resolved fields like probe that
+            # a fresh validation round must not see.
+            raw_by_id = {c.get("id"): c for c in project["clips"]
+                         if isinstance(c, dict)}
+            if clip.get("id") in raw_by_id:
+                seg_clip = copy.deepcopy(raw_by_id[clip["id"]])
+            else:
+                seg_clip = {k: v for k, v in copy.deepcopy(clip).items()
+                            if k not in _SEGMENT_VOLATILE_KEYS}
+            eff = effective_ken_burns(clip, ci, project)
+            if eff not in (None, "none") and not clip.get("ken_burns"):
+                seg_clip["ken_burns"] = eff
+            seg_project = {
+                "id": f"segment-{ci}",
+                "version": 1,
+                "clips": [seg_clip],
+                "output": {"width": info["width"],
+                           "height": info["height"],
+                           "fps": info["fps"]},
+            }
+            if project.get("default_image_motion") is not None:
+                seg_project["default_image_motion"] = \
+                    project["default_image_motion"]
+            fd, tmp_seg = tempfile.mkstemp(prefix="agentcut-seg-",
+                                           suffix=f".{SEGMENT_CONTAINER}",
+                                           dir=cache_dir)
+            os.close(fd)
+            ok, err = render_project(
+                seg_project, tmp_seg, scale_factor=scale_factor,
+                timeout=timeout, video_codec="libx264", video_crf=0,
+                audio_codec="pcm_f32le", final_range_convert=False,
+                chain_scale_out=_first_clip_chain_format(info),
+                t_override=float(clip["duration"]) + 1.0 / info["fps"])
+            if not ok:
+                _remove_quietly(tmp_seg)
+                return False, err
+            try:
+                os.replace(tmp_seg, seg_path)
+            except OSError:
+                _remove_quietly(tmp_seg)
+                return False, {"code": "RENDER_FAILED",
+                               "message": f"cannot store segment {seg_path}"}
+            rendered += 1
+        segment_paths.append(seg_path)
+
+    # Multi-clip assembly: each segment file becomes one video clip,
+    # trimmed to the original clip's timeline duration. The assembly
+    # graph then joins them with the concat filter — exactly like
+    # the direct graph — so audio aligns by sample count and the
+    # final range conversion sees the same mixed input as direct.
+    # (The concat-demuxer join in _join_segments is kept as a
+    # utility but is NOT used here: it offsets by container
+    # duration and shifts audio a frame late at every boundary.)
+    assembly = dict(project)
+    assembly["clips"] = [{"id": f"segment-{ci}", "kind": "video",
+                          "src": segment_paths[ci],
+                          "trim_in": 0,
+                          "trim_out": info["clips"][ci]["duration"]}
+                         for ci in range(len(segment_paths))]
+    ok, rinfo = render_project(assembly, output_path,
+                               scale_factor=scale_factor,
+                               timeout=timeout,
+                               video_codec=video_codec,
+                               video_crf=video_crf,
+                               audio_codec=audio_codec,
+                               final_range_convert=final_range_convert,
+                               use_filter_script=use_filter_script,
+                               t_override=info["total_duration"] + 1.0 / info["fps"])
+    if ok:
+        rinfo = dict(rinfo, cached=True, cache_note="",
+                     segments_reused=reused, segments_rendered=rendered)
+    return ok, rinfo
 
 
 def poster_frame(project, output_path, time=None, timeout=600):
@@ -2634,13 +3766,37 @@ def _explainer_find_punch_in(obj, where="brief"):
     return None
 
 
+# v1.40.0: one-button look profiles. A look is orthogonal to
+# `style` (which stays blackboard-only for scrims) and applies
+# to ANY background — photo, solid, gradient or board. Each
+# profile combines clip treatment + clip grade + scene-title
+# text preset + motion default; a brief field always wins over
+# its look counterpart (brief motion beats look motion; scene
+# titles use the look's preset only when the look sets one, so
+# a look without a title_style keeps the 52/yellow defaults).
+EXPLAINER_LOOKS = {
+    # Exactly today's defaults, spelled out.
+    "clean": {},
+    # Film feel: grain + vignette, cinematic grade, preset titles.
+    "cinematic": {"treatment": {"grain": 8, "vignette": 0.4},
+                  "grade": "cinematic", "title_style": "title"},
+    # Aged film: heavier grain + vignette, vintage grade.
+    "vintage": {"treatment": {"grain": 15, "vignette": 0.6},
+                "grade": "vintage", "title_style": "title"},
+    # Titles pop (preset size + shadow); footage untouched.
+    "bold": {"title_style": "title"},
+    # No motion at all; everything else default.
+    "still": {"motion": "none"},
+}
+
+
 def produce_explainer(brief, output_path, review_dir=None):
     """One-button board explainer (v1.39.0): one brief in, one
     finished video out. No hand-written project.json: every
     timeline fact is DERIVED here from the brief.
 
     Brief shape (verbatim — this is the button):
-      {"id": "strawman", "style": "blackboard",
+      {"id": "strawman", "style": "blackboard", "look": "cinematic",
        "output": {"width": 720, "height": 1280, "fps": 30},
        "background": "/path/to/board_image.png",
        "title": "مغالطة رجل القش", "chapters": true,
@@ -2676,6 +3832,16 @@ def produce_explainer(brief, output_path, review_dir=None):
       on; motion "gentle" (or absent) turns
       default_image_motion on. punch_in ANYWHERE in the
       brief is rejected: gentle motion only, zero punch-ins.
+    - look (v1.40.0, optional) picks a profile from
+      EXPLAINER_LOOKS — clean, cinematic, vintage, bold,
+      still — combining clip treatment + grade + scene-title
+      preset + motion default, on ANY background. A brief
+      field always wins over its look counterpart: brief
+      motion beats look motion, and scene titles use the
+      look's preset only when the look sets one (otherwise
+      the 52/yellow defaults stay); keywords keep their
+      explicit size/colour. Unknown looks are rejected with
+      the known list.
     - Optional music: when "music" names a file it is added
       as a music track with deterministic 12 dB ducking
       windows = the narration spans.
@@ -2700,7 +3866,17 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"explainer style must be 'blackboard', got {style!r}",
                        "fix": "set style to 'blackboard', or remove it for the blackboard default"}
-    motion = brief.get("motion", "gentle")
+    # v1.40.0: look profiles (EXPLAINER_LOOKS above). Unknown
+    # looks are rejected with the known list; a brief field
+    # always wins over its look counterpart (motion below).
+    look_name = brief.get("look")
+    if look_name is not None and (not isinstance(look_name, str)
+                                  or look_name not in EXPLAINER_LOOKS):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"explainer look must be one of {', '.join(sorted(EXPLAINER_LOOKS))}, got {look_name!r}",
+                       "fix": "set look to one of: " + ", ".join(sorted(EXPLAINER_LOOKS)) + ", or remove it for the default look"}
+    look = EXPLAINER_LOOKS.get(look_name, {}) if look_name else {}
+    motion = brief.get("motion", look.get("motion", "gentle"))
     if motion not in ("gentle", "none"):
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"explainer motion must be 'gentle' or 'none', got {motion!r}",
@@ -2799,13 +3975,24 @@ def produce_explainer(brief, output_path, review_dir=None):
                              "end": round(start + min(cue["end"], dur), 3)})
         clips.append({"id": sid, "kind": "image", "src": background,
                       "duration": dur, "transition": "none"})
+        # v1.40.0: look treatment/grade ride on every scene clip,
+        # whatever the background is (photo, solid, board).
+        if look.get("treatment"):
+            clips[-1]["treatment"] = dict(look["treatment"])
+        if look.get("grade"):
+            clips[-1]["grade"] = look["grade"]
         audio.append({"src": narration, "kind": "voice", "volume": 1.0,
                       "start": start})
         stitle = scene.get("title")
         if isinstance(stitle, str) and stitle.strip():
-            texts.append({"text": stitle, "start": start, "end": end,
-                          "size": 52, "x": "center", "y": 190,
-                          "color": "yellow", "box": False})
+            if look.get("title_style"):
+                texts.append({"text": stitle, "start": start, "end": end,
+                              "x": "center", "y": 190,
+                              "style": look["title_style"]})
+            else:
+                texts.append({"text": stitle, "start": start, "end": end,
+                              "size": 52, "x": "center", "y": 190,
+                              "color": "yellow", "box": False})
         dg = scene.get("diagram")
         if dg is not None:
             if not isinstance(dg, dict):
@@ -2927,6 +4114,7 @@ def produce_explainer(brief, output_path, review_dir=None):
         "output": output_path,
         "duration": info["total_duration"],
         "width": width, "height": height, "fps": fps,
+        "look": look_name,
         "scenes": scenes,
         "chapters": info.get("chapters", []),
         "review_frames": frames,
@@ -3019,15 +4207,28 @@ def timeline_summary(project):
                "duration": round(float(clip["duration"]), 3),
                "transition": clip.get("transition", "none")}
         for fname in ("speed", "speed_curve", "reverse", "freeze_at",
-                      "loop_count", "ken_burns", "fit", "stabilize"):
+                      "loop_count", "ken_burns", "fit", "stabilize",
+                      "treatment", "scene_id"):
             if fname in clip:
                 seg[fname] = clip[fname]
+        # v1.40.0: the camera path, when present, is the clip's
+        # motion; it wins over Ken Burns, recorded plainly like
+        # punch below.
+        if clip.get("camera"):
+            seg["camera"] = [{"t": round(float(k["t"]), 3),
+                              "x": float(k["x"]), "y": float(k["y"]),
+                              "scale": float(k["scale"])}
+                             for k in clip["camera"]]
+        if clip.get("_continuity"):
+            seg["continuity_from_previous"] = True
         # v1.37.0: the motion actually applied (default motion
         # fills in for clips without an explicit ken_burns),
         # punch-in and element SFX, so the agent can reason from
         # the summary instead of re-reading the project.
         _eff = effective_ken_burns(clip, i, project)
-        if clip.get("punch_at") is not None:
+        if clip.get("camera"):
+            seg["effective_ken_burns"] = "none (camera)"
+        elif clip.get("punch_at") is not None:
             # v1.37.2: punch wins over Ken Burns, recorded plainly.
             seg["effective_ken_burns"] = "none (punch_in)"
         elif _eff != clip.get("ken_burns", "none"):
@@ -3041,6 +4242,14 @@ def timeline_summary(project):
     texts = [{"text": t["text"], "start": float(t.get("start", 0)),
               "end": float(t.get("end", info["total_duration"]))}
              for t in (project.get("texts") or [])]
+    # v1.40.0: style preset + kinetic flag, when present, so the
+    # agent can reason about which titles are kinetic.
+    for _t, _tt in zip(texts, project.get("texts") or []):
+        if isinstance(_tt, dict):
+            if _tt.get("style"):
+                _t["style"] = _tt["style"]
+            if _tt.get("word_timings"):
+                _t["kinetic"] = True
     captions = [{"text": c["text"], "start": float(c.get("start", 0)),
                  "end": float(c.get("end", info["total_duration"]))}
                 for c in info.get("captions", [])]
@@ -3055,6 +4264,11 @@ def timeline_summary(project):
                  "opacity": float(o.get("opacity", 1.0)),
                  "keyframes": len(o.get("keyframes_resolved", []) or [])}
                 for o in info.get("overlays", [])]
+    # v1.40.0: parallax depth, when set, so the agent can reason
+    # about which overlays drift with camera motion.
+    for _o, _ov in zip(overlays, info.get("overlays", [])):
+        if "depth" in _ov:
+            _o["depth"] = float(_ov["depth"])
     # v1.38.0: stroke diagrams — the draw window (start + draw)
     # is when the animation runs; the diagram holds complete
     # from draw end until the window end.
@@ -3077,6 +4291,7 @@ def timeline_summary(project):
                   "chapters": info.get("chapters", []),
                   "warnings": info.get("warnings", []),
                   "ducking": info.get("ducking"),
+                  "treatment": project.get("treatment"),
                   "default_image_motion": bool(project.get("default_image_motion"))}
 
 

@@ -19,15 +19,24 @@ is the delivery.
 Only stdlib + ffmpeg/ffprobe are used, like the rest of AgentCut.
 """
 
+import hashlib
 import json
 import os
 import shutil
+import subprocess
 
 from .validate import BASE_DIR, resolve_path, validate_project
 
 PACKAGE_SRC_DIR = "src"
 PACKAGE_MEDIA_DIR = "media"
 PACKAGE_FONTS_DIR = "fonts"
+
+# Safety margin (seconds) kept on each side of a trimmed clip's used
+# segment (trim_clips=True): stream-copy trimming cuts at the
+# nearest keyframe before the start, so a margin guarantees the
+# used frames survive even when the exact trim_in is not a
+# keyframe, and it keeps a little handle for re-editing.
+TRIM_MARGIN = 1.0
 
 RENDER_SH = """#!/bin/sh
 # AgentCut render pack: renders project.json to output.mp4 with
@@ -98,8 +107,25 @@ def _unique_name(used, basename):
         n += 1
 
 
+def _file_sha256(path):
+    """SHA-256 hex of a file's bytes (chunked read), or None when
+    the file cannot be read. A None hash never dedups with
+    anything (the file is treated as unique)."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _collect_files(project, info):
-    """(relpath -> abspath) for every file a render reads.
+    """{abspath: canonical_abspath} for every file a render reads.
 
     Sources: validated clips (resolved srcs + LUTs), validated
     overlays (resolved srcs), validated audio tracks (resolved
@@ -107,17 +133,25 @@ def _collect_files(project, info):
     the captions SRT file. Anything else in a project
     (texts, chapters, ducking windows, presets) is data, not a
     file reference, and is carried by project.json itself.
+
+    Deduplication (refactoring): files with identical SHA-256
+    content share one canonical path (the first collected with
+    that hash), so the same content is never copied twice under
+    different paths — package_project copies the canonical file
+    once and rewrites every reference to it. An unreadable file
+    maps to itself (never deduped); a missing file is still
+    listed here and reported by package_project's isfile check.
     """
     from .validate import SFX_NAMES
-    files = {}
+    collected = []
     for clip in info.get("clips") or []:
-        files[clip["src"]] = clip["src"]
+        collected.append(clip["src"])
         if clip.get("lut_resolved"):
-            files[clip["lut_resolved"]] = clip["lut_resolved"]
+            collected.append(clip["lut_resolved"])
     for ov in info.get("overlays") or []:
-        files[ov["src"]] = ov["src"]
+        collected.append(ov["src"])
     for track in info.get("audio") or []:
-        files[track["src"]] = track["src"]
+        collected.append(track["src"])
     for _holder in (list(project.get("clips") or [])
                     + list(project.get("texts") or [])
                     + list(info.get("captions") or [])
@@ -126,32 +160,147 @@ def _collect_files(project, info):
         if isinstance(_sfx, str) and _sfx not in SFX_NAMES:
             _resolved = resolve_path(_sfx)
             if os.path.isfile(_resolved):
-                files[_resolved] = _resolved
+                collected.append(_resolved)
     captions_file = project.get("captions_file")
     if captions_file:
-        files[resolve_path(captions_file)] = resolve_path(captions_file)
-    return files
+        collected.append(resolve_path(captions_file))
+    by_hash = {}
+    out = {}
+    for abspath in collected:
+        digest = _file_sha256(abspath) if os.path.isfile(abspath) else None
+        if digest is None:
+            out[abspath] = abspath
+        elif digest in by_hash:
+            out[abspath] = by_hash[digest]
+        else:
+            by_hash[digest] = abspath
+            out[abspath] = abspath
+    return out
 
 
-def package_project(project, outdir):
+def _trim_clip_window(clip, file_duration):
+    """(ss, to) trim window for a video clip, or None to skip trim.
+
+    The window is the clip's used segment plus TRIM_MARGIN on
+    each side, clamped to the file. Trimming is skipped (copy
+    whole) when: the clip is not a plain trimmed video (image
+    clips have no trim range); the window already covers the
+    whole file (nothing to save); or the clip references file
+    times outside the window (freeze_at, speed_curve segment
+    bounds) — trimming would cut content the render needs.
+    Reverse/loop clips are trimmable: they operate on the trim
+    range, which is re-based below, so their output is unchanged.
+    """
+    if clip.get("kind") != "video":
+        return None
+    try:
+        tin = float(clip.get("trim_in", 0))
+        tout = float(clip.get("trim_out", file_duration))
+    except (TypeError, ValueError):
+        return None
+    if file_duration is None or file_duration <= 0:
+        return None
+    ss = max(0.0, tin - TRIM_MARGIN)
+    to = min(float(file_duration), tout + TRIM_MARGIN)
+    if ss <= 0.0 and to >= float(file_duration):
+        return None
+    if clip.get("freeze_at") is not None:
+        try:
+            if not (ss <= float(clip["freeze_at"]) <= to):
+                return None
+        except (TypeError, ValueError):
+            return None
+    for seg in clip.get("speed_curve") or []:
+        try:
+            if not (ss <= float(seg["start"]) and float(seg["end"]) <= to):
+                return None
+        except (TypeError, ValueError, KeyError):
+            return None
+    return (ss, to)
+
+
+def _trim_file(src, dst, ss, to):
+    """Stream-copy trim src[ss:to] to dst via ffmpeg -ss/-to.
+
+    -ss seeks (keyframe-accurate, fast) and -to stops at output
+    time to-ss, so the trimmed file covers exactly the input
+    window [ss, to]. Stream copy: no re-encode, no quality loss.
+    Raises ValueError when ffmpeg fails or the result is empty.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", repr(ss),
+         "-i", src, "-to", repr(to - ss), "-map", "0", "-c", "copy", dst],
+        capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) == 0:
+        raise ValueError(f"trim failed for {src}: {proc.stderr[-500:]}")
+
+
+def package_project(project, outdir, trim_clips=False):
     """Build a render pack. Returns a summary dict.
 
     Raises ValueError with a plain message when the project is
     invalid or a referenced file is missing — a pack must never
     be built from a project that cannot render.
+
+    trim_clips (default False, preserves current behaviour
+    exactly): when True, each trimmable video clip is copied as
+    only its used segment plus TRIM_MARGIN on each side (ffmpeg
+    stream copy, no re-encode), and the packed project.json
+    re-bases that clip's trim_in/trim_out (and freeze_at /
+    speed_curve bounds, when present) by the trim start, so the
+    packed render produces the same frames. Clips that cannot be
+    trimmed safely (whole file used, or referenced times outside
+    the window) are copied whole. Trimmed clips always get their
+    own media file, even when another clip shares the same
+    source: content dedup cannot apply across different trim
+    windows. Audio tracks and images are never trimmed (tracks
+    have no trim range in the schema; images are single frames).
     """
     errors, info = validate_project(project)
     if errors:
         raise ValueError("project is invalid: " + json.dumps(errors, ensure_ascii=False))
-    media_map = {}  # abspath -> media/ relpath
+    collected = _collect_files(project, info)
+    media_map = {}  # abspath -> media/ relpath (deduped by canonical)
     used = set()
-    for abspath in _collect_files(project, info):
+    relpath_for_canonical = {}
+    for abspath, canonical in collected.items():
         if not os.path.isfile(abspath):
             raise ValueError(f"referenced file not found: {abspath}")
-        media_map[abspath] = os.path.join(
-            PACKAGE_MEDIA_DIR, _unique_name(used, os.path.basename(abspath)))
+        if canonical not in relpath_for_canonical:
+            relpath_for_canonical[canonical] = os.path.join(
+                PACKAGE_MEDIA_DIR, _unique_name(used, os.path.basename(canonical)))
+        media_map[abspath] = relpath_for_canonical[canonical]
 
     packed = json.loads(json.dumps(project, ensure_ascii=False))
+
+    # Trim overrides (trim_clips=True only): clip id -> (relpath, ss).
+    # A trimmed clip's packed src points at its own trimmed copy,
+    # and its trim times are re-based by ss below.
+    trim_overrides = {}
+    info_by_id = {c.get("id"): c for c in info.get("clips") or []}
+    if trim_clips:
+        for clip in packed.get("clips") or []:
+            if not isinstance(clip, dict) or not clip.get("src"):
+                continue
+            resolved = resolve_path(clip["src"])
+            iclip = info_by_id.get(clip.get("id")) or {}
+            probe = iclip.get("probe") or {}
+            window = _trim_clip_window(iclip, probe.get("duration"))
+            if window is None:
+                continue
+            ss, _to = window
+            relpath = os.path.join(
+                PACKAGE_MEDIA_DIR, _unique_name(used, os.path.basename(resolved)))
+            # Store re-based times now (validated times always
+            # exist for video clips); the rewrite below assigns
+            # them, so a missing key can never leave a packed
+            # clip with un-rebased times.
+            try:
+                tin_r = float(iclip.get("trim_in", 0)) - ss
+                tout_r = float(iclip.get("trim_out")) - ss
+            except (TypeError, ValueError):
+                continue
+            trim_overrides[clip.get("id")] = (relpath, ss, tin_r, tout_r)
 
     def _rewrite(path):
         resolved = resolve_path(path)
@@ -159,7 +308,24 @@ def package_project(project, outdir):
 
     for clip in packed.get("clips") or []:
         if isinstance(clip, dict) and clip.get("src"):
-            clip["src"] = _rewrite(clip["src"])
+            if clip.get("id") in trim_overrides:
+                relpath, ss, tin_r, tout_r = trim_overrides[clip["id"]]
+                clip["src"] = relpath
+                # Re-base every file-time field by the trim start
+                # (precomputed validated times, so the packed clip
+                # renders the same frames from its trimmed copy).
+                clip["trim_in"] = tin_r
+                clip["trim_out"] = tout_r
+                if clip.get("freeze_at") is not None:
+                    clip["freeze_at"] = float(clip["freeze_at"]) - ss
+                for seg in clip.get("speed_curve") or []:
+                    if isinstance(seg, dict):
+                        if "start" in seg:
+                            seg["start"] = float(seg["start"]) - ss
+                        if "end" in seg:
+                            seg["end"] = float(seg["end"]) - ss
+            else:
+                clip["src"] = _rewrite(clip["src"])
         if isinstance(clip, dict) and clip.get("lut"):
             clip["lut"] = _rewrite(clip["lut"])
         if isinstance(clip, dict) and isinstance(clip.get("sfx"), str) and resolve_path(clip["sfx"]) in media_map:
@@ -181,10 +347,68 @@ def package_project(project, outdir):
     os.makedirs(outdir, exist_ok=True)
     media_dir = os.path.join(outdir, PACKAGE_MEDIA_DIR)
     os.makedirs(media_dir, exist_ok=True)
+    # Referenced relpaths: shared copies for untrimmed references
+    # plus one trimmed copy per trimmed clip. A shared file used
+    # ONLY by trimmed clips (no untrimmed reference left) is not
+    # copied untrimmed — its trimmed copies carry the content.
+    referenced_shared = set()
+    for clip in packed.get("clips") or []:
+        if isinstance(clip, dict) and clip.get("src") and clip.get("id") not in trim_overrides:
+            referenced_shared.add(clip["src"])
+    for ov in packed.get("overlays") or []:
+        if isinstance(ov, dict) and ov.get("src"):
+            referenced_shared.add(ov["src"])
+    for track in packed.get("audio") or []:
+        if isinstance(track, dict) and track.get("src"):
+            referenced_shared.add(track["src"])
+    for _item in (packed.get("texts") or []) + (packed.get("captions") or []):
+        if isinstance(_item, dict) and isinstance(_item.get("sfx"), str) and resolve_path(_item["sfx"]) in media_map:
+            referenced_shared.add(_item["sfx"])
+    if packed.get("captions_file"):
+        referenced_shared.add(packed["captions_file"])
+    # LUTs are rewritten via media_map; collect their relpaths too.
+    for clip in packed.get("clips") or []:
+        if isinstance(clip, dict) and clip.get("lut"):
+            referenced_shared.add(clip["lut"])
     copied = 0
+    deduped = 0
+    _copied_relpaths = set()
     for abspath, relpath in media_map.items():
+        if relpath not in referenced_shared or relpath in _copied_relpaths:
+            continue
         shutil.copyfile(abspath, os.path.join(outdir, relpath))
+        _copied_relpaths.add(relpath)
         copied += 1
+    # Count duplicate references skipped by dedup (references to
+    # a canonical file beyond the first).
+    seen_canonical = set()
+    for abspath, canonical in collected.items():
+        if canonical in seen_canonical:
+            deduped += 1
+        else:
+            seen_canonical.add(canonical)
+    trimmed = 0
+    if trim_clips:
+        for clip in packed.get("clips") or []:
+            if not isinstance(clip, dict) or clip.get("id") not in trim_overrides:
+                continue
+            relpath, ss, _tin_r, _tout_r = trim_overrides[clip["id"]]
+            iclip = info_by_id.get(clip.get("id")) or {}
+            probe = iclip.get("probe") or {}
+            window = _trim_clip_window(iclip, probe.get("duration"))
+            if window is None:
+                continue
+            _ss, _to = window
+            # Source is the ORIGINAL file (packed src was rewritten).
+            orig = None
+            for _c in project.get("clips") or []:
+                if isinstance(_c, dict) and _c.get("id") == clip.get("id"):
+                    orig = resolve_path(_c["src"])
+                    break
+            if orig is None:
+                continue
+            _trim_file(orig, os.path.join(outdir, relpath), _ss, _to)
+            trimmed += 1
     with open(os.path.join(outdir, "project.json"), "w", encoding="utf-8") as fh:
         json.dump(packed, fh, ensure_ascii=False, indent=2)
 
@@ -209,6 +433,7 @@ def package_project(project, outdir):
     with open(os.path.join(outdir, "README.md"), "w", encoding="utf-8") as fh:
         fh.write(README_TEXT)
     return {"outdir": os.path.abspath(outdir), "files_copied": copied,
+            "files_deduped": deduped, "files_trimmed": trimmed,
             "project": packed.get("id"),
             "total_duration": info.get("total_duration"),
             "render_command": "./render.sh"}

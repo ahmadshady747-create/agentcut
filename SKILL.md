@@ -27,6 +27,10 @@ failure is a JSON object with `code` and `message`.
   sheet, and only then call `render_project` for the final MP4.
 - Poll `get_job` until status is `done` or `failed`. Jobs are detached processes: closing stdio cannot kill them, and a new connection can poll them. Never present a
   queued or running job as a finished video.
+- Background jobs are a second, lighter option: `start_render_job`
+  (stored id or project dict), poll `get_job_status`, cancel with
+  `cancel_job`. They live only in this server process, and a running
+  one cannot be interrupted (cancel reports `cancelled: false`).
 - After `done`, verify the output with the probe data in the job
   result: duration, width, height, video and audio streams.
 
@@ -265,15 +269,23 @@ AgentCut edit and verify them.
   keyframe wins if both set a non-linear easing. Unknown
   values fail validation with a fix hint.
 - Grading: clips accept `grade` (`cinematic`, `teal_orange`,
-  `warm`, `cool`, `noir` — documented filter combinations,
-  not film stocks) and/or `lut` (a local `.cube` file that
-  must exist). Copy `examples/grading.json` to start.
+  `warm`, `cool`, `noir`, `vintage`, `crisp` — documented
+  filter combinations, not film stocks) and/or `lut` (a local
+  `.cube` file that must exist). Copy `examples/grading.json`
+  to start.
 - Ducking: a project `ducking` object
   (`voice_track` index or src, `amount_db`, `fade`, optional
   `windows`) replaces the sidechain compressor with
   deterministic volume automation from the voice track's time
   windows. It is not sidechain compression and not level
   detection. Copy `examples/ducking.json` to start.
+  The auto path has a switch, `auto_duck` (default true):
+  explicit `ducking` always wins; otherwise voice + music
+  + no explicit ducking gets the sidechain; `false` disables
+  only the auto path. `output.master_loudnorm: true` masters
+  the finished mix at -14 LUFS (single pass, near -14 not
+  exact); silent timelines skip it, and it disqualifies
+  segment caching.
 - Chapters: project `chapters` (`{title, start}`) are written
   into the output metadata; verify with
   `ffprobe -show_chapters`. Produce briefs accept `chapters`;
@@ -436,11 +448,11 @@ then holds the complete diagram until `end` — the hold is
 a freeze on the last frame, never a replay. The final
 frame equals the complete diagram exactly (tested).
 
-- Custom strokes: `{"kind": "polyline"|"arrow"|"circle"|
-  "ellipse"|"rect", ...}` in diagram-local coordinates
-  (canvas default 900x560, `canvas: {width, height}`
-  100..1920). Stroke fields: `color` (`white` default,
-  `yellow` for emphasis only, any named colour or
+- Custom strokes: `{"kind": "polyline"|"arrow"|"line"|
+  "circle"|"ellipse"|"rect"|"arc", ...}` in diagram-local
+  coordinates (canvas default 900x560, `canvas: {width,
+  height}` 100..1920). Stroke fields: `color` (`white`
+  default, `yellow` for emphasis only, any named colour or
   #RRGGBB), `width` (2..20, 7 is the standard chalk
   weight), `alpha` (0.2..1, 0.95 solid; faint grid lines
   use ~0.35), `weight` (share of the draw window; default
@@ -452,9 +464,11 @@ frame equals the complete diagram exactly (tested).
   default 36). Circle takes `center` + `radius`, ellipse
   `center` + `radius_x`/`radius_y`, rect `x`/`y` +
   `rect_width`/`rect_height` (NOT `width` — that is the
-  stroke width) + optional `corner_radius`. All geometry
-  must fit inside the canvas, or validation fails with a
-  fix hint.
+  stroke width) + optional `corner_radius`. Arc takes
+  `center` + `radius` + `start_angle`/`end_angle` in
+  degrees (0 = east, positive = clockwise; zero sweep =
+  full circle). All geometry must fit inside the canvas,
+  or validation fails with a fix hint.
 - Templates (parameters only, never text — labels are
   always AgentCut texts, never baked into a diagram):
   `chart` (`values`: 2..8 numbers; axes with arrowheads,
@@ -483,3 +497,60 @@ frame equals the complete diagram exactly (tested).
   `end`, `draw` and `draw_end`, plus `source`, `template`
   and stroke count, so you can reason about draw timing
   without re-reading the project.
+
+## Delta upgrade (unreleased, audit pending)
+
+- `fit: "blur_pad"` is the blurred-background fill with a
+  boxblur kernel instead of gblur; all blur exclusions
+  apply to both names.
+- ASS export (additional, never replacing drawtext):
+  `\fad(120,120)` fades by default, soft outline + drop
+  shadow, and karaoke by default (Karaoke style, yellow
+  highlight; measured `\k` tags from `word_timings`, else
+  a proportional split labelled `est` — estimates, never
+  measured timings). `karaoke=None` gives plain dialogues.
+- Diagram stamps feather with a smoothstep falloff and
+  stroke progress eases (smoothstep); the final frame
+  stays byte-identical to a direct full render.
+- `render_project_cached` stays a Python API (not an MCP
+  tool or CLI): qualified subset only. The concat demuxer
+  stays rejected (proven one-frame audio gap).
+- Smooth camera is verified, not rewritten: Ken Burns
+  keeps 2x pre-scale, smoothstep easing, fixed fps, even
+  dimensions. Element keyframe easing defaults stay
+  `linear` — flipping them would change existing output.
+
+## General visual craft (1.40.0)
+
+All of these work on video, image, solid/gradient and board
+clips alike — none is tied to a style.
+
+- Camera path: clip `camera: [{t, x, y, scale}]`, multi-stop
+  pan/zoom, smoothstep, even-size-safe. Wins over
+  `ken_burns` (warning); rejects `punch_in`, blur fit,
+  `stabilize`, `speed_curve`; 1.25x max by construction.
+- Parallax: overlay `depth` 0..1 drifts with camera/Ken
+  Burns motion; warns and does nothing on a motionless
+  clip.
+- Kinetic text: any text takes `word_timings` + highlight
+  colour + `emphasis` pop (`emphasis_factor` 1.0..1.5);
+  `style` presets `title`/`heading`/`label`/`caption`
+  (size ratios, shadow, stroke, spacing). Explicit values
+  always win.
+- Treatment: clip- and project-level
+  `treatment: {grain 0..30, vignette 0..1, shadow 0..1}`.
+- Continuity: clips sharing a `scene_id` chain scales
+  (N's end = N+1's start, 1.25x max); punch end feeds the
+  chain, static clips reset it. Warns on a motionless
+  same-scene clip after a zoomed one.
+- Transitions: `zoom`, `wipe_tl`, `squeeze_h` join the
+  xfade set. circlecrop as "iris" was tried and rejected
+  (midpoint renders black on this build) — do not offer it.
+- Produce look: `produce_explainer` brief `look` — clean,
+  cinematic, vintage, bold, still — treatment + grade +
+  scene-title preset + motion default, on any background.
+  Brief fields always win; unknown looks are rejected
+  with the known list.
+- Defaults: plain texts now default to the (2,2) shadow
+  when neither axis is set (mirroring captions); texts
+  crossing the 5% action-safe rect warn only, never error.
