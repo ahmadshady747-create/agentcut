@@ -4306,8 +4306,10 @@ class TestRefactoring(unittest.TestCase):
             self.assertEqual(script_graph, inline_graph)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-            shutil.rmtree(td1, ignore_errors=True)
-            shutil.rmtree(td2, ignore_errors=True)
+            if td1:
+                shutil.rmtree(td1, ignore_errors=True)
+            if td2:
+                shutil.rmtree(td2, ignore_errors=True)
 
     def test_refactor_segment_cache_image_byte_identical(self):
         import tempfile
