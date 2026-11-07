@@ -77,12 +77,39 @@ TEXT_COLORS = {"white", "black", "yellow", "red", "green", "blue", "cyan",
 # Keyframe easing values (pro pack). "linear" is the default and the
 # old behaviour; the others reshape the normalised segment time
 # before interpolation (see _interp_expr_eased in render.py).
-EASING_VALUES = {"linear", "ease_in", "ease_out", "ease_in_out"}
+EASING_VALUES = {"linear", "ease_in", "ease_out", "ease_in_out", "ease_out_back"}
 
 # Colour-grade presets (pro pack). These are honest, documented
 # filter combinations — eq/colorbalance/saturation settings, NOT
 # film-stock emulation. Each value is the FFmpeg filter chain
 # appended after a clip's other colour filters.
+# Custom transitions (v1.44.0, F5): NOT xfade names — they are
+# post-join effect passes that straddle a plain concat cut, so the
+# joined video is built with concat and the effect is applied
+# over the cut window afterwards (see render.py
+# _apply_custom_transition). The old xfade "zoom" (zoomin) is
+# untouched; zoom_out here is the cut-straddling pulse.
+CUSTOM_TRANSITIONS = {"zoom_out", "whip_pan", "glitch", "light_leak"}
+
+# Animated text presets (v1.44.0, F4): named entrance styles on
+# texts/captions. typewriter reveals WHOLE WORDS only (never a
+# mid-word split, which breaks Arabic joining) via the existing
+# reveal-word expansion; kinetic_words staggers per-word
+# slide+fade; highlight_sweep sweeps a bar behind the whole line;
+# underline_swipe sweeps a thin bar under the line. reveal_mask
+# was DROPPED (v1.44.0, R7): the animated crop it needs is not
+# feasible -- crop w/h are fixed at config time on this FFmpeg
+# 8.1 build (proven: w stayed 500 past frame 15 with an n-driven
+# expression), so a crop cannot reveal over time; the geq-alpha
+# alternative works in a probe but needs a new looped-PNG input
+# whose frame-number timing depends on the input framerate rather
+# than the render timeline (fps-fragile), a whole new render path
+# for one preset. The other seven presets cover the entrance
+# vocabulary. A preset and an explicit animation/reveal/
+# word_timings on the same item conflict and are rejected.
+TEXT_PRESETS = ("typewriter", "slide_in", "pop_in", "fade_up",
+                "kinetic_words", "highlight_sweep", "underline_swipe")
+
 GRADE_PRESETS = {
     # Slightly lifted contrast, pulled-back saturation, a touch of
     # blue in the shadows and warmth in the highlights.
@@ -137,6 +164,28 @@ TEXT_STYLES = {
               "shadow": (2, 2), "box": False},
     "caption": {"size_frac": 0.028, "color": "white",
                 "shadow": (2, 2), "box": True},
+    # Rounded translucent backdrop card (v1.41.0, Fix 6 title
+    # treatment): legibility from the card + shadow, never
+    # from a black box behind every line.
+    "card": {"size_frac": 0.055, "color": "white",
+             "shadow": (2, 2), "box": True, "box_radius": 18,
+             "box_color": "black", "box_opacity": 0.45},
+    # Modern display styles (v1.44.0, F4 typography system):
+    # opt-in designed looks — size, colour, font, shadow and
+    # box resolved together. Existing title/heading/label/
+    # caption/card values are FROZEN (never change resolved
+    # values), so old projects render byte-identically.
+    "display": {"size_frac": 0.075, "color": "white",
+                "font": "noto-sans-bold", "shadow": (3, 3),
+                "box": True, "box_radius": 24,
+                "box_color": "black", "box_opacity": 0.55},
+    "subtitle": {"size_frac": 0.038, "color": "white",
+                 "font": "noto-sans-bold", "shadow": (2, 2),
+                 "box": False},
+    "quote": {"size_frac": 0.042, "color": "yellow",
+              "font": "noto-sans-bold", "shadow": (2, 2),
+              "box": True, "box_radius": 18,
+              "box_color": "black", "box_opacity": 0.35},
 }
 
 # Built-in procedural SFX (v1.37.0): generated deterministically at
@@ -155,6 +204,39 @@ LATIN_FONT_FILES = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
 ARABIC_FONT_FILES = ["NotoNaskhArabic-Regular.ttf",
                      "NotoNaskhArabic-Medium.ttf",
                      "NotoSansArabic-Regular.ttf"]
+
+# Bundled fonts selectable by name (v1.41.0): the `font`
+# option on texts/captions takes one of these keys, never a
+# path, so a project stays portable across machines. Files
+# are searched in the usual font dirs (bundled fonts/ first
+# among the repo paths); noto-sans-bold is the Arabic DISPLAY
+# face (Bold, modern, geometric) next to the Noto Naskh book
+# face. Licence files ship beside the fonts.
+BUNDLED_FONTS = {"noto-naskh": "NotoNaskhArabic-Regular.ttf",
+                 "noto-sans-bold": "NotoSansArabic-Bold.ttf",
+                 "dejavu": "DejaVuSans.ttf"}
+
+
+def find_bundled_font(name):
+    """Resolve a BUNDLED_FONTS key to a file path, or None."""
+    filename = BUNDLED_FONTS.get(name)
+    if filename is None:
+        return None
+    return _find_font_file([filename])
+
+
+def bundled_fonts_dir():
+    """First font dir holding a bundled font file, or None.
+
+    The render path passes this as the ass filter's fontsdir so
+    libass resolves bundled families (Noto Naskh / Noto Sans
+    Arabic / DejaVu) without depending on system fontconfig
+    alone; system dirs still apply on top of it."""
+    for d in _font_dirs():
+        for filename in BUNDLED_FONTS.values():
+            if os.path.isfile(os.path.join(d, filename)):
+                return d
+    return None
 
 
 def _font_dirs():
@@ -227,6 +309,171 @@ def resolve_path(path):
     if os.path.isfile(candidate):
         return candidate
     return path
+
+
+def _load_json_data_file(path, field, errors, oid=None, fix_hint=None):
+    """Load a JSON data file produced by an AgentMedia analysis
+    tool (v1.44.0). resolve_path + read + json.loads, with a
+    structured error (and None) on any failure. The resolved
+    absolute path is returned alongside the data so the caller
+    can stash it in info["data_files"] for the renderer.
+    """
+    if not isinstance(path, str) or not path:
+        errors.append(err("INVALID_SCHEMA", f"{field} must be a non-empty file path", field=field, clip_id=oid,
+                          fix=fix_hint or f"point {field} at a JSON file produced by an AgentMedia tool"))
+        return None, None
+    resolved = resolve_path(path)
+    if not os.path.isfile(resolved):
+        errors.append(err("FILE_NOT_FOUND", f"data file not found: {resolved}", field=field, clip_id=oid,
+                          fix=fix_hint or "fix the path, or run the AgentMedia tool that produces this file"))
+        return None, None
+    try:
+        with open(resolved, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        errors.append(err("INVALID_SCHEMA", f"data file is not valid JSON: {resolved} ({exc})", field=field, clip_id=oid,
+                          fix="replace it with the JSON file the AgentMedia tool wrote"))
+        return None, None
+    if not isinstance(data, dict):
+        errors.append(err("INVALID_SCHEMA", "data file must hold a JSON object: {resolved}", field=field, clip_id=oid,
+                          fix="replace it with the JSON file the AgentMedia tool wrote"))
+        return None, None
+    return data, resolved
+
+
+def _load_beats_data(spec, errors, oid=None):
+    """Validate a beat_cut spec's beats file (v1.44.0, F1).
+    Returns (beats_list, bpm, resolved_path) or (None, None,
+    None). Beats are sorted defensively; bpm is informational
+    only and never affects the cut positions.
+    """
+    if not isinstance(spec, dict):
+        errors.append(err("INVALID_SCHEMA", "beat_cut must be an object with a beats file", field="beat_cut", clip_id=oid,
+                          fix="set beat_cut to {file: 'beats.json'}"))
+        return None, None, None
+    data, resolved = _load_json_data_file(spec.get("file"), "beat_cut.file", errors, oid)
+    if data is None:
+        return None, None, None
+    beats = data.get("beats")
+    if not isinstance(beats, list) or len(beats) < 2:
+        errors.append(err("INVALID_SCHEMA", "beats file must hold at least 2 beat times in 'beats'", field="beat_cut.file", clip_id=oid,
+                          fix="run AgentMedia detect_beats on the soundtrack and use its beats.json"))
+        return None, None, None
+    try:
+        beats = sorted(float(b) for b in beats)
+    except (TypeError, ValueError):
+        errors.append(err("INVALID_SCHEMA", "beats must be numbers (seconds)", field="beat_cut.file", clip_id=oid,
+                          fix="use the beats.json AgentMedia detect_beats wrote"))
+        return None, None, None
+    bpm = data.get("bpm")
+    try:
+        bpm = float(bpm) if bpm is not None else None
+    except (TypeError, ValueError):
+        bpm = None
+    return beats, bpm, resolved
+
+
+def _load_track_data(spec, field, errors, oid=None):
+    """Validate a follow_track spec's track file (v1.44.0, F2).
+    Returns (track_dict, resolved_path) or (None, None). The
+    track dict keeps the AgentMedia shape: {frame_size:
+    {width, height}, track: [{t, x, y, w, h, ...}]} where x/y
+    is the tracked box's TOP-LEFT corner. offset_x/offset_y
+    ride in the returned dict (default 0).
+    """
+    if not isinstance(spec, dict):
+        errors.append(err("INVALID_SCHEMA", "track must be an object with a file", field=field, clip_id=oid,
+                          fix="set track to {file: 'track.json'}"))
+        return None, None
+    data, resolved = _load_json_data_file(spec.get("file"), field + ".file", errors, oid)
+    if data is None:
+        return None, None
+    pts = data.get("track")
+    if not isinstance(pts, list) or len(pts) < 2:
+        errors.append(err("INVALID_SCHEMA", "track file must hold at least 2 points in 'track'", field=field + ".file", clip_id=oid,
+                          fix="run AgentMedia track_object and use its track.json"))
+        return None, None
+    fs = data.get("frame_size") or {}
+    try:
+        fw = float(fs.get("width")); fh = float(fs.get("height"))
+        if fw <= 0 or fh <= 0:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        errors.append(err("INVALID_SCHEMA", "track file must hold frame_size {width, height} (positive numbers)", field=field + ".file", clip_id=oid,
+                          fix="use the track.json AgentMedia track_object wrote"))
+        return None, None
+    try:
+        ox = float(spec.get("offset_x", 0)); oy = float(spec.get("offset_y", 0))
+    except (TypeError, ValueError):
+        errors.append(err("INVALID_SCHEMA", "track offset_x/offset_y must be numbers (pixels)", field=field, clip_id=oid,
+                          fix="set offset_x/offset_y to pixel numbers, or remove them"))
+        return None, None
+    try:
+        pts = sorted(({"t": float(p["t"]), "x": float(p["x"]), "y": float(p["y"]),
+                       "w": float(p.get("w", 0)), "h": float(p.get("h", 0))}
+                      for p in pts), key=lambda p: p["t"])
+    except (TypeError, ValueError, KeyError, AttributeError):
+        errors.append(err("INVALID_SCHEMA", "track points must be objects with numeric t, x, y", field=field + ".file", clip_id=oid,
+                          fix="use the track.json AgentMedia track_object wrote"))
+        return None, None
+    # Duplicate times would divide by zero in the renderer's
+    # interpolation (and cannot come from track_object, which
+    # samples on a fixed grid): keep the first point per time.
+    _deduped = []
+    for _p in pts:
+        if _deduped and _p["t"] == _deduped[-1]["t"]:
+            continue
+        _deduped.append(_p)
+    pts = _deduped
+    if len(pts) < 2:
+        errors.append(err("INVALID_SCHEMA", "track file must hold at least 2 points at distinct times in 'track'", field=field + ".file", clip_id=oid,
+                          fix="run AgentMedia track_object and use its track.json"))
+        return None, None
+    return {"frame_size": {"width": fw, "height": fh}, "track": pts,
+            "offset_x": ox, "offset_y": oy}, resolved
+
+
+def _load_reframe_data(spec, errors, cid=None):
+    """Validate a clip reframe spec's windows file (v1.44.0, F3).
+    Returns (reframe_dict, resolved_path) or (None, None).
+    Windows keep the AgentMedia shape: [{t, x, y, w, h}] in
+    source pixels and source seconds; crop_size (when present)
+    is ignored — the windows are authoritative.
+    """
+    if not isinstance(spec, dict):
+        errors.append(err("INVALID_SCHEMA", "reframe must be an object with windows_file and target_aspect", field="clips.reframe", clip_id=cid,
+                          fix="set reframe to {windows_file: 'reframe.json', target_aspect: '9:16'}"))
+        return None, None
+    data, resolved = _load_json_data_file(spec.get("windows_file"), "clips.reframe.windows_file", errors, cid)
+    if data is None:
+        return None, None
+    wins = data.get("windows")
+    if not isinstance(wins, list) or len(wins) < 1:
+        errors.append(err("INVALID_SCHEMA", "reframe file must hold at least 1 window in 'windows'", field="clips.reframe.windows_file", clip_id=cid,
+                          fix="run AgentMedia analyze_reframe and use its reframe.json"))
+        return None, None
+    fs = data.get("frame_size") or {}
+    try:
+        fw = float(fs.get("width")); fh = float(fs.get("height"))
+        if fw <= 0 or fh <= 0:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        errors.append(err("INVALID_SCHEMA", "reframe file must hold frame_size {width, height} (positive numbers)", field="clips.reframe.windows_file", clip_id=cid,
+                          fix="use the reframe.json AgentMedia analyze_reframe wrote"))
+        return None, None
+    try:
+        wins = sorted(({"t": float(w["t"]), "x": float(w["x"]), "y": float(w["y"]),
+                        "w": float(w["w"]), "h": float(w["h"])} for w in wins), key=lambda w: w["t"])
+    except (TypeError, ValueError, KeyError, AttributeError):
+        errors.append(err("INVALID_SCHEMA", "reframe windows must be objects with numeric t, x, y, w, h", field="clips.reframe.windows_file", clip_id=cid,
+                          fix="use the reframe.json AgentMedia analyze_reframe wrote"))
+        return None, None
+    for w in wins:
+        if w["w"] <= 0 or w["h"] <= 0 or w["x"] < 0 or w["y"] < 0:
+            errors.append(err("INVALID_SCHEMA", "reframe windows must have positive w/h and non-negative x/y", field="clips.reframe.windows_file", clip_id=cid,
+                              fix="use the reframe.json AgentMedia analyze_reframe wrote"))
+            return None, None
+    return {"frame_size": {"width": fw, "height": fh}, "windows": wins}, resolved
 
 
 def find_font():
@@ -731,6 +978,74 @@ def _validate_camera(clip, duration, errors, cid):
                           fix="use camera or speed_curve, not both, on one clip"))
 
 
+AUTO_SUBCUT_CYCLE = (
+    # Waypoints after the opening wide framing, cycled in
+    # order (x, y, scale): zoomed-in centre, pan one way,
+    # pan the other, pull back to wide. The pan direction
+    # flips per clip index so neighbouring scenes do not
+    # mirror each other exactly.
+    (0.5, 0.5, 1.18),
+    (0.58, 0.5, 1.12),
+    (0.42, 0.5, 1.12),
+    (0.5, 0.5, 1.0),
+)
+
+
+def _generate_auto_subcuts(resolved, project):
+    """Auto sub-cuts / multi-shot camera pacing (v1.42.0, Fix 4b).
+
+    Still-image clips longer than 12s with no explicit camera,
+    no punch_in and no explicit ken_burns get a generated
+    multi-stop camera path that cycles camera angles every
+    ~10s (wide slow zoom-in -> medium pan right/left ->
+    center pull-back, scale 1.0..1.18, continuous visible
+    motion) instead of one imperceptible minute-long creep.
+    The path is waypoints, not independent segments: each
+    glide ends exactly where the next begins, so there is no
+    jump at a sub-cut boundary. It runs BEFORE the motion
+    continuity pass, so same-scene clips chain their scales
+    through it. Opt-outs: project auto_subcuts: false, or
+    per-clip auto_subcuts: false; explicit camera, punch_in
+    or ken_burns always win over generation, and blurred
+    fits never get a path (camera cannot combine with them).
+    Default is ON: a long still that used to sit frozen now
+    moves — the same default-on precedent as 1.37.1's
+    default_image_motion. Returns the ids of clips that got
+    a generated path (for info["auto_subcuts"]).
+    """
+    if project.get("auto_subcuts") is False:
+        return []
+    generated = []
+    for ci, clip in enumerate(resolved):
+        if clip.get("kind") != "image":
+            continue
+        if clip.get("auto_subcuts") is False:
+            continue
+        duration = float(clip["duration"])
+        if duration <= 12:
+            continue
+        if clip.get("camera") or clip.get("punch_at") is not None:
+            continue
+        if clip.get("ken_burns", "none") != "none":
+            continue
+        if clip.get("fit") in BLUR_FITS:
+            continue
+        n = max(1, round(duration / 10.0))
+        seg = duration / n
+        cycle = list(AUTO_SUBCUT_CYCLE)
+        if ci % 2 == 1:
+            cycle[1], cycle[2] = cycle[2], cycle[1]
+        keyframes = [{"t": 0.0, "x": 0.5, "y": 0.5, "scale": 1.0}]
+        for k in range(1, n + 1):
+            x, y, s = cycle[(k - 1) % len(cycle)]
+            keyframes.append({"t": round(k * seg, 3), "x": x, "y": y,
+                              "scale": s})
+        clip["camera"] = keyframes
+        clip["_auto_subcuts"] = True
+        generated.append(clip.get("id"))
+    return generated
+
+
 def _validate_treatment(obj, errors, oid, field_prefix):
     """Validate a treatment dict (v1.40.0), clip-level or
     project-level (field_prefix "" for the project).
@@ -924,27 +1239,37 @@ def wrap_caption_lines(text, size, max_width_px):
 
 
 def _text_box(item, is_caption, width, height, total,
-              line_spacing=1.35, max_width_frac=0.9):
+              line_spacing=1.35, max_width_frac=0.9, zone_clamp=False):
     """Approximate on-screen box (x, y, w, h) for a text/caption item.
 
     APPROXIMATION, documented honestly: the true drawtext box
     depends on the font's glyph advances, which validation does not
-    measure. Width is estimated as len(text) x size x 0.6 and height
-    as size x 1.4; positions mirror render.py (numeric x/y, the
-    POS_MAP presets, centred texts, captions at height-120 by
-    default). Captions are wrapped (v1.36.0): the box spans the
-    wrapped block — width is the widest line, height covers all
-    lines at line_spacing — so collision checks see the real
-    wrapped block, not the old single-line box. The check is a
-    warning, never an error, precisely because these boxes are
-    estimates.
+    measure. Caption width is the widest wrapped line measured
+    with the same weight estimator the wrapper uses (v1.41.0,
+    Fix 2 — so the box can never exceed the wrap width it was
+    wrapped at); non-caption text width keeps the flat
+    len(text) x size x 0.6 overestimate (safe direction for
+    collision warnings and pill backdrops). Height is size x
+    1.4; positions mirror render.py (numeric x/y, the POS_MAP
+    presets, centred texts, captions at height-120 by default).
+    Captions are wrapped (v1.36.0): the box spans the wrapped
+    block — width is the widest line, height covers all lines at
+    line_spacing — so collision checks see the real wrapped
+    block, not the old single-line box. The check is a warning,
+    never an error, precisely because these boxes are estimates.
+    zone_clamp (v1.42.0, Fix 3): when True, a no-position
+    caption's block top is clamped so the block bottom stays
+    inside the subtitle zone (<= 0.92*height) — the same clamp
+    render.py applies to the real caption anchor, so the
+    estimated box and the rendered caption agree.
     """
+    from .srt import _word_width
     text = str(item.get("text", ""))
     size = float(item.get("size", 36 if is_caption else 48))
     cap_lines = wrap_caption_lines(text, size, width * max_width_frac) \
         if is_caption else [text]
     if is_caption:
-        est_w = max(10.0, max(len(ln) * size * 0.6 for ln in cap_lines))
+        est_w = max(10.0, max(_word_width(ln, size) for ln in cap_lines))
         if len(cap_lines) > 1:
             est_h = (len(cap_lines) - 1) * size * line_spacing + size * 1.4
         else:
@@ -967,9 +1292,13 @@ def _text_box(item, is_caption, width, height, total,
     elif is_caption:
         # Wrapped block, stacked upward: the LAST line keeps the
         # old single-line top (height-120), earlier lines rise
-        # above it — exactly like render.py.
+        # above it — exactly like render.py. With zone_clamp the
+        # whole block is pulled up so its bottom stays inside
+        # the subtitle zone (0.92*height).
         x, y = (width - est_w) / 2, float(
             height - 120 - (len(cap_lines) - 1) * size * line_spacing)
+        if zone_clamp:
+            y = min(y, 0.92 * height - est_h)
     else:
         xv = item.get("x", "center")
         x = (width - est_w) / 2 if xv == "center" else float(xv)
@@ -1064,14 +1393,27 @@ def check_layer_text_overlap(project, info):
     collision range, not the whole window).
     """
     width, height, total = info["width"], info["height"], info["total_duration"]
+    # The zone manager (v1.42.0, Fix 3) shares this flag: when
+    # resolve_overlaps is on, caption boxes use the zone-clamped
+    # anchor, matching the rendered caption position.
+    zone_clamp = project.get("resolve_overlaps") is True
     texts = []
-    for item in (project.get("texts") or []):
+    pop_entries = []
+    for _pi, item in enumerate(project.get("texts") or []):
         if isinstance(item, dict) and isinstance(item.get("text"), str):
+            _box = list(_text_box(item, False, width, height, total))
             texts.append((item["text"], float(item.get("start", 0)),
-                          float(item.get("end", total)),
-                          _text_box(item, False, width, height, total)))
+                          float(item.get("end", total)), _box))
+            if (item.get("sfx") == "pop"
+                    and isinstance(item.get("y"), (int, float))
+                    and "position" not in item):
+                pop_entries.append({
+                    "box": _box, "start": float(item.get("start", 0)),
+                    "end": float(item.get("end", total)), "index": _pi,
+                    "text": item["text"],
+                    "orig_y": float(item["y"])})
     cap_spacing = project.get("caption_line_spacing", 1.35)
-    cap_maxw = project.get("caption_max_width", 0.9)
+    cap_maxw = project.get("caption_max_width", 0.8)
     try:
         cap_spacing = float(cap_spacing)
     except (TypeError, ValueError):
@@ -1086,7 +1428,8 @@ def check_layer_text_overlap(project, info):
                           float(cap.get("end", total)),
                           _text_box(cap, True, width, height, total,
                                     line_spacing=cap_spacing,
-                                    max_width_frac=cap_maxw)))
+                                    max_width_frac=cap_maxw,
+                                    zone_clamp=zone_clamp)))
     # Layers above the clips: overlays plus stroke diagrams
     # (v1.38.0). A diagram's box is its placement box, computed
     # with the same per-axis preset logic as overlays (its
@@ -1106,6 +1449,58 @@ def check_layer_text_overlap(project, info):
                 synthetic[axis] = dg[axis]
         layers.append(("diagram", dg["id"], float(dg["start"]),
                        float(dg["end"]), synthetic))
+    # Collision-proof layout (v1.41.0): when the project opts in
+    # with resolve_overlaps: true, keyword pops (texts with
+    # sfx "pop" and an explicit numeric y) that overlap any
+    # other text, caption or diagram box in a shared time
+    # window cascade DOWNWARD — new y = bottom of the
+    # lowest overlapped box + 16px, repeated until clear —
+    # generalizing the AI-race scene-4 fix (a pop over a
+    # diagram label moved below the whole diagram). The move
+    # is recorded in the returned moves list and applied by
+    # the renderer; it never pushes a pop off the frame (a
+    # pop that cannot clear inside the frame keeps its
+    # original y and the overlap is warned about instead).
+    # Pops with a position preset are warned, not moved.
+    # Resolution runs BEFORE the warning passes, so a
+    # resolved project reports ZERO overlap warnings and
+    # the moves are visible separately.
+    moves = []
+    if project.get("resolve_overlaps") is True and pop_entries:
+        _diag_boxes = []
+        for _kind, _lid, _ds, _de, _syn in layers:
+            if _kind != "diagram":
+                continue
+            _db = _overlay_box_at(_syn, _ds, width, height)
+            if _db is not None:
+                _diag_boxes.append((_db, _ds, _de))
+        for _pe in pop_entries:
+            _box, _orig_y = _pe["box"], _pe["orig_y"]
+            for _ in range(20):
+                _blocked = []
+                for _t, _s, _e, _b in texts:
+                    if _b is _box:
+                        continue
+                    if _e <= _pe["start"] or _s >= _pe["end"]:
+                        continue
+                    if _boxes_overlap(_box, _b):
+                        _blocked.append(_b)
+                for _b, _s, _e in _diag_boxes:
+                    if _e <= _pe["start"] or _s >= _pe["end"]:
+                        continue
+                    if _boxes_overlap(_box, _b):
+                        _blocked.append(_b)
+                if not _blocked:
+                    break
+                _new_y = max(_b[1] + _b[3] for _b in _blocked) + 16
+                if _new_y + _box[3] > height:
+                    _box[1] = _orig_y
+                    break
+                _box[1] = _new_y
+            if _box[1] != _orig_y:
+                moves.append({"index": _pe["index"],
+                              "text": _pe["text"][:40],
+                              "old_y": _orig_y, "new_y": _box[1]})
     warnings = []
     # Safe-area check (v1.40.0, warning only): a text or caption
     # whose estimated box crosses the 5% action-safe rect may
@@ -1155,6 +1550,27 @@ def check_layer_text_overlap(project, info):
                     "start": round(hits[0], 3), "end": end}
                 warn["overlay_id" if kind == "overlay" else "diagram_id"] = lid
                 warnings.append(warn)
+    # Text-vs-text collisions (v1.41.0): two texts/captions
+    # whose estimated boxes overlap in a shared time window
+    # — the pop-vs-diagram-label case from the AI-race
+    # video, which the layer pass above cannot see because
+    # both elements are texts. One warning per pair, naming
+    # both texts and the colliding range.
+    for _i in range(len(texts)):
+        _t1, _s1, _e1, _b1 = texts[_i]
+        for _j in range(_i + 1, len(texts)):
+            _t2, _s2, _e2, _b2 = texts[_j]
+            _ws, _we = max(_s1, _s2), min(_e1, _e2)
+            if _we <= _ws or not _boxes_overlap(_b1, _b2):
+                continue
+            warnings.append({
+                "code": "text_text_overlap_warning",
+                "message": (f"text '{_t1}' overlaps text '{_t2}' "
+                            f"during {_ws:.2f}..{_we:.2f}s "
+                            f"(approximate boxes; move one of "
+                            f"them or shorten a window)"),
+                "text": _t1, "other_text": _t2,
+                "start": round(_ws, 3), "end": round(_we, 3)})
     # Text overflow (1.34.0): single-line centred drawtext clips
     # both edges when the line is wider than the frame, silently
     # (the known caption-clipping case). Estimated width, same
@@ -1173,7 +1589,304 @@ def check_layer_text_overlap(project, info):
                 "text": text, "start": round(t_start, 3),
                 "end": round(t_end, 3),
                 "estimated_width": round(tbox[2], 1)})
-    return warnings
+    return warnings, moves
+
+
+ZONE_BANDS = {  # Fractions of frame height (v1.42.0, Fix 3).
+    # Gutters between bands (18-22%, 56-60%, 70-76%) are free
+    # space: a box may extend into a gutter, but it must never
+    # intersect two content bands.
+    "header": (0.05, 0.18),
+    "diagram": (0.22, 0.56),
+    "callout": (0.60, 0.70),
+    "subtitle": (0.76, 0.92),
+}
+ZONE_MIN_GAP_PX = 40  # callout below an active diagram box
+
+
+def _bands_hit(box, height):
+    """Content bands a box intersects (gutters ignored)."""
+    top, bot = box[1], box[1] + box[3]
+    return [name for name, (a, b) in ZONE_BANDS.items()
+            if top < b * height and bot > a * height]
+
+
+def check_vertical_zones(project, info, overlap_moves=None):
+    """Vertical zone manager (v1.42.0, Fix 3).
+
+    Strict non-overlapping bands for 9:16 and 16:9 (fractions of
+    frame height): Header 5-18% (main + scene title), Diagram
+    22-56%, Callout/Emphasis 60-70%, Subtitle 76-92%.
+
+    - Callouts (keyword pops: texts with sfx "pop" and an
+      explicit numeric y, no position preset) ALWAYS belong in
+      the callout band. When a diagram is active in the pop's
+      window the pop is pushed below the diagram box with a
+      >=40px gap (the AI-race v2 03:13 case: the overlap
+      cascade had moved the pop to 16px below the diagram box,
+      which reads as touching the card). When resolve_overlaps
+      is on the move is recorded in the returned moves list
+      (applied by the renderer AFTER overlap_moves, so the zone
+      wins on conflict); otherwise the misplacement is warned
+      about and the pop stays put. A pop that cannot fit inside
+      the callout band keeps its original y and is warned about.
+    - Non-pop texts and diagrams are checked, never moved: a
+      box intersecting two content bands warns
+      (text_crosses_zone_boundary / diagram_crosses_zone) naming
+      the bands. Gutters do not count.
+    - Captions are checked against the subtitle band; with
+      resolve_overlaps on, their anchor is already zone-clamped
+      (see _text_box), so a bottom violation cannot occur — a
+      too-tall block rising above the band top still warns.
+    Boxes are the same estimates _text_box gives the overlap
+    check, so every warning here is advisory, never an error.
+    Returns (warnings, moves); moves are dicts {index, text,
+    old_y, new_y} shaped like the overlap cascade's moves.
+    """
+    width, height, total = info["width"], info["height"], info["total_duration"]
+    zone_clamp = project.get("resolve_overlaps") is True
+    moved_y = {}
+    for mv in (overlap_moves or []):
+        if isinstance(mv, dict) and isinstance(mv.get("index"), int):
+            moved_y[mv["index"]] = float(mv["new_y"])
+    cap_spacing = project.get("caption_line_spacing", 1.35)
+    cap_maxw = project.get("caption_max_width", 0.8)
+    try:
+        cap_spacing = float(cap_spacing)
+    except (TypeError, ValueError):
+        cap_spacing = 1.35
+    try:
+        cap_maxw = float(cap_maxw)
+    except (TypeError, ValueError):
+        cap_maxw = 0.9
+    texts = []
+    pops = []
+    for pi, item in enumerate(project.get("texts") or []):
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            box = list(_text_box(item, False, width, height, total))
+            if pi in moved_y:
+                box[1] = moved_y[pi]
+            is_pop = (item.get("sfx") == "pop"
+                      and isinstance(item.get("y"), (int, float))
+                      and "position" not in item)
+            texts.append((item["text"], float(item.get("start", 0)),
+                          float(item.get("end", total)), box, is_pop))
+            if is_pop:
+                pops.append((item["text"], float(item.get("start", 0)),
+                             float(item.get("end", total)), box, pi))
+    diag_boxes = []
+    for dg in (info.get("diagrams") or []):
+        synthetic = {"size": float(dg["size"]),
+                     "position": dg.get("position", "bottom_right"),
+                     "probe": {"width": dg["canvas_w"],
+                               "height": dg["canvas_h"]}}
+        for axis in ("x", "y"):
+            if axis in dg:
+                synthetic[axis] = dg[axis]
+        db = _overlay_box_at(synthetic, float(dg["start"]), width, height)
+        if db is not None:
+            diag_boxes.append((db, float(dg["start"]),
+                               float(dg["end"]), dg["id"]))
+    warnings, moves = [], []
+    call_top = ZONE_BANDS["callout"][0] * height
+    call_bot = ZONE_BANDS["callout"][1] * height
+    for text, s, e, box, pi in pops:
+        required_top = call_top
+        for dbox, ds, de, did in diag_boxes:
+            if de <= s or ds >= e:
+                continue
+            required_top = max(required_top,
+                               dbox[1] + dbox[3] + ZONE_MIN_GAP_PX)
+        if box[1] >= required_top and box[1] + box[3] <= call_bot:
+            continue  # already inside the callout band, clear of diagrams
+        if required_top + box[3] > call_bot:
+            warnings.append({
+                "code": "callout_zone_overflow",
+                "message": (f"callout '{text}' cannot fit inside the "
+                            f"callout zone ({call_top:.0f}..{call_bot:.0f}px) "
+                            f"with a 40px gap below the active diagram "
+                            f"during {s:.2f}..{e:.2f}s and keeps its "
+                            f"original y={box[1]:.0f} (shrink it or move "
+                            f"the diagram)"),
+                "text": text, "start": round(s, 3), "end": round(e, 3)})
+            continue
+        if zone_clamp:
+            moves.append({"index": pi, "text": text,
+                          "old_y": box[1], "new_y": required_top})
+        else:
+            warnings.append({
+                "code": "callout_outside_zone",
+                "message": (f"callout '{text}' at y={box[1]:.0f} sits "
+                            f"outside the callout zone "
+                            f"({call_top:.0f}..{call_bot:.0f}px) during "
+                            f"{s:.2f}..{e:.2f}s (set resolve_overlaps: "
+                            f"true to auto-move it, or move it to "
+                            f"y={required_top:.0f})"),
+                "text": text, "start": round(s, 3), "end": round(e, 3)})
+    for text, s, e, box, is_pop in texts:
+        if is_pop:
+            continue
+        hit = _bands_hit(box, height)
+        if len(hit) >= 2:
+            warnings.append({
+                "code": "text_crosses_zone_boundary",
+                "message": (f"text '{text}' crosses the zone boundary "
+                            f"between {hit[0]} and {hit[1]} "
+                            f"(box {box[1]:.0f}..{box[1] + box[3]:.0f}px) "
+                            f"during {s:.2f}..{e:.2f}s (keep each text "
+                            f"inside one band)"),
+                "text": text, "start": round(s, 3), "end": round(e, 3)})
+    for dbox, ds, de, did in diag_boxes:
+        hit = _bands_hit(dbox, height)
+        if len(hit) >= 2:
+            warnings.append({
+                "code": "diagram_crosses_zone",
+                "message": (f"diagram '{did}' crosses the zone boundary "
+                            f"between {hit[0]} and {hit[1]} "
+                            f"(box {dbox[1]:.0f}..{dbox[1] + dbox[3]:.0f}px) "
+                            f"during {ds:.2f}..{de:.2f}s (keep diagrams "
+                            f"inside the diagram zone)"),
+                "text": did, "start": round(ds, 3), "end": round(de, 3)})
+    sub_top = ZONE_BANDS["subtitle"][0] * height
+    sub_bot = ZONE_BANDS["subtitle"][1] * height
+    for cap in (info.get("captions") or []):
+        if isinstance(cap, dict) and isinstance(cap.get("text"), str):
+            cbox = _text_box(cap, True, width, height, total,
+                             line_spacing=cap_spacing,
+                             max_width_frac=cap_maxw,
+                             zone_clamp=zone_clamp)
+            cs = float(cap.get("start", 0))
+            ce = float(cap.get("end", total))
+            if cbox[1] < sub_top or cbox[1] + cbox[3] > sub_bot:
+                warnings.append({
+                    "code": "caption_outside_subtitle_zone",
+                    "message": (f"caption '{cap['text'][:40]}' extends "
+                                f"outside the subtitle zone "
+                                f"({sub_top:.0f}..{sub_bot:.0f}px): box "
+                                f"{cbox[1]:.0f}..{cbox[1] + cbox[3]:.0f}px "
+                                f"during {cs:.2f}..{ce:.2f}s (with "
+                                f"resolve_overlaps: true the anchor is "
+                                f"clamped; a too-tall block still needs "
+                                f"shorter cues)"),
+                    "text": cap["text"], "start": round(cs, 3),
+                    "end": round(ce, 3)})
+    return warnings, moves
+
+
+SFX_COOLDOWN_S = 15.0  # minimum gap between auto-SFX (v1.42.0, Fix 5)
+SFX_ATTENUATION_DEFAULT_DB = 16.0  # below the voiceover, by default
+SFX_KIND_PRIORITY = {"chapter": 0, "diagram": 1, "callout": 2}
+
+
+def compute_sfx_plan(project, info):
+    """SFX discipline plan (v1.42.0, Fix 5).
+
+    Auto-SFX fire ONLY on chapter transitions (clip starts),
+    diagram reveals (diagram starts) and major callout pop-ins
+    (texts/captions/overlays with sfx) — those are exactly the
+    elements that carry sfx in the schema, so the plan's job is
+    the other two rules: a minimum 15s cooldown between any two
+    auto-SFX, and attenuation to ~-14..-18 dB below the
+    voiceover.
+
+    Cooldown: candidates are sorted chronologically (ties break
+    by kind priority chapter > diagram > callout, then by
+    collection order) and kept greedily — an entry is kept only
+    when it starts >= 15s after the last kept one; the rest are
+    dropped with a reason naming the SFX they crowded.
+
+    Attenuation: an explicit sfx_volume always wins. Otherwise
+    the volume is 0.8 * 10^(-att/20), where att is the project
+    option sfx_attenuation_db (default 16, range 0..30) — about
+    0.127 at the default, against sources that peak near full
+    scale. The 0.8 factor is the sources' typical level (their
+    RMS sits below their peak); the resulting level below the
+    voice is MEASURED in the R5 proof render, not assumed.
+
+    Pitch: kept entries alternate 1.03 / 0.97 (deterministic,
+    by kept index) so repeated SFX do not sound identical.
+
+    Returns {"kept": [...], "dropped": [...],
+    "attenuation_db": att}. Kept entries carry start, name,
+    volume, kind, source and pitch; dropped entries carry
+    start, name, kind, source and reason. The renderer
+    consumes kept; a hand-built info dict without a plan falls
+    back to the old collect-all behaviour.
+    """
+    att = project.get("sfx_attenuation_db",
+                      SFX_ATTENUATION_DEFAULT_DB)
+    try:
+        att = float(att)
+    except (TypeError, ValueError):
+        att = SFX_ATTENUATION_DEFAULT_DB
+    auto_vol = 0.8 * (10.0 ** (-att / 20.0))
+    clip_starts = info.get("clip_starts") or []
+    candidates = []
+    for ci, clip in enumerate(info.get("clips") or []):
+        if isinstance(clip, dict) and clip.get("sfx"):
+            st = clip_starts[ci] if ci < len(clip_starts) else 0.0
+            candidates.append({"start": round(float(st), 3),
+                               "name": clip["sfx"],
+                               "volume": clip.get("sfx_volume"),
+                               "kind": "chapter", "source": "clip",
+                               "order": len(candidates)})
+    for item in (project.get("texts") or []):
+        if isinstance(item, dict) and item.get("sfx"):
+            candidates.append({"start": round(float(item.get("start", 0)), 3),
+                               "name": item["sfx"],
+                               "volume": item.get("sfx_volume"),
+                               "kind": "callout", "source": "text",
+                               "order": len(candidates)})
+    for cap in (info.get("captions") or []):
+        if isinstance(cap, dict) and cap.get("sfx"):
+            candidates.append({"start": round(float(cap.get("start", 0)), 3),
+                               "name": cap["sfx"],
+                               "volume": cap.get("sfx_volume"),
+                               "kind": "callout", "source": "caption",
+                               "order": len(candidates)})
+    for ov in (info.get("overlays") or []):
+        if isinstance(ov, dict) and ov.get("sfx"):
+            candidates.append({"start": round(float(ov.get("start", 0)), 3),
+                               "name": ov["sfx"],
+                               "volume": ov.get("sfx_volume"),
+                               "kind": "callout", "source": "overlay",
+                               "order": len(candidates)})
+    for dg in (info.get("diagrams") or []):
+        if isinstance(dg, dict) and dg.get("sfx"):
+            candidates.append({"start": round(float(dg.get("start", 0)), 3),
+                               "name": dg["sfx"],
+                               "volume": dg.get("sfx_volume"),
+                               "kind": "diagram", "source": "diagram",
+                               "order": len(candidates)})
+    # Starts are rounded to ms: a clip start computed from
+    # duration sums can differ from a text's literal start by
+    # float dust (531.7200000000001 vs 531.72), which would let
+    # the dust decide a tie instead of the kind priority.
+    candidates.sort(key=lambda c: (c["start"],
+                                   SFX_KIND_PRIORITY[c["kind"]],
+                                   c["order"]))
+    kept, dropped = [], []
+    last_kept = None
+    for cand in candidates:
+        if last_kept is not None and \
+                cand["start"] - last_kept["start"] < SFX_COOLDOWN_S - 1e-9:
+            dropped.append({
+                "start": cand["start"], "name": cand["name"],
+                "kind": cand["kind"], "source": cand["source"],
+                "reason": (f"within 15s of kept {last_kept['kind']} "
+                           f"'{last_kept['name']}' at "
+                           f"{last_kept['start']:.2f}s "
+                           f"({cand['start'] - last_kept['start']:.2f}s "
+                           f"gap)")})
+            continue
+        vol = cand["volume"]
+        vol = float(vol) if vol is not None else auto_vol
+        kept.append({"start": cand["start"], "name": cand["name"],
+                     "volume": vol, "kind": cand["kind"],
+                     "source": cand["source"],
+                     "pitch": 1.03 if len(kept) % 2 == 0 else 0.97})
+        last_kept = kept[-1]
+    return {"kept": kept, "dropped": dropped, "attenuation_db": att}
 
 
 def _validate_stroke(st, cw, ch, errors, did):
@@ -1441,6 +2154,24 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                 continue
         else:
             draw = min(4.0, window)
+        # Max diagram hold (v1.42.0, Fix 4a): after the draw
+        # animation completes the diagram holds for hold_seconds
+        # (default 8.0, the spec's 6-10s band) and then fades
+        # out over 1.0s — it never sits frozen for 40s. A hold
+        # of 0 fades immediately after the draw. The fade is
+        # applied by the renderer to the diagram and card
+        # streams; a window that ends before the fade starts
+        # simply ends first.
+        try:
+            hold = float(dg.get("hold_seconds", 8.0))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "diagram hold_seconds must be a number of seconds", field="diagrams.hold_seconds", clip_id=did,
+                              fix="set hold_seconds to e.g. 8.0, or remove it"))
+            continue
+        if not 0 <= hold <= 60:
+            errors.append(err("INVALID_SCHEMA", "diagram hold_seconds must be 0..60", field="diagrams.hold_seconds", clip_id=did,
+                              fix="set hold_seconds between 0 and 60 seconds"))
+            continue
         try:
             size = float(dg.get("size", 0.5))
         except (TypeError, ValueError):
@@ -1457,7 +2188,8 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                               fix="use a preset position, or set x and y pixel offsets instead"))
             continue
         rdg = {"id": did, "start": start, "end": end, "draw": draw,
-               "size": size, "position": position}
+               "size": size, "position": position,
+               "hold_seconds": hold}
         bad_xy = False
         for axis in ("x", "y"):
             if axis in dg:
@@ -1497,7 +2229,8 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                 errors.append(err("INVALID_SCHEMA", "diagram params must be an object", field="diagrams.params", clip_id=did,
                                   fix="give params as an object, e.g. {'values': [10, 12, 14]}"))
                 continue
-            allowed = {"chart": {"values"}, "basket": {"coins"},
+            allowed = {"chart": {"values", "fill", "y_grid_values"},
+                       "basket": {"coins"},
                        "balance": {"left", "right"}, "causes": {"rows"},
                        "primitives": {"strokes", "canvas"}}[tname]
             unknown = sorted(set(params) - allowed)
@@ -1521,6 +2254,24 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                         ok = False
                     else:
                         params = dict(params, values=vals)
+                    # v1.41.0: fill must be a bool; y_grid_values
+                    # a list of numbers (any count — each maps to
+                    # a gridline through the curve normalization).
+                    if params.get("fill") is not None and \
+                            not isinstance(params["fill"], bool):
+                        errors.append(err("INVALID_SCHEMA", "chart fill must be true or false", field="diagrams.params.fill", clip_id=did,
+                                          fix="set fill to true for a translucent area under the curve, or remove it"))
+                        ok = False
+                    gv = params.get("y_grid_values")
+                    if gv is not None:
+                        try:
+                            gv = [float(v) for v in gv]
+                        except (TypeError, ValueError):
+                            errors.append(err("INVALID_SCHEMA", "chart y_grid_values must be a list of numbers", field="diagrams.params.y_grid_values", clip_id=did,
+                                              fix="give y_grid_values as e.g. [0, 50, 100] in the same units as values"))
+                            ok = False
+                        else:
+                            params = dict(params, y_grid_values=gv)
             elif tname == "basket":
                 try:
                     coins = int(params.get("coins", 3))
@@ -1664,7 +2415,1134 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                 continue
             rdg.update({"source": "custom", "template": None,
                         "canvas_w": cw, "canvas_h": ch, "strokes": rstrokes})
+        # v1.41.0: diagram SFX (chart-reveal chime and friends).
+        # Validated exactly like clip/text SFX; carried into the
+        # resolved diagram so the render schedules it at the
+        # diagram's start. Invalid SFX leaves the diagram
+        # un-carried (validation fails anyway on the errors).
+        _nerr = len(errors)
+        _validate_sfx(dg, errors, did, "diagrams")
+        if len(errors) == _nerr:
+            if "sfx" in dg:
+                rdg["sfx"] = dg["sfx"]
+            if "sfx_volume" in dg:
+                rdg["sfx_volume"] = dg["sfx_volume"]
+        # v1.41.0 Fix 6: diagram card — a rounded translucent
+        # backdrop composited UNDER the diagram for its whole
+        # window (static layer, not drawn progressively).
+        # Validated exactly like SFX above; carried only when
+        # clean. Defaults (black, 0.45) match the card text
+        # preset and are applied at render time, so a bare
+        # card: true needs no further fields.
+        _nerr = len(errors)
+        if "card" in dg and not isinstance(dg["card"], bool):
+            errors.append(err("INVALID_SCHEMA", "diagram card must be true or false", field="diagrams.card", clip_id=did,
+                              fix="set card to true for a backdrop card, or remove it"))
+        if "card_color" in dg:
+            from .diagrams import resolve_color
+            if resolve_color(dg["card_color"]) is None:
+                errors.append(err("INVALID_SCHEMA", f"unknown diagram card_color '{dg['card_color']}'", field="diagrams.card_color", clip_id=did,
+                                  fix="set card_color to a colour name or #RRGGBB hex"))
+        if "card_opacity" in dg:
+            _co = dg["card_opacity"]
+            if isinstance(_co, bool) or not isinstance(_co, (int, float)) or not 0.0 <= float(_co) <= 1.0:
+                errors.append(err("INVALID_SCHEMA", "diagram card_opacity must be a number 0..1", field="diagrams.card_opacity", clip_id=did,
+                                  fix="set card_opacity between 0 and 1, e.g. 0.45"))
+        if len(errors) == _nerr:
+            if "card" in dg:
+                rdg["card"] = dg["card"]
+            if "card_color" in dg:
+                rdg["card_color"] = dg["card_color"]
+            if "card_opacity" in dg:
+                rdg["card_opacity"] = dg["card_opacity"]
         resolved.append(rdg)
+    return resolved
+
+
+def _validate_motion_chart(el, kind, mid, start, end, width, height,
+                           fps, errors):
+    """Validate one bars / donut / pie / line_chart element (R2).
+
+    Returns the resolved dict, or None (errors appended). Charts
+    use a TOP-LEFT anchor (x, y, w, h) — except donut/pie, which
+    use a CENTER (x, y) + radius. The raster bbox must sit fully
+    inside the frame (charts do not slide); derived labels are
+    clamped into the frame at render time.
+    """
+    from .diagrams import resolve_color
+    from .motion import _chart_bbox
+
+    _PALETTE = ["#facc15", "#22d3ee", "#4ade80", "#f97316",
+                "#e879f9", "#60a5fa", "#f43f5e", "#a3e635"]
+    rel = {"id": mid, "kind": kind, "start": start, "end": end}
+    ok = True
+
+    def _num(name, lo=None, hi=None, default=None, required=False):
+        nonlocal ok
+        if name not in el:
+            if required:
+                errors.append(err("INVALID_SCHEMA", f"motion {kind} needs a numeric {name}", field=f"motion.{name}", clip_id=mid,
+                                  fix=f"set {name} to a number, e.g. {default if default is not None else 100}"))
+                ok = False
+            return default
+        v = el[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be a number", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to a number"))
+            ok = False
+            return default
+        v = float(v)
+        if lo is not None and not v >= lo:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be >= {lo}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {lo} or more"))
+            ok = False
+            return default
+        if hi is not None and not v <= hi:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be <= {hi}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {hi} or less"))
+            ok = False
+            return default
+        return v
+
+    def _color(name, default):
+        nonlocal ok
+        if name not in el:
+            return resolve_color(default)
+        c = resolve_color(el[name])
+        if c is None:
+            errors.append(err("INVALID_SCHEMA", f"unknown motion {name} colour '{el[name]}'", field=f"motion.{name}", clip_id=mid,
+                              fix="set it to a colour name or #RRGGBB hex"))
+            ok = False
+            return None
+        return c
+
+    x = _num("x", required=True)
+    y = _num("y", required=True)
+    if x is not None:
+        rel["x"] = x
+    if y is not None:
+        rel["y"] = y
+    if kind in ("bars", "line_chart"):
+        w = _num("w", lo=1, required=True)
+        h = _num("h", lo=1, required=True)
+        if w is not None:
+            rel["w"] = w
+        if h is not None:
+            rel["h"] = h
+    else:
+        radius = _num("radius", lo=1, required=True)
+        if radius is not None:
+            rel["radius"] = radius
+        if kind == "donut":
+            rel["donut_ratio"] = _num("donut_ratio", lo=0.0, hi=0.9,
+                                      default=0.55)
+        elif "donut_ratio" in el:
+            errors.append(err("INVALID_SCHEMA", "motion pie does not take donut_ratio (a pie has no hole)", field="motion.donut_ratio", clip_id=mid,
+                              fix="remove donut_ratio, or use kind 'donut'"))
+            ok = False
+    values = el.get("values")
+    if not isinstance(values, list) or not 2 <= len(values) <= 8:
+        errors.append(err("INVALID_SCHEMA", f"motion {kind} needs values: a list of 2..8 numbers", field="motion.values", clip_id=mid,
+                          fix="give values as e.g. [10, 25, 40]"))
+        return None
+    clean_values = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)) or float(v) < 0:
+            errors.append(err("INVALID_SCHEMA", "motion values must be numbers >= 0", field="motion.values", clip_id=mid,
+                              fix="give values as non-negative numbers, e.g. [10, 25, 40]"))
+            return None
+        clean_values.append(float(v))
+    if max(clean_values) <= 0:
+        errors.append(err("INVALID_SCHEMA", "motion values need at least one value above 0", field="motion.values", clip_id=mid,
+                          fix="give at least one value above 0"))
+        return None
+    rel["values"] = clean_values
+    labels = el.get("labels")
+    if labels is not None:
+        if not isinstance(labels, list) or len(labels) != len(values) \
+                or any(not isinstance(s, str) for s in labels):
+            errors.append(err("INVALID_SCHEMA", "motion labels must be a list of strings, one per value", field="motion.labels", clip_id=mid,
+                              fix="give one label string per value, e.g. ['Jan', 'Feb', 'Mar']"))
+            return None
+        rel["labels"] = list(labels)
+    colors = el.get("colors")
+    if colors is None:
+        rel["colors"] = [resolve_color(c) for c in _PALETTE]
+    elif isinstance(colors, str):
+        c = resolve_color(colors)
+        if c is None:
+            errors.append(err("INVALID_SCHEMA", f"unknown motion colors colour '{colors}'", field="motion.colors", clip_id=mid,
+                              fix="set colors to a colour name, a #RRGGBB hex, or a list of them"))
+            return None
+        rel["colors"] = [c]
+    elif isinstance(colors, list) and colors and all(
+            isinstance(c, str) for c in colors):
+        resolved_colors = []
+        for c in colors:
+            rc = resolve_color(c)
+            if rc is None:
+                errors.append(err("INVALID_SCHEMA", f"unknown motion colors colour '{c}'", field="motion.colors", clip_id=mid,
+                                  fix="set colors to colour names or #RRGGBB hex values"))
+                return None
+            resolved_colors.append(rc)
+        rel["colors"] = resolved_colors
+    else:
+        errors.append(err("INVALID_SCHEMA", "motion colors must be a colour or a list of colours", field="motion.colors", clip_id=mid,
+                          fix="set colors to e.g. 'yellow' or ['yellow', 'cyan']"))
+        return None
+    rel["label_size"] = _num("label_size", lo=8, hi=120, default=28)
+    rel["label_color"] = _color("label_color", "white")
+    rel["stagger"] = _num("stagger", lo=0.0, hi=0.5, default=0.12)
+    rel["grow"] = _num("grow", lo=0.1, hi=1.0, default=0.5)
+    if "grid" in el and not isinstance(el["grid"], bool):
+        errors.append(err("INVALID_SCHEMA", "motion grid must be true or false", field="motion.grid", clip_id=mid,
+                          fix="set grid to true for faint grid lines, or false to hide them"))
+        ok = False
+    rel["grid"] = bool(el.get("grid", True))
+    if kind == "bars":
+        rel["bar_gap"] = _num("bar_gap", lo=0.0, hi=0.8, default=0.2)
+    if kind == "line_chart":
+        rel["color"] = _color("color", "white")
+        rel["head_color"] = _color("head_color", "#facc15")
+        rel["line_width"] = _num("line_width", lo=1, hi=20, default=4)
+        if "show_points" in el and not isinstance(el["show_points"], bool):
+            errors.append(err("INVALID_SCHEMA", "motion show_points must be true or false", field="motion.show_points", clip_id=mid,
+                              fix="set show_points to true for dots on reached points, or false to hide them"))
+            ok = False
+        rel["show_points"] = bool(el.get("show_points", True))
+    if not ok:
+        return None
+    # Stagger must let every bar/segment finish inside the window.
+    n = len(clean_values)
+    if (n - 1) * rel["stagger"] + rel["grow"] > 1.0 + 1e-9:
+        errors.append(err("INVALID_SCHEMA", f"motion stagger/grow leaves the last item unfinished: {(n - 1) * rel['stagger'] + rel['grow']:.2f} > 1", field="motion.stagger", clip_id=mid,
+                          fix="lower stagger or grow so (values-1)*stagger + grow <= 1, e.g. stagger 0.12 and grow 0.5"))
+        return None
+    try:
+        bx, by, bw, bh = _chart_bbox(rel)
+    except Exception as exc:
+        errors.append(err("INVALID_SCHEMA", f"motion chart geometry failed: {exc}", field="motion", clip_id=mid,
+                          fix="check the chart geometry (x, y, w/h or radius)"))
+        return None
+    if bx < 0 or by < 0 or bx + bw > width or by + bh > height:
+        errors.append(err("INVALID_SCHEMA", f"motion {kind} '{mid}' bbox {bx},{by} {bw}x{bh} is outside the {width}x{height} frame", field="motion", clip_id=mid,
+                          fix="move the chart inside the frame (charts do not slide in from off-screen)"))
+        return None
+    rel["_bbox"] = (bx, by, bw, bh)
+    rel["_frames"] = max(1, int(round((end - start) * fps)))
+    return rel
+
+
+def _validate_motion_counter(el, mid, start, end, width, height,
+                               errors):
+    """Validate one counter element (R3).
+
+    Returns the resolved dict, or None (errors appended). The
+    counter produces no video: render.py emits a drawtext
+    %{eif} expression for it, so x/y are the CENTER of the
+    counter text. from/to must be >= 0 (floor/trunc sign edge);
+    decimals is 0 or 1 (eif formats integers only on this
+    build). Affixes reject filter-breaking characters — a
+    literal Latin % is impossible on this build (%% gives
+    "Stray %" inline AND in textfile), so use \u066a (\u066a,
+    the Arabic percent sign).
+    """
+    from .motion import EASINGS
+
+    rel = {"id": mid, "kind": "counter", "start": start, "end": end}
+    ok = True
+
+    def _num(name, lo=None, hi=None, default=None, required=False):
+        nonlocal ok
+        if name not in el:
+            if required:
+                errors.append(err("INVALID_SCHEMA", f"motion counter needs a numeric {name}", field=f"motion.{name}", clip_id=mid,
+                                  fix=f"set {name} to a number"))
+                ok = False
+            return default
+        v = el[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be a number", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to a number"))
+            ok = False
+            return default
+        v = float(v)
+        if lo is not None and not v >= lo:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be >= {lo}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {lo} or more"))
+            ok = False
+            return default
+        if hi is not None and not v <= hi:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be <= {hi}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {hi} or less"))
+            ok = False
+            return default
+        return v
+
+    x = _num("x", required=True)
+    y = _num("y", required=True)
+    if x is not None:
+        rel["x"] = x
+    if y is not None:
+        rel["y"] = y
+    if x is not None and not 0 <= x <= width:
+        errors.append(err("INVALID_SCHEMA", f"motion counter x {x} is outside the {width}px frame width", field="motion.x", clip_id=mid,
+                          fix=f"set x between 0 and {width}"))
+        ok = False
+    if y is not None and not 0 <= y <= height:
+        errors.append(err("INVALID_SCHEMA", f"motion counter y {y} is outside the {height}px frame height", field="motion.y", clip_id=mid,
+                          fix=f"set y between 0 and {height}"))
+        ok = False
+    rel["from"] = _num("from", lo=0.0, required=True)
+    rel["to"] = _num("to", lo=0.0, required=True)
+    decimals = _num("decimals", lo=0, hi=1, default=0)
+    if decimals is not None and decimals != int(decimals):
+        errors.append(err("INVALID_SCHEMA", "motion decimals must be 0 or 1", field="motion.decimals", clip_id=mid,
+                          fix="set decimals to 0 for whole numbers or 1 for one decimal place"))
+        ok = False
+    rel["decimals"] = int(decimals) if decimals is not None else 0
+    easing = el.get("easing", "linear")
+    if easing not in EASINGS:
+        errors.append(err("INVALID_SCHEMA", f"unknown motion easing '{easing}'; valid easings are: " + ", ".join(EASINGS), field="motion.easing", clip_id=mid,
+                          fix="set easing to one of: " + ", ".join(EASINGS)))
+        ok = False
+    else:
+        rel["easing"] = easing
+    size = _num("size", lo=8, hi=120, default=48)
+    if size is not None:
+        rel["size"] = size
+    color = el.get("color", "white")
+    if not (isinstance(color, str) and (color in TEXT_COLORS
+                                        or re.fullmatch(r"#[0-9a-fA-F]{6}", color))):
+        errors.append(err("INVALID_SCHEMA", "motion counter color must be a #RRGGBB hex value or one of: " + ", ".join(sorted(TEXT_COLORS)), field="motion.color", clip_id=mid,
+                          fix="set color to e.g. 'white' or '#facc15'"))
+        ok = False
+    else:
+        rel["color"] = color
+    if "box" in el and not isinstance(el["box"], bool):
+        errors.append(err("INVALID_SCHEMA", "motion box must be true or false", field="motion.box", clip_id=mid,
+                          fix="set box to true for a backdrop box, or false for bare digits"))
+        ok = False
+    rel["box"] = bool(el.get("box", True))
+    for aname in ("prefix", "suffix"):
+        a = el.get(aname, "")
+        if not isinstance(a, str):
+            errors.append(err("INVALID_SCHEMA", f"motion {aname} must be a string", field=f"motion.{aname}", clip_id=mid,
+                              fix=f"set {aname} to a string, e.g. '\\u066a' for a percent suffix"))
+            ok = False
+            continue
+        bad = [ch for ch in a if ch in "%:'\"\\,;[]" or ord(ch) < 32]
+        if bad:
+            errors.append(err("INVALID_SCHEMA", f"motion {aname} contains a filter-breaking character {bad[0]!r}", field=f"motion.{aname}", clip_id=mid,
+                              fix="remove that character; for a percent sign use \u066a (\u066a), not %"))
+            ok = False
+            continue
+        rel[aname] = a
+    if not ok:
+        return None
+    return rel
+
+
+def _validate_motion_lower_third(el, mid, start, end, width, height,
+                                 fps, errors):
+    """Validate one lower_third element (R3).
+
+    Returns the resolved dict, or None (errors appended). The
+    card's rest position (x, y, w, h) must sit fully inside the
+    frame; the slide-in bbox (from fully off-screen left) uses
+    the same one-bbox-size extension rule as shapes. The text
+    line is a derived drawtext item at render time, so it keeps
+    the BiDi-verified path.
+    """
+    from .diagrams import resolve_color
+    from .motion import lower_third_bbox
+
+    rel = {"id": mid, "kind": "lower_third", "start": start, "end": end}
+    ok = True
+
+    def _num(name, lo=None, hi=None, default=None, required=False):
+        nonlocal ok
+        if name not in el:
+            if required:
+                errors.append(err("INVALID_SCHEMA", f"motion lower_third needs a numeric {name}", field=f"motion.{name}", clip_id=mid,
+                                  fix=f"set {name} to a number"))
+                ok = False
+            return default
+        v = el[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be a number", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to a number"))
+            ok = False
+            return default
+        v = float(v)
+        if lo is not None and not v >= lo:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be >= {lo}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {lo} or more"))
+            ok = False
+            return default
+        if hi is not None and not v <= hi:
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be <= {hi}", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to {hi} or less"))
+            ok = False
+            return default
+        return v
+
+    x = _num("x", required=True)
+    y = _num("y", required=True)
+    w = _num("w", lo=1, required=True)
+    h = _num("h", lo=1, required=True)
+    if x is not None:
+        rel["x"] = x
+    if y is not None:
+        rel["y"] = y
+    if w is not None:
+        rel["w"] = w
+    if h is not None:
+        rel["h"] = h
+    text = el.get("text")
+    if not isinstance(text, str) or not text.strip():
+        errors.append(err("INVALID_SCHEMA", "motion lower_third needs a non-empty text string", field="motion.text", clip_id=mid,
+                          fix="set text to the line to show, e.g. 'السباق نحو الذكاء الاصطناعي'"))
+        ok = False
+    else:
+        rel["text"] = text
+    size = _num("size", lo=8, hi=120, default=36)
+    if size is not None:
+        rel["size"] = size
+    color = el.get("color", "white")
+    if not (isinstance(color, str) and (color in TEXT_COLORS
+                                        or re.fullmatch(r"#[0-9a-fA-F]{6}", color))):
+        errors.append(err("INVALID_SCHEMA", "motion lower_third color must be a #RRGGBB hex value or one of: " + ", ".join(sorted(TEXT_COLORS)), field="motion.color", clip_id=mid,
+                          fix="set color to e.g. 'white' or '#facc15'"))
+        ok = False
+    else:
+        rel["color"] = color
+    font = el.get("font")
+    if font is not None:
+        if not isinstance(font, str) or font not in BUNDLED_FONTS:
+            errors.append(err("INVALID_SCHEMA", f"unknown motion font '{font}'; valid fonts are: " + ", ".join(sorted(BUNDLED_FONTS)), field="motion.font", clip_id=mid,
+                              fix="set font to one of: " + ", ".join(sorted(BUNDLED_FONTS))))
+            ok = False
+        else:
+            rel["font"] = font
+    card_color = resolve_color(el.get("card_color", "black"))
+    if card_color is None:
+        errors.append(err("INVALID_SCHEMA", f"unknown motion card_color colour '{el.get('card_color')}'", field="motion.card_color", clip_id=mid,
+                          fix="set card_color to a colour name or #RRGGBB hex"))
+        ok = False
+    else:
+        rel["card_color"] = card_color
+    rel["card_opacity"] = _num("card_opacity", lo=0.0, hi=1.0,
+                               default=0.75)
+    if w is not None and h is not None:
+        rel["corner_radius"] = _num("corner_radius", lo=0.0,
+                                    hi=min(w, h) / 2.0, default=16)
+    else:
+        rel["corner_radius"] = _num("corner_radius", lo=0.0, default=16)
+    enter = _num("enter", lo=0.0, hi=2.0, default=0.6)
+    exit_ = _num("exit", lo=0.0, hi=2.0, default=0.6)
+    if enter is not None:
+        rel["enter"] = enter
+    if exit_ is not None:
+        rel["exit"] = exit_
+    if enter is not None and exit_ is not None \
+            and enter + exit_ > end - start + 1e-9:
+        errors.append(err("INVALID_SCHEMA", f"motion enter+exit {enter + exit_} exceeds the {end - start}s window", field="motion.enter", clip_id=mid,
+                          fix="shorten enter/exit so enter + exit fits inside the window"))
+        ok = False
+    if not ok:
+        return None
+    if not (0 <= x <= width - w and 0 <= y <= height - h):
+        errors.append(err("INVALID_SCHEMA", f"motion lower_third '{mid}' card {x},{y} {w}x{h} is outside the {width}x{height} frame", field="motion", clip_id=mid,
+                          fix="move the card fully inside the frame (it slides in from off-screen on its own)"))
+        return None
+    try:
+        bx, by, bw, bh = lower_third_bbox(rel)
+    except Exception as exc:
+        errors.append(err("INVALID_SCHEMA", f"motion lower_third geometry failed: {exc}", field="motion", clip_id=mid,
+                          fix="check the card geometry (x, y, w, h)"))
+        return None
+    if (bx + bw <= 0 or by + bh <= 0 or bx >= width or by >= height
+            or bx < -bw or by < -bh or bx + bw > width + bw
+            or by + bh > height + bh):
+        errors.append(err("INVALID_SCHEMA", f"motion lower_third '{mid}' bbox {bx},{by} {bw}x{bh} is outside the {width}x{height} frame", field="motion", clip_id=mid,
+                          fix="move the card inside the frame"))
+        return None
+    rel["_bbox"] = (bx, by, bw, bh)
+    rel["_frames"] = max(1, int(round((end - start) * fps)))
+    return rel
+
+
+def _motion_style_passthrough(el, rel, mid, errors):
+    """Shared style passthrough for motion elements (v1.44.0,
+    F4d): chart/counter labels take `label_style`, lower thirds
+    take `style` — both must be TEXT_STYLES names and ride on
+    the resolved element for the renderer's shared style
+    resolver. An unknown name is an error, never a silent
+    fallback.
+    """
+    for key in ("label_style", "style"):
+        if el.get(key) is not None:
+            if el[key] not in TEXT_STYLES:
+                errors.append(err("INVALID_SCHEMA", f"motion {key} must be one of: " + ", ".join(sorted(TEXT_STYLES)), field="motion." + key, clip_id=mid,
+                                  fix="set " + key + " to one of: " + ", ".join(sorted(TEXT_STYLES)) + ", or remove it"))
+            else:
+                rel[key] = el[key]
+
+
+def _validate_motion(project, total, width, height, fps, overlay_ids,
+                     diagram_ids, errors):
+    """Validate the project-level `motion` list (v1.43.0).
+
+    Returns resolved motion elements for info["motion"]. All
+    seven kinds are landed (shape in R1, bars/donut/pie/line_chart
+    in R2, counter and lower_third in R3) — an unknown kind is an
+    error, never a silent drop. Keyframe times are ABSOLUTE
+    timeline seconds inside the element window; x/y are the shape
+    CENTER.
+    """
+    from .diagrams import resolve_color
+    from .motion import EASINGS, MOTION_KINDS, shape_bbox
+
+    resolved = []
+    raw = project.get("motion")
+    if raw is None:
+        return resolved
+    if not isinstance(raw, list):
+        errors.append(err("INVALID_SCHEMA", "motion must be a list", field="motion",
+                          fix="give motion as a list of motion elements, or remove motion"))
+        return resolved
+    seen = set()
+    for el in raw:
+        if not isinstance(el, dict):
+            errors.append(err("INVALID_SCHEMA", "each motion element must be an object", field="motion",
+                              fix="make each motion element an object with id, kind, start and end"))
+            continue
+        mid = el.get("id")
+        if not isinstance(mid, str) or not mid.strip():
+            errors.append(err("INVALID_SCHEMA", "each motion element needs a non-empty string id", field="motion.id",
+                              fix="give every motion element an id, e.g. 'dot1'"))
+            continue
+        if mid in seen or mid in overlay_ids or mid in diagram_ids:
+            errors.append(err("INVALID_SCHEMA", f"duplicate motion id {mid}", field="motion.id", clip_id=mid,
+                              fix=f"rename one of the motion elements/overlays/diagrams called {mid}"))
+            continue
+        seen.add(mid)
+        kind = el.get("kind")
+        if kind not in MOTION_KINDS:
+            errors.append(err("INVALID_SCHEMA", f"unknown motion kind '{kind}'; valid kinds are: " + ", ".join(sorted(MOTION_KINDS)), field="motion.kind", clip_id=mid,
+                              fix="set kind to one of: " + ", ".join(sorted(MOTION_KINDS))))
+            continue
+        try:
+            start = float(el.get("start", 0))
+            end = float(el.get("end", total))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "motion start/end must be numbers", field="motion", clip_id=mid,
+                              fix="set start/end to timeline seconds, e.g. start 2, end 10"))
+            continue
+        if start < 0 or end <= start or end > total + 0.05:
+            errors.append(err("CLIP_OUT_OF_RANGE", f"motion range {start}..{end} outside timeline {total:.2f}s", field="motion", clip_id=mid,
+                              fix=f"keep the motion window inside 0..{total:.2f} with end after start"))
+            continue
+        if kind in ("bars", "donut", "pie", "line_chart"):
+            rel = _validate_motion_chart(el, kind, mid, start, end,
+                                         width, height, fps, errors)
+            if rel is not None:
+                _motion_style_passthrough(el, rel, mid, errors)
+                resolved.append(rel)
+            continue
+        if kind == "counter":
+            rel = _validate_motion_counter(el, mid, start, end,
+                                           width, height, errors)
+            if rel is not None:
+                _motion_style_passthrough(el, rel, mid, errors)
+                resolved.append(rel)
+            continue
+        if kind == "lower_third":
+            rel = _validate_motion_lower_third(el, mid, start, end,
+                                               width, height, fps,
+                                               errors)
+            if rel is not None:
+                _motion_style_passthrough(el, rel, mid, errors)
+                resolved.append(rel)
+            continue
+        if kind != "shape":
+            # Later rounds land the remaining kinds. Until then
+            # the kind is known but unimplemented, so it fails
+            # loudly instead of validating into a drop.
+            errors.append(err("INVALID_SCHEMA", f"motion kind '{kind}' is not implemented yet", field="motion.kind", clip_id=mid,
+                              fix="use kind 'shape', 'bars', 'donut', 'pie', 'line_chart', 'counter' or 'lower_third' for now, or wait for the next motion round"))
+            continue
+        rel = {"id": mid, "kind": "shape", "start": start, "end": end}
+        shape = el.get("shape", "rect")
+        if shape not in ("rect", "circle", "ellipse", "line", "polygon"):
+            errors.append(err("INVALID_SCHEMA", f"unknown shape '{shape}'; valid shapes are: rect, circle, ellipse, line, polygon", field="motion.shape", clip_id=mid,
+                              fix="set shape to rect, circle, ellipse, line or polygon"))
+            continue
+        rel["shape"] = shape
+        # Element-level defaults; keyframes override per keyframe.
+        defaults = {}
+        ok = True
+        for fname, lo, lo_exclusive, hi in (
+                ("x", None, False, None), ("y", None, False, None),
+                ("scale", 0.0, True, None), ("rotation", None, False, None),
+                ("opacity", 0.0, False, 1.0)):
+            if fname in el:
+                try:
+                    v = float(el[fname])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"motion {fname} must be a number", field=f"motion.{fname}", clip_id=mid,
+                                      fix=f"set {fname} to a number, or remove it"))
+                    ok = False
+                    continue
+                if isinstance(el[fname], bool):
+                    errors.append(err("INVALID_SCHEMA", f"motion {fname} must be a number", field=f"motion.{fname}", clip_id=mid,
+                                      fix=f"set {fname} to a number, or remove it"))
+                    ok = False
+                    continue
+                if lo is not None and (not v > lo if lo_exclusive else not v >= lo):
+                    errors.append(err("INVALID_SCHEMA", f"motion {fname} must be >= {lo}" if not lo_exclusive else f"motion {fname} must be > {lo}", field=f"motion.{fname}", clip_id=mid,
+                                      fix=f"set {fname} above {lo}" if lo_exclusive else f"set {fname} between {lo} and 1"))
+                    ok = False
+                    continue
+                if hi is not None and not v <= hi:
+                    errors.append(err("INVALID_SCHEMA", f"motion {fname} must be 0..1", field=f"motion.{fname}", clip_id=mid,
+                                      fix=f"set {fname} between 0 and 1"))
+                    ok = False
+                    continue
+                defaults[fname] = v
+        if not ok:
+            continue
+        rel.update(defaults)
+        # Geometry, per shape kind. Fields that belong to another
+        # kind are rejected, not silently ignored (1.34.0 rule).
+        if shape in ("rect", "ellipse"):
+            for gname in ("w", "h"):
+                try:
+                    gv = float(el[gname])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", f"motion {shape} needs a numeric {gname}", field=f"motion.{gname}", clip_id=mid,
+                                      fix=f"set {gname} to a pixel size above 0, e.g. 200"))
+                    ok = False
+                    continue
+                if not gv > 0:
+                    errors.append(err("INVALID_SCHEMA", f"motion {gname} must be > 0", field=f"motion.{gname}", clip_id=mid,
+                                      fix=f"set {gname} above 0"))
+                    ok = False
+                    continue
+                rel[gname] = gv
+            if "radius" in el:
+                errors.append(err("INVALID_SCHEMA", f"motion {shape} uses w/h, not radius", field="motion.radius", clip_id=mid,
+                                  fix="remove radius, or use shape 'circle'"))
+                ok = False
+            if "points" in el:
+                errors.append(err("INVALID_SCHEMA", f"motion {shape} uses w/h, not points", field="motion.points", clip_id=mid,
+                                  fix="remove points, or use shape 'polygon'/'line'"))
+                ok = False
+            if shape == "ellipse" and "corner_radius" in el:
+                errors.append(err("INVALID_SCHEMA", "motion corner_radius only applies to rect shapes", field="motion.corner_radius", clip_id=mid,
+                                  fix="remove corner_radius, or use shape 'rect'"))
+                ok = False
+        elif shape == "circle":
+            try:
+                rv = float(el["radius"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "motion circle needs a numeric radius", field="motion.radius", clip_id=mid,
+                                  fix="set radius to a pixel size above 0, e.g. 60"))
+                ok = False
+            else:
+                if not rv > 0:
+                    errors.append(err("INVALID_SCHEMA", "motion radius must be > 0", field="motion.radius", clip_id=mid,
+                                      fix="set radius above 0"))
+                    ok = False
+                else:
+                    rel["radius"] = rv
+            for gname in ("w", "h", "points", "corner_radius"):
+                if gname in el:
+                    errors.append(err("INVALID_SCHEMA", f"motion circle does not take {gname}", field=f"motion.{gname}", clip_id=mid,
+                                      fix=f"remove {gname}"))
+                    ok = False
+        else:  # line / polygon: local points relative to the center.
+            pts = el.get("points")
+            if not isinstance(pts, list) or not pts:
+                errors.append(err("INVALID_SCHEMA", f"motion {shape} needs a points list", field="motion.points", clip_id=mid,
+                                  fix="give points as [[x, y], ...] relative to the shape center"))
+                ok = False
+            else:
+                need = 2 if shape == "line" else 3
+                if len(pts) < need:
+                    errors.append(err("INVALID_SCHEMA", f"motion {shape} needs at least {need} points", field="motion.points", clip_id=mid,
+                                      fix=f"give at least {need} [x, y] points"))
+                    ok = False
+                else:
+                    clean = []
+                    for pt in pts:
+                        if (not isinstance(pt, (list, tuple)) or len(pt) != 2
+                                or isinstance(pt[0], bool) or isinstance(pt[1], bool)):
+                            errors.append(err("INVALID_SCHEMA", "motion points must be [x, y] pairs of numbers", field="motion.points", clip_id=mid,
+                                              fix="give each point as [x, y], e.g. [0, 0]"))
+                            ok = False
+                            break
+                        try:
+                            clean.append((float(pt[0]), float(pt[1])))
+                        except (TypeError, ValueError):
+                            errors.append(err("INVALID_SCHEMA", "motion points must be [x, y] pairs of numbers", field="motion.points", clip_id=mid,
+                                              fix="give each point as [x, y], e.g. [0, 0]"))
+                            ok = False
+                            break
+                    if ok:
+                        rel["points"] = clean
+            for gname in ("w", "h", "radius", "corner_radius"):
+                if gname in el:
+                    errors.append(err("INVALID_SCHEMA", f"motion {shape} does not take {gname}", field=f"motion.{gname}", clip_id=mid,
+                                      fix=f"remove {gname}"))
+                    ok = False
+        if shape == "rect" and "corner_radius" in el:
+            try:
+                cr = float(el["corner_radius"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "motion corner_radius must be a number", field="motion.corner_radius", clip_id=mid,
+                                  fix="set corner_radius to 0 (square corners) or a radius in pixels"))
+                ok = False
+            else:
+                cap = min(rel.get("w", 0), rel.get("h", 0)) / 2.0
+                if not 0 <= cr <= cap:
+                    errors.append(err("INVALID_SCHEMA", f"motion corner_radius must be 0..{cap:.0f} (half the smaller side)", field="motion.corner_radius", clip_id=mid,
+                                      fix=f"set corner_radius between 0 and {cap:.0f}"))
+                    ok = False
+                else:
+                    rel["corner_radius"] = cr
+        if not ok:
+            continue
+        # Fill / stroke. At least one must be present, or the shape
+        # is invisible. Colours resolve to RGB tuples here.
+        fill = el.get("fill")
+        stroke = el.get("stroke")
+        if fill is None and stroke is None:
+            errors.append(err("INVALID_SCHEMA", "motion shape needs a fill or a stroke (or both)", field="motion", clip_id=mid,
+                              fix="set fill to a colour, e.g. 'yellow', or stroke to a colour"))
+            continue
+        if fill is not None:
+            fc = resolve_color(fill)
+            if fc is None:
+                errors.append(err("INVALID_SCHEMA", f"unknown motion fill colour '{fill}'", field="motion.fill", clip_id=mid,
+                                  fix="set fill to a colour name or #RRGGBB hex"))
+                continue
+            rel["fill"] = fc
+        if stroke is not None:
+            sc = resolve_color(stroke)
+            if sc is None:
+                errors.append(err("INVALID_SCHEMA", f"unknown motion stroke colour '{stroke}'", field="motion.stroke", clip_id=mid,
+                                  fix="set stroke to a colour name or #RRGGBB hex"))
+                continue
+            rel["stroke"] = sc
+            try:
+                sw = float(el.get("stroke_width", 4))
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "motion stroke_width must be a number", field="motion.stroke_width", clip_id=mid,
+                                  fix="set stroke_width to a pixel width 0.5..50, e.g. 4"))
+                continue
+            if not 0.5 <= sw <= 50:
+                errors.append(err("INVALID_SCHEMA", "motion stroke_width must be 0.5..50", field="motion.stroke_width", clip_id=mid,
+                                  fix="set stroke_width between 0.5 and 50 pixels"))
+                continue
+            rel["stroke_width"] = sw
+        elif "stroke_width" in el:
+            errors.append(err("INVALID_SCHEMA", "motion stroke_width needs a stroke colour", field="motion.stroke_width", clip_id=mid,
+                              fix="set stroke to a colour, or remove stroke_width"))
+            continue
+        # Keyframes: non-empty, absolute times, strictly increasing,
+        # inside the window. Each keyframe overrides any subset of
+        # x/y/scale/rotation/opacity; missing fields carry forward
+        # from the element defaults, then from earlier keyframes.
+        kfs = el.get("keyframes")
+        if not isinstance(kfs, list) or not kfs:
+            errors.append(err("INVALID_SCHEMA", "motion shape needs a non-empty keyframes list", field="motion.keyframes", clip_id=mid,
+                              fix="give at least one keyframe, e.g. {'t': 0, 'x': 100, 'y': 100}"))
+            continue
+        norm = []
+        prev_t = None
+        cur = {"x": defaults.get("x"), "y": defaults.get("y"),
+               "scale": defaults.get("scale", 1.0),
+               "rotation": defaults.get("rotation", 0.0),
+               "opacity": defaults.get("opacity", 1.0)}
+        for kf in kfs:
+            if not isinstance(kf, dict):
+                errors.append(err("INVALID_SCHEMA", "each motion keyframe must be an object", field="motion.keyframes", clip_id=mid,
+                                  fix="give each keyframe as {'t': seconds, 'x': ..., 'y': ...}"))
+                ok = False
+                break
+            try:
+                kt = float(kf["t"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "motion keyframe t must be a number", field="motion.keyframes.t", clip_id=mid,
+                                  fix="set t to an absolute timeline second inside the element window"))
+                ok = False
+                break
+            if kt < start - 1e-9 or kt > end + 1e-9:
+                errors.append(err("INVALID_SCHEMA", f"motion keyframe t={kt} is outside the element window {start}..{end}", field="motion.keyframes.t", clip_id=mid,
+                                  fix=f"keep keyframe times inside {start}..{end}"))
+                ok = False
+                break
+            if prev_t is not None and not kt > prev_t:
+                errors.append(err("INVALID_SCHEMA", "motion keyframes must be in strictly increasing time order", field="motion.keyframes.t", clip_id=mid,
+                                  fix="sort the keyframes by t, with no two keyframes at the same time"))
+                ok = False
+                break
+            prev_t = kt
+            nkf = {"t": kt}
+            for fname in ("x", "y", "scale", "rotation", "opacity"):
+                if fname in kf:
+                    try:
+                        fv = float(kf[fname])
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", f"motion keyframe {fname} must be a number", field=f"motion.keyframes.{fname}", clip_id=mid,
+                                          fix=f"set {fname} to a number, or remove it from this keyframe"))
+                        ok = False
+                        break
+                    if fname == "scale" and not fv > 0:
+                        errors.append(err("INVALID_SCHEMA", "motion keyframe scale must be > 0", field="motion.keyframes.scale", clip_id=mid,
+                                          fix="set scale above 0"))
+                        ok = False
+                        break
+                    if fname == "opacity" and not 0.0 <= fv <= 1.0:
+                        errors.append(err("INVALID_SCHEMA", "motion keyframe opacity must be 0..1", field="motion.keyframes.opacity", clip_id=mid,
+                                          fix="set opacity between 0 and 1"))
+                        ok = False
+                        break
+                    cur[fname] = fv
+                nkf[fname] = cur[fname]
+            if not ok:
+                break
+            if "easing" in kf:
+                if kf["easing"] not in EASINGS:
+                    errors.append(err("INVALID_SCHEMA", f"unknown motion easing '{kf['easing']}'; valid easings are: " + ", ".join(EASINGS), field="motion.keyframes.easing", clip_id=mid,
+                                      fix="set easing to one of: " + ", ".join(EASINGS)))
+                    ok = False
+                    break
+                nkf["easing"] = kf["easing"]
+            norm.append(nkf)
+        if not ok:
+            continue
+        if norm[0]["x"] is None or norm[0]["y"] is None:
+            errors.append(err("INVALID_SCHEMA", "motion shape needs x and y: set them on the element or on the first keyframe", field="motion", clip_id=mid,
+                              fix="set x and y on the element, e.g. {'x': 360, 'y': 640}, or on the first keyframe"))
+            continue
+        rel["keyframes"] = norm
+        rel["x"] = norm[0]["x"]
+        rel["y"] = norm[0]["y"]
+        # Geometry bounds: the keyframe-union bbox must overlap the
+        # frame, and may extend outside it by at most one bbox-size
+        # per side (slide-in/out from off-screen). Anything further
+        # out, or fully outside, is an authoring error, not a clip.
+        try:
+            bx, by, bw, bh = shape_bbox(rel)
+        except Exception as exc:
+            errors.append(err("INVALID_SCHEMA", f"motion shape geometry failed: {exc}", field="motion", clip_id=mid,
+                              fix="check the shape geometry and keyframes"))
+            continue
+        if (bx + bw <= 0 or by + bh <= 0 or bx >= width or by >= height
+                or bx < -bw or by < -bh or bx + bw > width + bw
+                or by + bh > height + bh):
+            errors.append(err("INVALID_SCHEMA", f"motion shape '{mid}' bbox {bx},{by} {bw}x{bh} is outside the {width}x{height} frame", field="motion", clip_id=mid,
+                              fix="move the shape and its keyframes inside the frame (a slide-in may start at most one shape-width off-screen)"))
+            continue
+        rel["_bbox"] = (bx, by, bw, bh)
+        rel["_frames"] = max(1, int(round((end - start) * fps)))
+        resolved.append(rel)
+    return resolved
+
+
+def _recompute_clip_starts(resolved):
+    """Recompute clip_starts + total from a resolved clip list
+    (v1.44.0, F1). Mirrors the clip loop exactly: an xfade
+    transition overlaps by its transition_duration, every other
+    transition (including custom ones) concatenates.
+    """
+    starts = []
+    total = 0.0
+    prev_start = 0.0
+    prev_dur = 0.0
+    _seen_joined = False
+    for clip in resolved:
+        if clip.get("track", 0) == 1:
+            # Absolute start; does not advance the base timeline.
+            starts.append(float(clip.get("start", 0.0)))
+            continue
+        if not _seen_joined:
+            starts.append(0.0)
+            _seen_joined = True
+        elif clip.get("transition") in XFADE_TRANSITIONS:
+            td = float(clip.get("transition_duration", 0.5))
+            starts.append(prev_start + prev_dur - td)
+        else:
+            starts.append(prev_start + prev_dur)
+        prev_start = starts[-1]
+        prev_dur = float(clip["duration"])
+    if _seen_joined:
+        total = prev_start + prev_dur
+    return starts, total
+
+
+def _apply_beat_cut(project, resolved, clip_starts, total, errors, data_files):
+    """Split clips at beat times (v1.44.0, F1). Returns
+    (resolved, clip_starts, total, beat_cuts). beat_cut is
+    {file, every=1, window=[start, end]}: every Nth beat (1 =
+    every beat), window restricts the beats used (default the
+    whole timeline). Segments shorter than 0.2s are never made
+    (the cut is dropped, not the segment). The first segment
+    keeps the original transition; later segments get
+    transition "none" and ids "id#b1", "id#b2", ... Video
+    segments re-trim by source time (linear speed and reverse
+    are mapped; speed_curve, loop_count, camera, punch_in and
+    freeze_at are rejected on a split clip because their timing
+    is clip-global and would land wrong after the split).
+    Ken Burns is allowed: each segment re-runs its sweep, which
+    is a visible cut anyway. Total duration is unchanged.
+    """
+    spec = project.get("beat_cut")
+    if spec is None:
+        return resolved, clip_starts, total, []
+    beats, bpm, resolved_path = _load_beats_data(spec, errors)
+    if beats is None:
+        return resolved, clip_starts, total, []
+    data_files[resolved_path] = {"kind": "beats",
+                                 "data": {"bpm": bpm, "beats": beats}}
+    every = spec.get("every", 1)
+    if isinstance(every, bool) or not isinstance(every, int):
+        try:
+            every = int(every)
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "beat_cut.every must be an integer >= 1", field="beat_cut.every",
+                              fix="set every to 1 (every beat), 2 (every other beat), or remove it"))
+            return resolved, clip_starts, total, []
+    if every < 1:
+        errors.append(err("INVALID_SCHEMA", "beat_cut.every must be >= 1", field="beat_cut.every",
+                          fix="set every to 1 (every beat), 2 (every other beat), or remove it"))
+        return resolved, clip_starts, total, []
+    window = spec.get("window")
+    ws, we = 0.0, total
+    if window is not None:
+        try:
+            ws = float(window[0]); we = float(window[1])
+        except (TypeError, ValueError, IndexError):
+            errors.append(err("INVALID_SCHEMA", "beat_cut.window must be [start, end] seconds", field="beat_cut.window",
+                              fix="set window to [start, end] inside the timeline, or remove it"))
+            return resolved, clip_starts, total, []
+        if not (0 <= ws < we <= total + 0.05):
+            errors.append(err("INVALID_SCHEMA", f"beat_cut.window {ws}..{we} outside timeline 0..{total:.2f}", field="beat_cut.window",
+                              fix=f"keep window inside 0..{total:.2f} with end after start"))
+            return resolved, clip_starts, total, []
+    selected = [b for i, b in enumerate(beats)
+                if i % every == 0 and ws <= b <= we]
+    if not selected:
+        errors.append(err("INVALID_SCHEMA", "beat_cut selects no beats inside the project timeline", field="beat_cut",
+                          fix="check the beats file times against the project duration, or widen window"))
+        return resolved, clip_starts, total, []
+    new_resolved = []
+    beat_cuts = []
+    made_cuts = 0
+    for clip, cs in zip(resolved, clip_starts):
+        if clip.get("track", 0) == 1:
+            # Track 1 clips are composited, not joined: beats
+            # never split them.
+            new_resolved.append(clip)
+            continue
+        dur = float(clip["duration"])
+        ce = cs + dur
+        cuts = [b for b in selected if cs < b < ce]
+        # Min segment 0.2s: drop cuts too close to a boundary
+        # or to the previous kept cut inside this clip.
+        kept = []
+        last = cs
+        for b in cuts:
+            if b - last >= 0.2 and ce - b >= 0.2:
+                kept.append(b)
+                last = b
+        if not kept:
+            new_resolved.append(clip)
+            continue
+        if (clip.get("speed_curve") is not None or clip.get("loop_count") is not None
+                or clip.get("camera") or clip.get("punch_at") is not None
+                or clip.get("freeze_at") is not None):
+            errors.append(err("INVALID_SCHEMA", f"beat_cut cannot split clip '{clip.get('id')}' with speed_curve, loop_count, camera, punch_in or freeze_at (their timing is clip-global and would land wrong after the split)", field="beat_cut", clip_id=clip.get("id"),
+                              fix="remove speed_curve/loop_count/camera/punch_in/freeze_at from that clip, or move the beat_cut window off it"))
+            new_resolved.append(clip)
+            continue
+        is_video = "trim_in" in clip
+        speed = float(clip.get("speed", 1.0))
+        reverse = bool(clip.get("reverse"))
+        trim_in = float(clip.get("trim_in", 0.0))
+        trim_out = float(clip.get("trim_out", 0.0))
+        bounds = [cs] + kept + [ce]
+        for k in range(len(bounds) - 1):
+            seg_start, seg_end = bounds[k], bounds[k + 1]
+            seg = dict(clip)
+            seg["duration"] = seg_end - seg_start
+            if k > 0:
+                seg["id"] = f"{clip.get('id')}#b{k}"
+                seg["transition"] = "none"
+                seg["transition_duration"] = 0.0
+                # A beat cut is an edit point: later segments do
+                # not inherit scene continuity, so each segment
+                # restarts its motion instead of chaining across
+                # the cut (which would hide the cut entirely).
+                seg.pop("scene_id", None)
+                beat_cuts.append({"time": seg_start, "clip_id": clip.get("id")})
+                made_cuts += 1
+            if is_video:
+                if reverse:
+                    seg["trim_in"] = trim_out - (seg_end - cs) * speed
+                    seg["trim_out"] = trim_out - (seg_start - cs) * speed
+                else:
+                    seg["trim_in"] = trim_in + (seg_start - cs) * speed
+                    seg["trim_out"] = trim_in + (seg_end - cs) * speed
+            new_resolved.append(seg)
+    if made_cuts == 0:
+        errors.append(err("INVALID_SCHEMA", "beat_cut selects beats but none produce a valid split (all too close to a clip boundary)", field="beat_cut",
+                          fix="use beats further from clip starts/ends, or a different every/window"))
+        return resolved, clip_starts, total, []
+    starts, new_total = _recompute_clip_starts(new_resolved)
+    return new_resolved, starts, new_total, beat_cuts
+
+
+def _validate_reframe_clip(clip, probe, trim_in, trim_out, errors, cid,
+                           out_w=None, out_h=None):
+    """Validate a clip-level reframe spec (v1.44.0, F3).
+    Returns (reframe_data, resolved_path, warnings) or
+    (None, None, []). The data keeps the AgentMedia shape plus
+    the parsed target_aspect/target_ratio. Windows are the crop
+    in SOURCE pixels and source seconds; the renderer samples
+    them at the clip's source time (trim_in + timeline offset
+    x speed). Outside the windows' range the renderer holds
+    the nearest window (a warning, not an error).
+    """
+    spec = clip.get("reframe")
+    data, resolved = _load_reframe_data(spec, errors, cid)
+    if data is None:
+        return None, None, []
+    target = spec.get("target_aspect")
+    try:
+        tw, th = target.split(":")
+        tw, th = float(tw), float(th)
+        if tw <= 0 or th <= 0:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        errors.append(err("INVALID_SCHEMA", "reframe target_aspect must be 'W:H', e.g. '9:16'", field="clips.reframe.target_aspect", clip_id=cid,
+                          fix="set target_aspect to '9:16' for a vertical cut, or '16:9' for a wide one"))
+        return None, None, []
+    pw, ph = probe.get("width"), probe.get("height")
+    if abs(data["frame_size"]["width"] - pw) > 0.5 or abs(data["frame_size"]["height"] - ph) > 0.5:
+        errors.append(err("INVALID_SCHEMA", f"reframe windows are for a {data['frame_size']['width']:.0f}x{data['frame_size']['height']:.0f} source but this clip is {pw}x{ph}", field="clips.reframe.windows_file", clip_id=cid,
+                          fix="run AgentMedia analyze_reframe on this clip's source file"))
+        return None, None, []
+    target_ratio = tw / th
+    for w in data["windows"]:
+        if abs(w["w"] / w["h"] - target_ratio) > 0.02:
+            errors.append(err("INVALID_SCHEMA", f"reframe crop {w['w']:.0f}x{w['h']:.0f} does not match target_aspect {target} (ratio {w['w'] / w['h']:.3f} vs {target_ratio:.3f})", field="clips.reframe.windows_file", clip_id=cid,
+                              fix="run AgentMedia analyze_reframe with the same target_aspect"))
+            return None, None, []
+        if w["w"] != int(w["w"]) or w["h"] != int(w["h"]) or int(w["w"]) % 2 or int(w["h"]) % 2:
+            errors.append(err("INVALID_SCHEMA", f"reframe crop {w['w']:.0f}x{w['h']:.0f} has odd dimensions (yuv420p needs even crops)", field="clips.reframe.windows_file", clip_id=cid,
+                              fix="run AgentMedia analyze_reframe — it enforces even crops"))
+            return None, None, []
+        if w["x"] + w["w"] > pw + 0.5 or w["y"] + w["h"] > ph + 0.5:
+            errors.append(err("INVALID_SCHEMA", f"reframe window at t={w['t']} extends past the source frame", field="clips.reframe.windows_file", clip_id=cid,
+                              fix="run AgentMedia analyze_reframe on this clip's source file"))
+            return None, None, []
+    # One crop size for all windows (the AgentMedia
+    # contract): the renderer's crop filter takes constant w/h
+    # with per-frame x/y only.
+    _sizes = {(w["w"], w["h"]) for w in data["windows"]}
+    if len(_sizes) > 1:
+        errors.append(err("INVALID_SCHEMA", "reframe windows must share one crop size (w/h)", field="clips.reframe.windows_file", clip_id=cid,
+                          fix="run AgentMedia analyze_reframe — it emits one crop size for all windows"))
+        return None, None, []
+    if clip.get("camera"):
+        errors.append(err("INVALID_SCHEMA", "reframe cannot combine with camera (both drive the per-frame crop)", field="clips.reframe", clip_id=cid,
+                          fix="remove camera, or remove reframe, on this clip"))
+        return None, None, []
+    if clip.get("stabilize"):
+        errors.append(err("INVALID_SCHEMA", "reframe cannot combine with stabilize (stabilisation re-times the frames the crop follows)", field="clips.reframe", clip_id=cid,
+                          fix="remove stabilize, or remove reframe, on this clip"))
+        return None, None, []
+    if clip.get("fit") in BLUR_FITS:
+        errors.append(err("INVALID_SCHEMA", "reframe cannot combine with fit blur (the blurred background owns the frame geometry)", field="clips.reframe", clip_id=cid,
+                          fix="remove the blur fit, or remove reframe, on this clip"))
+        return None, None, []
+    if clip.get("freeze_at") is not None or clip.get("reverse") or clip.get("speed_curve") is not None:
+        errors.append(err("INVALID_SCHEMA", "reframe cannot combine with freeze_at, reverse or speed_curve (they change the frame order/timing the windows follow)", field="clips.reframe", clip_id=cid,
+                          fix="remove freeze_at/reverse/speed_curve, or remove reframe, on this clip"))
+        return None, None, []
+    warns = []
+    wins = data["windows"]
+    if wins[0]["t"] > trim_in + 0.05 or wins[-1]["t"] < trim_out - 0.05:
+        warns.append({"code": "reframe_partial_coverage",
+                      "message": f"clip '{cid}' reframe windows cover {wins[0]['t']:.2f}..{wins[-1]['t']:.2f}s but the trimmed clip runs {trim_in:.2f}..{trim_out:.2f}s; the nearest window is held outside the range",
+                      "clip_id": cid})
+    # Output-aspect mismatch is a warning, not an error: the
+    # reframed frame is stretched to the output size, which is
+    # what the project asked for.
+    if out_w and out_h and abs(out_w / out_h - target_ratio) > 0.02:
+        warns.append({"code": "reframe_output_aspect_mismatch",
+                      "message": f"clip '{cid}' reframe target_aspect {target} (ratio {target_ratio:.3f}) does not match the output aspect {out_w}x{out_h} (ratio {out_w / out_h:.3f}); the reframed frame is stretched to the output size",
+                      "clip_id": cid})
+    data["target_aspect"] = target
+    data["target_ratio"] = target_ratio
+    return data, resolved, warns
+
+
+def _validate_adjustments(project, total, errors):
+    """Validate project-level `adjustments` (v1.44.0, F6b).
+    Each adjustment is {start, end, grade?, effects?} with at
+    least one of grade/effects; grade must be a GRADE_PRESETS
+    name; effects reuse the clip effects vocabulary. Returns
+    the resolved list (empty when absent).
+    """
+    raw = project.get("adjustments")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        errors.append(err("INVALID_SCHEMA", "adjustments must be a list", field="adjustments",
+                          fix="give adjustments as a list of {start, end, grade} windows, or remove it"))
+        return []
+    resolved = []
+    for adj in raw:
+        if not isinstance(adj, dict):
+            errors.append(err("INVALID_SCHEMA", "each adjustment must be an object", field="adjustments",
+                              fix="make adjustments a list of objects with start, end and grade or effects"))
+            continue
+        try:
+            start = float(adj.get("start", 0)); end = float(adj.get("end", total))
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "adjustment start/end must be numbers", field="adjustments",
+                              fix="set start/end to timeline seconds, e.g. start 2, end 4"))
+            continue
+        if start < 0 or end <= start or end > total + 0.05:
+            errors.append(err("CLIP_OUT_OF_RANGE", f"adjustment range {start}..{end} outside timeline {total:.2f}s", field="adjustments",
+                              fix=f"keep the adjustment window inside 0..{total:.2f} with end after start"))
+            continue
+        grade = adj.get("grade")
+        if grade is not None and grade not in GRADE_PRESETS:
+            errors.append(err("INVALID_SCHEMA", "adjustment grade must be one of: " + ", ".join(sorted(GRADE_PRESETS)), field="adjustments.grade",
+                              fix="set grade to one of: " + ", ".join(sorted(GRADE_PRESETS)) + ", or remove it"))
+            continue
+        effects = adj.get("effects")
+        if effects is not None and not isinstance(effects, dict):
+            errors.append(err("INVALID_SCHEMA", "adjustment effects must be an object", field="adjustments.effects",
+                              fix="set effects to an object like {blur: 2}, or remove it"))
+            continue
+        if grade is None and not effects:
+            errors.append(err("INVALID_SCHEMA", "each adjustment needs a grade or effects (it must change something)", field="adjustments",
+                              fix="set grade, e.g. 'noir', or effects, e.g. {blur: 2}"))
+            continue
+        if effects:
+            _validate_effects(effects, errors, None, "adjustments.effects")
+        resolved.append({"start": start, "end": end, "grade": grade, "effects": effects or {}})
     return resolved
 
 
@@ -1675,6 +3553,13 @@ def validate_project(project):
     resolved clip durations and the total duration when computable.
     """
     errors = []
+    # v1.44.0: AgentMedia data files referenced by beat_cut /
+    # follow_track / reframe, keyed by resolved absolute path
+    # for the renderer; and warnings collected during validation
+    # (track / reframe partial coverage) merged into
+    # info["warnings"] at assembly.
+    _data_files = {}
+    _extra_warnings = []
     if not isinstance(project, dict):
         return [err("INVALID_SCHEMA", "project must be a JSON object")], {}
     if project.get("version") != 1:
@@ -1742,6 +3627,8 @@ def validate_project(project):
     total = 0.0
     seen_ids = set()
     prev_duration = None
+    _prev_start0 = 0.0
+    _prev_dur0 = 0.0
     clip_starts = []
     for clip in clips:
         if not isinstance(clip, dict):
@@ -1754,6 +3641,38 @@ def validate_project(project):
         if cid in seen_ids:
             errors.append(err("INVALID_SCHEMA", f"duplicate clip id {cid}", field="clips.id", clip_id=cid))
         seen_ids.add(cid)
+        # Multi-track (v1.44.0, F6a): track 0 is the base
+        # timeline, track 1 is a second video track composited
+        # over it. track must be the integer 0 or 1 (a bool is
+        # not an int here -- isinstance(True, int) is True).
+        _track = clip.get("track", 0)
+        if isinstance(_track, bool) or not isinstance(_track, int) or _track not in (0, 1):
+            errors.append(err("INVALID_SCHEMA", "clip track must be 0 (base timeline) or 1 (second track)", field="clips.track", clip_id=cid,
+                              fix="set track to 0 or 1, or remove it (0 is the default)"))
+            _track = 0
+        _is_t1 = _track == 1
+        _t1_start = 0.0
+        if _is_t1:
+            _raw_start = clip.get("start")
+            if isinstance(_raw_start, bool) or not isinstance(_raw_start, (int, float)):
+                errors.append(err("INVALID_SCHEMA", "a track 1 clip needs a numeric start (timeline seconds)", field="clips.start", clip_id=cid,
+                                  fix="set start to the timeline second the clip appears at, e.g. start 2"))
+            else:
+                _t1_start = float(_raw_start)
+                if _t1_start < 0:
+                    errors.append(err("INVALID_SCHEMA", "track 1 clip start must be >= 0", field="clips.start", clip_id=cid,
+                                      fix="set start to 0 or later"))
+                    _t1_start = 0.0
+            if "volume" in clip:
+                try:
+                    _t1_vol = float(clip["volume"])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "track 1 clip volume must be a number", field="clips.volume", clip_id=cid,
+                                      fix="set volume between 0 (muted) and 2, or remove it (1.0 is the default)"))
+                    _t1_vol = None
+                if _t1_vol is not None and not 0.0 <= _t1_vol <= 2.0:
+                    errors.append(err("INVALID_SCHEMA", "track 1 clip volume must be 0..2", field="clips.volume", clip_id=cid,
+                                      fix="set volume between 0 (muted) and 2, or remove it (1.0 is the default)"))
         # v1.40.0: scene_id groups sequential clips for motion
         # continuity (see the continuity pass after the clip
         # loop). Same character rule as clip ids.
@@ -1927,8 +3846,19 @@ def validate_project(project):
                 duration = base_duration * loop_count
             else:
                 duration = base_duration / speed
+            _reframe_data = _reframe_path = None
+            _reframe_warns = []
+            if "reframe" in clip:
+                _reframe_data, _reframe_path, _reframe_warns = _validate_reframe_clip(
+                    clip, info, trim_in, trim_out, errors, cid,
+                    width, height)
             resolved.append({**clip, "src": src, "duration": duration, "trim_in": trim_in, "trim_out": trim_out, "probe": info})
-            total += duration
+            if _reframe_data is not None:
+                resolved[-1]["reframe_file"] = _reframe_path
+                _data_files[_reframe_path] = {"kind": "reframe", "data": _reframe_data}
+                _extra_warnings.extend(_reframe_warns)
+            if not _is_t1:
+                total += duration
         else:
             # Image clips have no trim: accepting trim_in/trim_out
             # would silently ignore them (duration is the image's
@@ -1940,7 +3870,7 @@ def validate_project(project):
             if "speed" in clip:
                 errors.append(err("INVALID_SCHEMA", "clip speed is only for video clips", field="clips.speed", clip_id=cid))
                 continue
-            for _vf in ("reverse", "freeze_at", "loop_count", "speed_curve", "denoise", "stabilize"):
+            for _vf in ("reverse", "freeze_at", "loop_count", "speed_curve", "denoise", "stabilize", "reframe"):
                 if _vf in clip:
                     errors.append(err("INVALID_SCHEMA", f"clip {_vf} is only for video clips", field=f"clips.{_vf}", clip_id=cid,
                                       fix=f"remove {_vf} from this image clip"))
@@ -1975,7 +3905,8 @@ def validate_project(project):
                 errors.append(err("INVALID_SCHEMA", "image clip duration must be > 0", field="clips.duration", clip_id=cid))
                 continue
             resolved.append({**clip, "src": src, "duration": duration, "probe": iinfo})
-            total += duration
+            if not _is_t1:
+                total += duration
         fit = clip.get("fit", "contain")
         if fit not in ("contain", "cover", "blur", "blur_pad"):
             errors.append(err("INVALID_SCHEMA", "fit must be 'contain', 'cover', 'blur' or 'blur_pad' (blurred background)", field="clips.fit", clip_id=cid))
@@ -1984,6 +3915,16 @@ def validate_project(project):
             errors.append(err("INVALID_SCHEMA", "ken_burns must be 'none', 'zoom_in', 'zoom_out', 'pan_left' or 'pan_right'", field="clips.ken_burns", clip_id=cid))
         elif kb != "none" and kind != "image":
             errors.append(err("INVALID_SCHEMA", "ken_burns is only for image clips", field="clips.ken_burns", clip_id=cid))
+        # Track 1 clips are full-frame overlays: cover by
+        # default (an explicit fit wins).
+        if _is_t1 and "fit" not in clip and resolved and resolved[-1].get("id") == cid:
+            resolved[-1]["fit"] = "cover"
+        # Auto sub-cuts (v1.42.0, Fix 4b): per-clip opt-out
+        # must be a boolean when present.
+        if "auto_subcuts" in clip and not isinstance(
+                clip["auto_subcuts"], bool):
+            errors.append(err("INVALID_SCHEMA", "clip auto_subcuts must be true or false", field="clips.auto_subcuts", clip_id=cid,
+                              fix="set auto_subcuts to false to keep this still frozen, or remove it"))
         for fname, lo, hi in (("brightness", -1.0, 1.0), ("contrast", 0.0, 2.0), ("saturation", 0.0, 3.0)):
             if fname in clip:
                 try:
@@ -2047,10 +3988,18 @@ def validate_project(project):
         if "grayscale" in clip and not isinstance(clip["grayscale"], bool):
             errors.append(err("INVALID_SCHEMA", "clip grayscale must be true or false", field="clips.grayscale", clip_id=cid))
         transition = clip.get("transition", "none")
-        allowed = ["none", "fade"] + list(XFADE_TRANSITIONS)
+        allowed = ["none", "fade"] + list(XFADE_TRANSITIONS) + sorted(CUSTOM_TRANSITIONS)
+        # _joined counts track 0 clips only: the first JOINED
+        # clip is what the first-clip rule is about.
+        _joined = sum(1 for _c in resolved if _c.get("track", 0) == 0)
         if transition not in allowed:
             errors.append(err("INVALID_SCHEMA", f"transition must be one of {', '.join(allowed)}", field="clips.transition", clip_id=cid))
-        elif transition in XFADE_TRANSITIONS and len(resolved) == 1:
+        elif _is_t1 and transition != "none":
+            errors.append(err("INVALID_SCHEMA", f"{transition} on a track 1 clip has nothing to transition from (track 1 clips are composited, not joined)", field="clips.transition", clip_id=cid,
+                              fix="remove transition from the track 1 clip"))
+        elif transition in XFADE_TRANSITIONS and _joined == 1:
+            errors.append(err("INVALID_SCHEMA", f"{transition} on the first clip has nothing to transition from", field="clips.transition", clip_id=cid))
+        elif transition in CUSTOM_TRANSITIONS and _joined == 1:
             errors.append(err("INVALID_SCHEMA", f"{transition} on the first clip has nothing to transition from", field="clips.transition", clip_id=cid))
         td = None
         if "transition_duration" in clip:
@@ -2061,7 +4010,12 @@ def validate_project(project):
                 td = None
             if td is not None and (td <= 0 or td > 2.0):
                 errors.append(err("INVALID_SCHEMA", "transition_duration must be > 0 and <= 2.0 seconds", field="clips.transition_duration", clip_id=cid))
-        if transition in XFADE_TRANSITIONS and len(resolved) >= 2:
+        if transition in XFADE_TRANSITIONS and _joined >= 2:
+            if td is None:
+                td = 0.5
+            if prev_duration is None or td >= duration or td >= prev_duration:
+                errors.append(err("INVALID_SCHEMA", f"{transition} transition_duration {td}s must be less than both clip durations", field="clips.transition_duration", clip_id=cid))
+        elif transition in CUSTOM_TRANSITIONS and _joined >= 2:
             if td is None:
                 td = 0.5
             if prev_duration is None or td >= duration or td >= prev_duration:
@@ -2082,16 +4036,54 @@ def validate_project(project):
         if resolved and resolved[-1].get("id") == cid:
             _validate_punch_in(clip, duration, errors, cid, resolved[-1])
         _validate_sfx(clip, errors, cid, "clips")
-        # start offset in the final timeline (after xfade overlaps)
-        if len(resolved) >= 2 and transition in XFADE_TRANSITIONS:
-            clip_starts.append(clip_starts[-1] + prev_duration - td)
-        elif resolved:
-            clip_starts.append((clip_starts[-1] + prev_duration) if clip_starts else 0.0)
-        prev_duration = duration
+        # start offset in the final timeline (after xfade
+        # overlaps). Track 1 clips keep their absolute start
+        # (they are composited, not joined); clip_starts stays
+        # aligned with resolved, one entry per clip. _prev_* track
+        # the previous TRACK 0 clip only, so a track 1 clip in
+        # the list never shifts the base timeline.
+        if _is_t1:
+            clip_starts.append(float(_t1_start))
+        elif _joined == 1:
+            clip_starts.append(0.0)
+            _prev_start0, _prev_dur0 = 0.0, duration
+        elif transition in XFADE_TRANSITIONS:
+            clip_starts.append(_prev_start0 + _prev_dur0 - td)
+            _prev_start0, _prev_dur0 = clip_starts[-1], duration
+        else:
+            clip_starts.append(_prev_start0 + _prev_dur0)
+            _prev_start0, _prev_dur0 = clip_starts[-1], duration
+        if not _is_t1:
+            prev_duration = duration
     overlap_total = sum(float(c.get("transition_duration", 0.5)) for c in resolved[1:] if c.get("transition") in XFADE_TRANSITIONS)
     total = total - overlap_total
     if total > MAX_DURATION:
         errors.append(err("DURATION_TOO_LONG", f"total duration {total:.2f}s exceeds {MAX_DURATION}s", field="clips"))
+    # Multi-track (v1.44.0, F6a): the base timeline needs at
+    # least one track 0 clip, and every track 1 clip must sit
+    # inside it (it never extends the total).
+    if not any(c.get("track", 0) == 0 for c in resolved):
+        errors.append(err("EMPTY_TIMELINE", "at least one clip must be on track 0 (the base timeline)", field="clips",
+                          fix="set track to 0 on the main clip, or remove track 1 from every clip"))
+    for _c in resolved:
+        if _c.get("track", 0) == 1:
+            _s_raw = _c.get("start")
+            if isinstance(_s_raw, bool) or not isinstance(_s_raw, (int, float)):
+                continue  # per-clip start error already recorded
+            _s = float(_s_raw); _e = _s + float(_c["duration"])
+            if _e > total + 0.05:
+                errors.append(err("CLIP_OUT_OF_RANGE", f"track 1 clip '{_c.get('id')}' runs {_s:.2f}..{_e:.2f}, past the {total:.2f}s base timeline", field="clips.start", clip_id=_c.get("id"),
+                                  fix=f"move the clip earlier or shorten it so it ends by {total:.2f}s"))
+    # Auto sub-cuts (v1.42.0, Fix 4b): generated camera paths
+    # for long stills, BEFORE the continuity pass so the pass
+    # chains their scales across same-scene clips. (info is
+    # assembled later, so the ids ride in a local until then.)
+    # Beat cutting (v1.44.0, F1): split clips at AgentMedia
+    # detect_beats times, BEFORE auto-subcuts and continuity so
+    # both see the expanded timeline. info carries the cut list.
+    resolved, clip_starts, total, _beat_cuts = _apply_beat_cut(
+        project, resolved, clip_starts, total, errors, _data_files)
+    _auto_subcut_ids = _generate_auto_subcuts(resolved, project)
     # Motion continuity (v1.40.0): sequential clips sharing a
     # scene_id chain their scales — clip N's end scale is clip
     # N+1's start scale — fixing the 1.37.2 residual where a
@@ -2113,6 +4105,12 @@ def validate_project(project):
     _prev_end = 1.0
     _prev_scene = None
     for _ci, _clip in enumerate(resolved):
+        if _clip.get("track", 0) == 1:
+            # A second-track clip does not interrupt the base
+            # timeline: it neither chains from the previous base
+            # clip nor resets the chain for the next one.
+            _clip["_motion_end"] = 1.0
+            continue
         _scene = _clip.get("scene_id")
         _continuous = _scene is not None and _scene == _prev_scene
         _start = _end = 1.0
@@ -2566,6 +4564,42 @@ def validate_project(project):
                             # broken or half-keyed overlay.
                             errors.append(err("INVALID_SCHEMA", "chroma_key cannot combine with scale keyframes (colorkey cannot handle per-frame size changes on this FFmpeg build)", field="overlays.chroma_key", clip_id=oid,
                                               fix="remove chroma_key, or use a constant overlay size (drop scale keyframes), on this overlay"))
+        if "track" in ov:
+            if ov.get("keyframes"):
+                errors.append(err("INVALID_SCHEMA", "overlay track cannot combine with keyframes (the track drives the position)", field="overlays.track", clip_id=oid,
+                                  fix="remove keyframes, or remove track, on this overlay"))
+            else:
+                _trk, _trk_path = _load_track_data(ov["track"], "overlays.track", errors, oid)
+                if _trk is not None:
+                    rov["track_file"] = _trk_path
+                    # Offsets are ELEMENT properties, not file data:
+                    # two elements sharing one track file with
+                    # different offsets must not overwrite each
+                    # other in data_files (R3: an overlay inherited
+                    # a text's offset_y=-60 through the shared key).
+                    rov["track_offset"] = {"x": _trk["offset_x"],
+                                           "y": _trk["offset_y"]}
+                    _data_files[_trk_path] = {
+                        "kind": "track",
+                        "data": {"frame_size": _trk["frame_size"],
+                                 "track": _trk["track"]}}
+                    # Track times are ELEMENT-RELATIVE
+                    # (v1.44.0, F2, corrected R3): the track is
+                    # sampled in the overlay's source time (t -
+                    # start + trim_in), so it must cover
+                    # [trim_in, trim_in + duration], not the
+                    # absolute timeline window.
+                    _ti = float(rov.get("trim_in", 0))
+                    _tw0 = _ti
+                    _tw1 = _ti + float(rov["duration"])
+                    _t0 = _trk["track"][0]["t"]; _t1 = _trk["track"][-1]["t"]
+                    if _t1 < _tw0 or _t0 > _tw1:
+                        errors.append(err("INVALID_SCHEMA", f"track covers {_t0:.2f}..{_t1:.2f}s but the overlay source time runs {_tw0:.2f}..{_tw1:.2f}s (no overlap)", field="overlays.track", clip_id=oid,
+                                          fix="use a track file covering the overlay's source time (t - start + trim_in), or shorten the overlay"))
+                    elif _t0 > _tw0 or _t1 < _tw1:
+                        _extra_warnings.append({"code": "track_partial_coverage",
+                                                "message": f"overlay '{oid}' track covers {_t0:.2f}..{_t1:.2f}s but the overlay source time runs {_tw0:.2f}..{_tw1:.2f}s; the first/last track point is held outside the track",
+                                                "clip_id": oid})
         resolved_overlays.append(rov)
     for label, items in (("texts", project.get("texts") or []), ("captions", project.get("captions") or [])):
         if not isinstance(items, list):
@@ -2595,6 +4629,46 @@ def validate_project(project):
             if item.get("style") is not None and item["style"] not in TEXT_STYLES:
                 errors.append(err("INVALID_SCHEMA", "text style must be one of: " + ", ".join(sorted(TEXT_STYLES)), field=label + ".style",
                                   fix="set style to one of: " + ", ".join(sorted(TEXT_STYLES)) + ", or remove it"))
+            # v1.44.0: animated text presets + follow_track.
+            _preset = item.get("preset")
+            if _preset is not None and _preset not in TEXT_PRESETS:
+                errors.append(err("INVALID_SCHEMA", "text preset must be one of: " + ", ".join(TEXT_PRESETS), field=label + ".preset",
+                                  fix="set preset to one of: " + ", ".join(TEXT_PRESETS) + ", or remove it"))
+            if _preset is not None and item.get("word_timings"):
+                errors.append(err("INVALID_SCHEMA", "text preset cannot combine with word_timings (both drive the word reveal)", field=label + ".preset",
+                                  fix="use preset or word_timings on this text, not both"))
+            if _preset is not None and item.get("animation"):
+                errors.append(err("INVALID_SCHEMA", "text preset cannot combine with animation (the preset sets the entrance)", field=label + ".preset",
+                                  fix="use preset or animation on this text, not both"))
+            if _preset is not None and item.get("reveal"):
+                errors.append(err("INVALID_SCHEMA", "text preset cannot combine with reveal (the preset sets the entrance)", field=label + ".preset",
+                                  fix="use preset or reveal on this text, not both"))
+            if "track" in item:
+                if item.get("keyframes"):
+                    errors.append(err("INVALID_SCHEMA", "text track cannot combine with keyframes (the track drives the position)", field=label + ".track",
+                                      fix="remove keyframes, or remove track, on this text"))
+                else:
+                    _trk, _trk_path = _load_track_data(item["track"], label + ".track", errors)
+                    if _trk is not None:
+                        # Offsets stay on the element (item["track"]);
+                        # the shared entry holds pure file data only
+                        # (see the overlay block above).
+                        _data_files[_trk_path] = {
+                            "kind": "track",
+                            "data": {"frame_size": _trk["frame_size"],
+                                     "track": _trk["track"]}}
+                        # Track times are ELEMENT-RELATIVE
+                        # (v1.44.0, F2, corrected R3): sampled in
+                        # the text's source time (t - start), so
+                        # the track must cover [0, end - start].
+                        _tdur = end - start
+                        _t0 = _trk["track"][0]["t"]; _t1 = _trk["track"][-1]["t"]
+                        if _t1 < 0 or _t0 > _tdur:
+                            errors.append(err("INVALID_SCHEMA", f"track covers {_t0:.2f}..{_t1:.2f}s but the text source time runs 0..{_tdur:.2f}s (no overlap)", field=label + ".track",
+                                              fix="use a track file covering the text's source time (t - start), or shorten the text"))
+                        elif _t0 > 0 or _t1 < _tdur:
+                            _extra_warnings.append({"code": "track_partial_coverage",
+                                                    "message": f"{label} text track covers {_t0:.2f}..{_t1:.2f}s but the text source time runs 0..{_tdur:.2f}s; the first/last track point is held outside the track"})
             fi = fo = 0.0
             for fname in ("fade_in", "fade_out"):
                 try:
@@ -2611,9 +4685,9 @@ def validate_project(project):
             if fi + fo >= (end - start):
                 errors.append(err("INVALID_SCHEMA", f"{label} fade_in + fade_out must be less than the text duration", field=label))
             anim = item.get("animation")
-            if anim is not None and anim not in ("slide_in", "slide_out", "slide_in_out", "pop"):
-                errors.append(err("INVALID_SCHEMA", "text animation must be slide_in, slide_out, slide_in_out or pop", field=label + ".animation",
-                                  fix="set animation to slide_in, slide_out, slide_in_out or pop, or remove it"))
+            if anim is not None and anim not in ("slide_in", "slide_out", "slide_in_out", "pop", "pop_in"):
+                errors.append(err("INVALID_SCHEMA", "text animation must be slide_in, slide_out, slide_in_out, pop or pop_in", field=label + ".animation",
+                                  fix="set animation to slide_in, slide_out, slide_in_out, pop or pop_in, or remove it"))
             ad = item.get("animation_duration", 1.0)
             try:
                 ad = float(ad)
@@ -2628,7 +4702,7 @@ def validate_project(project):
                 elif anim == "slide_in_out" and 2 * ad >= (end - start):
                     errors.append(err("INVALID_SCHEMA", "slide_in_out needs animation_duration less than half the text duration", field=label + ".animation_duration",
                                       fix="shorten animation_duration, or lengthen the text window"))
-                elif anim in ("slide_in", "slide_out", "pop") and ad >= (end - start):
+                elif anim in ("slide_in", "slide_out", "pop", "pop_in") and ad >= (end - start):
                     errors.append(err("INVALID_SCHEMA", "animation_duration must be less than the text duration", field=label + ".animation_duration",
                                       fix="shorten animation_duration, or lengthen the text window"))
             reveal = item.get("reveal")
@@ -2640,6 +4714,69 @@ def validate_project(project):
                 errors.append(err("INVALID_SCHEMA", "text reveal cannot combine with animation",
                                   field=label + ".reveal",
                                   fix="use reveal or animation, not both, on one text"))
+            # Title badge (v1.42.0, Fix 4c): a text (titles only,
+            # never captions) shows big until shrink_after, then
+            # shrinks to a small top badge for the rest of its
+            # window. shrink_after must leave >= 0.5s on each
+            # side (the badge fades in over 0.3s). It cannot
+            # combine with word_timings (the ASS event would
+            # span the whole window) or reveal (prefix expansion
+            # conflicts with the split); an animation is allowed
+            # on the big window only, so its duration must fit
+            # inside the big window too.
+            if label == "captions" and "shrink_after" in item:
+                errors.append(err("INVALID_SCHEMA", "shrink_after is for titles (texts), not captions",
+                                  field=label + ".shrink_after",
+                                  fix="remove shrink_after from this caption, or move the shrink to a title text"))
+            _shrink = None
+            if label == "texts" and "shrink_after" in item:
+                try:
+                    _shrink = float(item["shrink_after"])
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "text shrink_after must be a number of timeline seconds",
+                                      field=label + ".shrink_after",
+                                      fix="set shrink_after to e.g. 6.0, or remove it"))
+                    _shrink = None
+                if _shrink is not None:
+                    if not start + 0.5 <= _shrink <= end - 0.5:
+                        errors.append(err("INVALID_SCHEMA", "text shrink_after must leave at least 0.5s on each side of the window",
+                                          field=label + ".shrink_after",
+                                          fix=f"set shrink_after between {start + 0.5:.2f} and {end - 0.5:.2f}"))
+                    if item.get("word_timings"):
+                        errors.append(err("INVALID_SCHEMA", "text shrink_after cannot combine with word_timings",
+                                          field=label + ".shrink_after",
+                                          fix="use shrink_after on a plain title, or word_timings without it"))
+                    if reveal == "word":
+                        errors.append(err("INVALID_SCHEMA", "text shrink_after cannot combine with reveal",
+                                          field=label + ".shrink_after",
+                                          fix="use shrink_after or word reveal, not both, on one text"))
+                    if anim is not None and ad is not None and ad >= (_shrink - start):
+                        errors.append(err("INVALID_SCHEMA", "text animation_duration must be less than the big window before shrink_after",
+                                          field=label + ".animation_duration",
+                                          fix="shorten animation_duration, or move shrink_after later"))
+                for _sfield, _slo, _shi in (("shrink_size", 8, 240),
+                                            ("shrink_y", 0, 10000)):
+                    if _sfield in item:
+                        try:
+                            _sv = float(item[_sfield])
+                        except (TypeError, ValueError):
+                            errors.append(err("INVALID_SCHEMA", f"text {_sfield} must be a number",
+                                              field=label + "." + _sfield,
+                                              fix=f"set {_sfield} to a number, or remove it"))
+                            continue
+                        if not _slo <= _sv <= _shi:
+                            errors.append(err("INVALID_SCHEMA", f"text {_sfield} must be {_slo}..{_shi}",
+                                              field=label + "." + _sfield,
+                                              fix=f"set {_sfield} between {_slo} and {_shi}"))
+            if "shrink_size" in item or "shrink_y" in item:
+                if label == "captions":
+                    errors.append(err("INVALID_SCHEMA", "shrink_size/shrink_y are for titles (texts), not captions",
+                                      field=label + ".shrink_after",
+                                      fix="remove shrink_size/shrink_y from this caption"))
+                elif "shrink_after" not in item:
+                    errors.append(err("INVALID_SCHEMA", "text shrink_size/shrink_y need shrink_after",
+                                      field=label + ".shrink_after",
+                                      fix="add shrink_after, or remove shrink_size/shrink_y"))
             if "stroke" in item:
                 try:
                     st = int(item["stroke"])
@@ -2730,6 +4867,23 @@ def validate_project(project):
                 errors.append(err("INVALID_SCHEMA", "text color must be a #RRGGBB hex value or one of: " + ", ".join(sorted(TEXT_COLORS)), field=label + ".color"))
             if "box" in item and not isinstance(item["box"], bool):
                 errors.append(err("INVALID_SCHEMA", "text box must be true or false", field=label + ".box"))
+            # v1.41.0: font option — a bundled font by registry
+            # key (noto-sans-bold is the Arabic display face).
+            if "font" in item:
+                if not isinstance(item["font"], str) or item["font"] not in BUNDLED_FONTS:
+                    errors.append(err("INVALID_SCHEMA", "text font must be one of: " + ", ".join(sorted(BUNDLED_FONTS)), field=label + ".font",
+                                      fix="set font to a bundled font, e.g. 'noto-sans-bold' for Arabic display titles, or remove it for the script default"))
+                elif find_bundled_font(item["font"]) is None:
+                    errors.append(err("FONT_NOT_FOUND", "bundled font '" + item["font"] + "' file is missing", field=label + ".font",
+                                      fix="restore the bundled fonts/ directory, or remove the font option"))
+            # v1.41.0: hold — kinetic text base words persist to
+            # the text's own end by default (scene titles stay
+            # for the whole scene); false keeps the old
+            # chunk-window behaviour. Render applies it on the
+            # text path only; captions stay timed cues.
+            if "hold" in item and not isinstance(item["hold"], bool):
+                errors.append(err("INVALID_SCHEMA", "text hold must be true or false", field=label + ".hold",
+                                  fix="set hold to true (base words persist to the text end) or false (old chunk-window behaviour), or remove it"))
             position = item.get("position")
             if position is not None and position not in TEXT_POSITIONS:
                 errors.append(err("INVALID_SCHEMA", "text position must be one of: " + ", ".join(sorted(TEXT_POSITIONS)), field=label + ".position"))
@@ -2796,17 +4950,18 @@ def validate_project(project):
     # Caption wrapping controls (v1.36.0): cues wider than
     # caption_max_width (fraction of frame width) word-wrap into
     # centred lines stacked at caption_line_spacing x size.
-    # Defaults 0.9 / 1.35 keep old single-line renders identical.
+    # Default 0.8 (v1.41.0 Fix 2 cap) / 1.35; explicit 0.9 still
+    # available for projects that want the old wider block.
     if "caption_max_width" in project:
         try:
             _cmw = float(project["caption_max_width"])
         except (TypeError, ValueError):
             errors.append(err("INVALID_SCHEMA", "caption_max_width must be a number", field="caption_max_width",
-                              fix="set caption_max_width to a fraction of the frame width, e.g. 0.9"))
+                              fix="set caption_max_width to a fraction of the frame width, e.g. 0.8"))
             _cmw = None
         if _cmw is not None and not 0.5 <= _cmw <= 1.0:
             errors.append(err("INVALID_SCHEMA", "caption_max_width must be 0.5..1.0", field="caption_max_width",
-                              fix="set caption_max_width between 0.5 and 1.0 (0.9 = 90% of the frame width)"))
+                              fix="set caption_max_width between 0.5 and 1.0 (0.8 = 80% of the frame width)"))
     if "caption_line_spacing" in project:
         try:
             _cls = float(project["caption_line_spacing"])
@@ -2978,6 +5133,8 @@ def validate_project(project):
     video_bitrate = None
     loudness_target = -16.0
     master_loudnorm = False
+    loudnorm_i = -14.0
+    color_pipeline = "yuv"
     if isinstance(output, dict):
         if "video_bitrate" in output:
             vb = output["video_bitrate"]
@@ -3011,6 +5168,32 @@ def validate_project(project):
                                   fix="set master_loudnorm to true to master the final mix at -14 LUFS, or remove it"))
             else:
                 master_loudnorm = output["master_loudnorm"]
+        if "loudnorm_i" in output:            # v1.41.0: master loudnorm target. Default -14
+            # (the established video master standard; the
+            # spec's -16 is selectable here, not forced,
+            # because -14 is what every delivery preset and
+            # the v1 verified output used).
+            try:
+                _li = float(output["loudnorm_i"])
+            except (TypeError, ValueError):
+                errors.append(err("INVALID_SCHEMA", "output loudnorm_i must be a number", field="output.loudnorm_i",
+                                  fix="set loudnorm_i to a LUFS value such as -14 or -16, or remove it"))
+                _li = None
+            if _li is not None:
+                if not -70.0 <= _li <= -5.0:
+                    errors.append(err("INVALID_SCHEMA", "output loudnorm_i must be -70..-5 LUFS", field="output.loudnorm_i",
+                                      fix="set loudnorm_i between -70 and -5, e.g. -14"))
+                else:
+                    loudnorm_i = _li
+        if "color_pipeline" in output:
+            # v1.41.0 (Fix 1): "yuv" (default, current
+            # behaviour) or "rgb" (full-range gbrp internal
+            # graph + single final conversion to yuv420p).
+            if output["color_pipeline"] not in ("yuv", "rgb"):
+                errors.append(err("INVALID_SCHEMA", "output color_pipeline must be 'yuv' or 'rgb'", field="output.color_pipeline",
+                                  fix="set color_pipeline to 'rgb' for the full-range internal graph, or remove it (default 'yuv')"))
+            else:
+                color_pipeline = output["color_pipeline"]
     # Pro pack: chapters. An explicit list of {title, start} written
     # into the output file's metadata at render time. Starts must
     # strictly increase and stay inside the timeline; each chapter
@@ -3168,12 +5351,59 @@ def validate_project(project):
             if voice_index is not None and amount_db is not None and fade is not None and windows is not None:
                 ducking = {"voice_index": voice_index, "amount_db": amount_db,
                            "fade": fade, "windows": windows}
+    # v1.41.0: duck_amount_db — an explicit, gentler ducking
+    # depth for the automatic music duck. Precedence, exactly:
+    # explicit ducking object > duck_amount_db > auto sidechain
+    # (auto_duck true, voice + music present) > plain mix.
+    # When set and no explicit ducking exists, it synthesizes
+    # the same deterministic ducking object at the given depth
+    # (same window derivation from the voice track), so the old
+    # 12 dB default is a choice, not a trap: a bed at volume
+    # 0.3 under 12 dB of ducking sits ~22 dB under narration
+    # (measured on the AI-race mix: voice -15.99 LUFS, bed
+    # -16.37 LUFS, 0.3 = -10.46 dB, minus 12 dB = -38.83 LUFS
+    # effective) and is inaudible on phone speakers.
+    raw_dadb = project.get("duck_amount_db")
+    if ducking is None and raw_dadb is not None:
+        try:
+            dadb = float(raw_dadb)
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA", "duck_amount_db must be a number", field="duck_amount_db",
+                              fix="set duck_amount_db to a number 0..30, e.g. 6 for a gentler duck, or remove it"))
+            dadb = None
+        if dadb is not None:
+            if isinstance(raw_dadb, bool) or not 0 <= dadb <= 30:
+                errors.append(err("INVALID_SCHEMA", "duck_amount_db must be 0..30 dB", field="duck_amount_db",
+                                  fix="set duck_amount_db between 0 and 30"))
+            else:
+                _vidx = next((i for i, t in enumerate(resolved_audio) if t.get("kind") == "voice"), None)
+                _has_music = any(t.get("kind") == "music" for t in resolved_audio)
+                if _vidx is None:
+                    errors.append(err("INVALID_SCHEMA", "duck_amount_db needs a voice track to duck under", field="duck_amount_db",
+                                      fix="add a voice audio track, or remove duck_amount_db"))
+                elif not _has_music:
+                    errors.append(err("INVALID_SCHEMA", "duck_amount_db needs a music track to duck", field="duck_amount_db",
+                                      fix="add a music audio track, or remove duck_amount_db"))
+                else:
+                    _vt = resolved_audio[_vidx]
+                    _vp = probe_media(_vt.get("src", ""))
+                    if _vp is None or _vp.get("duration") is None:
+                        errors.append(err("CLIP_OUT_OF_RANGE", "duck_amount_db cannot derive a window: the voice track duration could not be probed", field="duck_amount_db",
+                                          fix="give explicit ducking windows, or replace the voice track with a file ffprobe can read"))
+                    else:
+                        _vs = float(_vt.get("start", 0))
+                        _ve = min(_vs + float(_vp["duration"]), total)
+                        _wins = [{"start": _vs, "end": _ve}] if _ve > _vs else []
+                        ducking = {"voice_index": _vidx, "amount_db": dadb,
+                                   "fade": 0.25, "windows": _wins}
     # Delta: explicit auto-duck switch. Precedence, exactly:
-    # explicit ducking object > auto sidechain (auto_duck true,
-    # voice + music present, no explicit ducking) > plain mix.
+    # explicit ducking object > duck_amount_db (v1.41.0) > auto
+    # sidechain (auto_duck true, voice + music present, no
+    # explicit ducking) > plain mix.
     # Default True is the pre-delta behaviour, so existing
     # projects render identically; False disables only the auto
-    # path (an explicit ducking object still wins over False).
+    # path (an explicit ducking object and duck_amount_db still
+    # win over False).
     auto_duck = True
     raw_auto = project.get("auto_duck")
     if raw_auto is not None:
@@ -3182,6 +5412,47 @@ def validate_project(project):
                               fix="set auto_duck to false to disable automatic sidechain ducking, or remove it (default true)"))
         else:
             auto_duck = raw_auto
+    # Collision-proof layout (v1.41.0): resolve_overlaps must
+    # be a boolean when present; True moves keyword pops
+    # below overlapped boxes (see check_layer_text_overlap).
+    if "resolve_overlaps" in project and not isinstance(
+            project["resolve_overlaps"], bool):
+        errors.append(err("INVALID_SCHEMA",
+                          "resolve_overlaps must be true or false",
+                          field="resolve_overlaps",
+                          fix="set resolve_overlaps to true to auto-move "
+                              "overlapping keyword pops, or remove it"))
+    # Auto sub-cuts (v1.42.0, Fix 4b): auto_subcuts must be a
+    # boolean when present; True (the default) generates
+    # multi-stop camera paths for still-image clips longer
+    # than 12s. Per-clip auto_subcuts is validated in the
+    # clip loop, next to ken_burns.
+    if "auto_subcuts" in project and not isinstance(
+            project["auto_subcuts"], bool):
+        errors.append(err("INVALID_SCHEMA",
+                          "auto_subcuts must be true or false",
+                          field="auto_subcuts",
+                          fix="set auto_subcuts to false to keep long "
+                              "stills frozen, or remove it"))
+    # SFX discipline (v1.42.0, Fix 5): sfx_attenuation_db is
+    # the dB below the voiceover for auto-SFX (default 16,
+    # the spec's -14..-18 band); 0..30.
+    if "sfx_attenuation_db" in project:
+        try:
+            _att = float(project["sfx_attenuation_db"])
+        except (TypeError, ValueError):
+            errors.append(err("INVALID_SCHEMA",
+                              "sfx_attenuation_db must be a number",
+                              field="sfx_attenuation_db",
+                              fix="set sfx_attenuation_db between 0 and "
+                                  "30, e.g. 16, or remove it"))
+            _att = None
+        if _att is not None and not 0 <= _att <= 30:
+            errors.append(err("INVALID_SCHEMA",
+                              "sfx_attenuation_db must be 0..30",
+                              field="sfx_attenuation_db",
+                              fix="set sfx_attenuation_db between 0 and "
+                                  "30, e.g. 16"))
     # Animated stroke diagrams (v1.38.0): validated after the
     # overlays so diagram ids can be checked against overlay ids.
     # Diagrams are resolved data (strokes/templates expanded),
@@ -3189,20 +5460,82 @@ def validate_project(project):
     # in project.json and regenerate the animation at render.
     resolved_diagrams = _validate_diagrams(
         project, total, {ov["id"] for ov in resolved_overlays}, errors)
+    # Motion graphics (v1.43.0): validated after the diagrams so
+    # motion ids can be checked against overlay and diagram ids.
+    resolved_motion = _validate_motion(
+        project, total, width, height, fps,
+        {ov["id"] for ov in resolved_overlays},
+        {dg["id"] for dg in resolved_diagrams}, errors)
+    # Typography profile (v1.44.0, F4): project-level default
+    # style, opt-in only — a project without `typography`
+    # renders exactly as before.
+    _typography = {}
+    if "typography" in project:
+        _typo = project["typography"]
+        if not isinstance(_typo, dict):
+            errors.append(err("INVALID_SCHEMA", "typography must be an object", field="typography",
+                              fix="set typography to {default_style: 'display'}, or remove it"))
+        elif _typo.get("default_style") is not None and _typo["default_style"] not in TEXT_STYLES:
+            errors.append(err("INVALID_SCHEMA", "typography default_style must be one of: " + ", ".join(sorted(TEXT_STYLES)), field="typography.default_style",
+                              fix="set default_style to one of: " + ", ".join(sorted(TEXT_STYLES)) + ", or remove it"))
+        elif _typo.get("default_style"):
+            _typography = {"default_style": _typo["default_style"]}
+    # Adjustment layers (v1.44.0, F6b): grade/effects windows
+    # over the base video only.
+    _adjustments = _validate_adjustments(project, total, errors)
+    # Custom transitions (v1.44.0, F5): the post-join effect pass
+    # straddles each cut; the cut time is the clip's timeline
+    # start (clip_starts already accounts for xfade overlaps
+    # elsewhere in the join, and for beat-cut expansion above).
+    _custom_transitions = [
+        {"time": clip_starts[i], "kind": c.get("transition"),
+         "duration": float(c.get("transition_duration", 0.5)),
+         "clip_id": c.get("id")}
+        for i, c in enumerate(resolved)
+        if c.get("transition") in CUSTOM_TRANSITIONS
+        and i < len(clip_starts)]
     info = {"width": width, "height": height, "fps": fps, "clips": resolved,
             "total_duration": total, "clip_starts": clip_starts, "font": font,
             "captions": merged_captions, "overlays": resolved_overlays,
             "diagrams": resolved_diagrams,
+            "motion": resolved_motion,
             "audio": resolved_audio,
             "chapters": chapters, "ducking": ducking,
             "auto_duck": auto_duck,
+            "auto_subcuts": _auto_subcut_ids,
             "video_bitrate": video_bitrate, "loudness_target": loudness_target,
-            "master_loudnorm": master_loudnorm}
+            "master_loudnorm": master_loudnorm, "loudnorm_i": loudnorm_i,
+            "color_pipeline": color_pipeline,
+            "beat_cuts": _beat_cuts, "typography": _typography,
+            "custom_transitions": _custom_transitions,
+            "adjustments": _adjustments, "data_files": _data_files}
     # Layer/text collision is warnings-only: it never adds errors.
     try:
-        info["warnings"] = check_layer_text_overlap(project, info)
+        info["warnings"], info["overlap_moves"] = \
+            check_layer_text_overlap(project, info)
     except Exception:
         info["warnings"] = []
+        info["overlap_moves"] = []
+    # v1.44.0: data-file warnings (track / reframe partial
+    # coverage) collected during validation.
+    info["warnings"].extend(_extra_warnings)
+    # Vertical zones (v1.42.0, Fix 3): strict bands; callout
+    # moves are recorded in info["zone_moves"] and applied by
+    # the renderer after overlap_moves (zone wins on conflict).
+    try:
+        _zw, info["zone_moves"] = check_vertical_zones(
+            project, info, info.get("overlap_moves"))
+        info["warnings"].extend(_zw)
+    except Exception:
+        info["zone_moves"] = []
+    # SFX discipline (v1.42.0, Fix 5): the cooldown /
+    # attenuation / pitch plan for auto-SFX. Computed here so
+    # the validate tool reports it; the renderer consumes it.
+    try:
+        info["sfx_plan"] = compute_sfx_plan(project, info)
+    except Exception:
+        info["sfx_plan"] = {"kept": [], "dropped": [],
+                            "attenuation_db": 16.0}
     # Static-shot warnings (v1.37.0, warnings only, never
     # blocking): a still-image clip longer than 4.5s with no
     # motion of any kind — no explicit or default Ken Burns, no
@@ -3268,6 +5601,15 @@ def validate_project(project):
                 for _dg in (info.get("diagrams") or []):
                     _ds, _de = float(_dg["start"]), float(_dg["end"])
                     if _ds < _ce and _de > _cs:
+                        _animated = True
+                        break
+            if not _animated:
+                # A motion-graphics element over the still is
+                # motion too (v1.43.0): it animates across its
+                # window even though the underlying clip is a still.
+                for _me in (info.get("motion") or []):
+                    _ms, _me2 = float(_me["start"]), float(_me["end"])
+                    if _ms < _ce and _me2 > _cs:
                         _animated = True
                         break
             if _animated:

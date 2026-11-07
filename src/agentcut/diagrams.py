@@ -9,25 +9,26 @@ frame is exactly the complete diagram (the animation is
 monotonic — nothing ever disappears — so the held final frame
 after the draw window is pixel-identical to the complete art).
 
-Rendering is stdlib + FFmpeg only, like the rest of AgentCut.
-The diagram is drawn into RGBA frames with a small stdlib PNG
-writer's sibling rasterizer (no PIL, no new dependencies):
-chalk strokes are stamped discs along a sampled path, with
-slightly irregular edges and a deterministic grain. The
-irregularity is baked into the path ONCE (a static function of
-position along the stroke), so every frame of the animation
-shows the same stroke shape — there is deliberately NO animated
-jitter, which would read as vibration. Frames are piped as
-rawvideo into FFmpeg and encoded to a temporary transparent
-(PNG codec, RGBA) video; the main render composites that video
-with the normal overlay filter and loops its last frames for
-the hold after the draw window ends.
+Rendering is stdlib + FFmpeg only, like the rest of AgentCut
+(PIL, when already present, is used automatically for a 2x
+supersampled path — never required). The diagram is drawn into
+RGBA frames with a small stdlib rasterizer: strokes are
+continuous capsule SDF segments along a sampled path (v1.41.0,
+Fix 3 — clean vector lines; the stamped discs and their chalk
+grain are gone by design). The wobble is baked into the path
+ONCE (a static function of position along the stroke), so every
+frame of the animation shows the same stroke shape — there is
+deliberately NO animated jitter, which would read as vibration.
+Frames are piped as rawvideo into FFmpeg and encoded to a
+temporary transparent (PNG codec, RGBA) video; the main render
+composites that video with the normal overlay filter and loops
+its last frames for the hold after the draw window ends.
 
 Artwork rules (serious, not childish): clean geometry, correct
-proportions, one consistent chalk weight per stroke, subtle
-chalk texture only, and two chalk colours — white for the
-drawing, yellow for emphasis only. Labels are NEVER baked into
-a diagram: templates take no text, and every label on screen
+proportions, one consistent stroke weight per stroke, and two
+colours — white for the drawing, yellow for emphasis only.
+Labels are NEVER baked into a diagram: templates take no text,
+and every label on screen
 is an AgentCut text (drawtext), so Arabic labels keep the
 BiDi-verified path and never become AI-generated image text.
 
@@ -64,6 +65,11 @@ import math
 import struct
 import subprocess
 import zlib
+
+try:
+    from PIL import Image as _PIL_IMAGE
+except Exception:
+    _PIL_IMAGE = None
 
 CHALK_WHITE = (246, 246, 238)
 CHALK_YELLOW = (250, 204, 21)
@@ -318,11 +324,18 @@ def stroke_weight(stroke, points):
 
 
 class Canvas:
-    """RGBA chalk canvas: stamped discs, max-alpha wins."""
+    """RGBA chalk canvas: stamped discs, max-alpha wins.
 
-    def __init__(self, width, height):
+    ss is the buffer's supersample factor relative to output
+    coordinates (1 = direct; 2 = the internal buffer of
+    _ScaledCanvas). draw_segments divides the SDF ramp by ss so
+    a supersampled edge downscales to the same 1-output-pixel
+    ramp as the 1x engine, and scales the gap threshold by ss."""
+
+    def __init__(self, width, height, ss=1):
         self.width = int(width)
         self.height = int(height)
+        self.ss = int(ss)
         self.buf = bytearray(self.width * self.height * 4)
 
     def stamp(self, x, y, radius, color, alpha, seed):
@@ -370,12 +383,122 @@ class Canvas:
         for (x, y) in points:
             self.stamp(x, y, radius, color, alpha, seed)
 
+    def draw_segments(self, points, color, width, alpha, seed=None):
+        """Draw consecutive point pairs as capsule SDF segments
+        (v1.41.0, Fix 3) — the diagram path's line engine,
+        replacing stamped discs. For a segment P1-P2, per-pixel
+        point-to-segment distance d gives coverage
+        alpha * clamp(0.5 + (r - d) / ss, 0, 1): continuous
+        lines with no bead gaps and no staircasing, unlike disc
+        stamps whose edges scallop. Segments break at jumps
+        over 15 output pixels (arrow-barb jumps of head_size
+        30-40px), so barbs never draw connecting lines; the
+        wobble baked into the points is preserved (capsules
+        between wobbled points keep the hand-drawn path). No
+        chalk grain: clean vector lines (documented aesthetic
+        change — the grain went with the discs). Max-alpha wins,
+        same compositing as stamp, so re-drawing a segment is
+        idempotent. seed is accepted for call-site
+        compatibility and ignored (grain is gone)."""
+        pts = [(float(x), float(y)) for x, y in points]
+        if len(pts) < 2:
+            return
+        r = float(width) / 2.0
+        ss = self.ss
+        gap = 15.0 * ss
+        buf = self.buf
+        w = self.width
+        h = self.height
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            dx = x2 - x1
+            dy = y2 - y1
+            seg_len2 = dx * dx + dy * dy
+            if seg_len2 > gap * gap:
+                continue
+            pad = r + 1.0
+            x0 = max(0, int(math.floor(min(x1, x2) - pad)))
+            x1i = min(w - 1, int(math.ceil(max(x1, x2) + pad)))
+            y0 = max(0, int(math.floor(min(y1, y2) - pad)))
+            y1i = min(h - 1, int(math.ceil(max(y1, y2) + pad)))
+            if x1i < x0 or y1i < y0:
+                continue
+            for yy in range(y0, y1i + 1):
+                for xx in range(x0, x1i + 1):
+                    px = xx + 0.5
+                    py = yy + 0.5
+                    if seg_len2 == 0:
+                        d = math.hypot(px - x1, py - y1)
+                    else:
+                        t = ((px - x1) * dx + (py - y1) * dy) / seg_len2
+                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                        d = math.hypot(px - (x1 + t * dx),
+                                       py - (y1 + t * dy))
+                    # Clamp the COVERAGE first, then scale by
+                    # the stroke alpha (interior pixels land at
+                    # exactly alpha, matching the stamped path's
+                    # alpha * edge with edge <= 1).
+                    cov = 0.5 + (r - d) / ss
+                    if cov <= 0.0:
+                        continue
+                    if cov > 1.0:
+                        cov = 1.0
+                    v = alpha * cov
+                    idx = (yy * w + xx) * 4
+                    old_a = buf[idx + 3] / 255.0
+                    if v > old_a:
+                        buf[idx] = color[0]
+                        buf[idx + 1] = color[1]
+                        buf[idx + 2] = color[2]
+                        buf[idx + 3] = int(round(v * 255))
+
     def bytes(self):
         return bytes(self.buf)
 
     def opaque_pixel_count(self):
         """Pixels with any chalk on them (alpha > 0)."""
         return sum(1 for i in range(3, len(self.buf), 4) if self.buf[i] > 0)
+
+
+class _ScaledCanvas:
+    """2x supersampled canvas (v1.41.0, Fix 3, PIL auto-path).
+
+    Draws into a 2x Canvas (same SDF engine, ss=2 so the edge
+    ramp stays 1 output pixel wide) and downscales with PIL
+    LANCZOS on bytes(). Only built when PIL is importable;
+    otherwise _new_canvas returns a plain Canvas (stdlib path).
+    No new REQUIRED dependency — the stdlib-only default stands
+    wherever PIL is absent."""
+
+    def __init__(self, width, height):
+        self.width = int(width)
+        self.height = int(height)
+        self._inner = Canvas(2 * self.width, 2 * self.height, ss=2)
+
+    def draw_segments(self, points, color, width, alpha, seed=None):
+        pts = [(float(x) * 2.0, float(y) * 2.0) for x, y in points]
+        self._inner.draw_segments(pts, color, float(width) * 2.0,
+                                  alpha, seed)
+
+    def bytes(self):
+        raw = self._inner.bytes()
+        img = _PIL_IMAGE.frombytes(
+            "RGBA", (2 * self.width, 2 * self.height), raw)
+        return img.resize((self.width, self.height),
+                          _PIL_IMAGE.LANCZOS).tobytes()
+
+    def opaque_pixel_count(self):
+        b = self.bytes()
+        return sum(1 for i in range(3, len(b), 4) if b[i] > 0)
+
+
+def _new_canvas(width, height):
+    """PIL-aware diagram canvas: 2x supersampled when PIL is
+    importable, else the stdlib 1x Canvas. Both paths preserve
+    the animator-last-frame == direct-render property (each
+    path self-consistent)."""
+    if _PIL_IMAGE is not None:
+        return _ScaledCanvas(width, height)
+    return Canvas(width, height)
 
 
 _STAMP_MASK_CACHE = {}
@@ -442,19 +565,19 @@ def render_diagram_rgba(strokes, width, height, progress=1.0):
     stroke is partial, later strokes are absent. At progress
     1.0 this is exactly the complete diagram, and the
     animator's last frame is byte-identical to it (same
-    stamps, same order).
+    segments, same order, same canvas path).
     """
     prepared = _prepare_strokes(strokes)
     total = sum(p[5] for p in prepared)
     target = max(0.0, min(1.0, float(progress))) * total
-    canvas = Canvas(width, height)
+    canvas = _new_canvas(width, height)
     acc = 0.0
     for points, color, wdt, alpha, seed, weight in prepared:
         if target <= acc:
             break
         take = target - acc
         n = len(points) if take >= weight else max(0, int(round(len(points) * take / weight))) if weight > 0 else 0
-        canvas.draw_points(points[:n], color, wdt, alpha, seed)
+        canvas.draw_segments(points[:n], color, wdt, alpha, seed)
         acc += weight
     return canvas.bytes()
 
@@ -480,13 +603,78 @@ def write_png_rgba(path, width, height, rgba):
     return path
 
 
+def rounded_card_rgba(width, height, color, opacity):
+    """RGBA bytes for a rounded translucent rectangle (v1.41.0,
+    Fix 6): the static backdrop card composited UNDER a diagram
+    for its whole window. Corner radius is 4% of the short side
+    (min 8px); the edge falls off over 2px with a smoothstep, the
+    same soft edge the stroke rasterizer uses, so card corners
+    never show aliasing steps. color is an (r, g, b) tuple,
+    opacity a 0..1 float; interior alpha is opacity x 255."""
+    w, h = int(width), int(height)
+    r = max(8, int(round(0.04 * min(w, h))))
+    cx, cy = w / 2.0, h / 2.0
+    hx, hy = w / 2.0 - r, h / 2.0 - r
+    cr, cg, cb = (int(color[0]), int(color[1]), int(color[2]))
+    a_full = max(0.0, min(1.0, float(opacity))) * 255.0
+    out = bytearray(w * h * 4)
+    for y in range(h):
+        qy = abs(y + 0.5 - cy) - hy
+        row = y * w * 4
+        for x in range(w):
+            qx = abs(x + 0.5 - cx) - hx
+            ax, ay = (qx if qx > 0 else 0.0), (qy if qy > 0 else 0.0)
+            d = math.sqrt(ax * ax + ay * ay) + min(max(qx, qy), 0.0) - r
+            cov = 0.5 - d / 2.0
+            if cov <= 0.0:
+                continue
+            if cov > 1.0:
+                cov = 1.0
+            o = row + x * 4
+            out[o] = cr
+            out[o + 1] = cg
+            out[o + 2] = cb
+            out[o + 3] = int(round(a_full * cov))
+    return bytes(out)
+
+
+def write_dual_tone_canvas(path, width, height):
+    """Write a generated dual-tone canvas background (v1.41.0,
+    Fix 6): a vertical gradient from deep slate at the top to a
+    lighter slate-teal at the bottom. Used when an explainer
+    brief sets background to the sentinel "canvas": a quiet,
+    detailed-free backdrop that still reads as a designed
+    surface (unlike a flat colour), with the look's vignette
+    treatment supplying the radial falloff at render time."""
+    w, h = int(width), int(height)
+    top = (22, 32, 46)
+    bottom = (36, 56, 74)
+    rgba = bytearray(w * h * 4)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        r = int(round(top[0] + (bottom[0] - top[0]) * t))
+        g = int(round(top[1] + (bottom[1] - top[1]) * t))
+        b = int(round(top[2] + (bottom[2] - top[2]) * t))
+        row = y * w * 4
+        for x in range(w):
+            o = row + x * 4
+            rgba[o] = r
+            rgba[o + 1] = g
+            rgba[o + 2] = b
+            rgba[o + 3] = 255
+    return write_png_rgba(path, w, h, bytes(rgba))
+
+
 class DiagramAnimator:
-    """Incremental draw-on animator: each next_frame() stamps
-    only the newly revealed points, so total raster work is one
-    complete diagram, not one per frame. Stroke progress eases
-    (smoothstep) so the pen accelerates and slows like a hand;
-    the final frame is exact and byte-identical to
-    render_diagram_rgba(..., 1.0)."""
+    """Incremental draw-on animator: each next_frame() draws
+    only the newly revealed segments, so total raster work is
+    one complete diagram, not one per frame. Stroke progress
+    eases (smoothstep) so the pen accelerates and slows like a
+    hand; the final frame is exact and byte-identical to
+    render_diagram_rgba(..., 1.0). Incremental slices include
+    the bridging segment (points[drawn-1:want]) because a
+    segment spanning the slice boundary belongs to neither
+    slice alone; re-drawing it is idempotent (max-alpha)."""
 
     def __init__(self, strokes, width, height, fps, draw_seconds):
         self.width = int(width)
@@ -494,7 +682,7 @@ class DiagramAnimator:
         self.prepared = _prepare_strokes(strokes)
         self.total_weight = sum(p[5] for p in self.prepared)
         self.frames = max(1, int(round(float(draw_seconds) * float(fps))))
-        self.canvas = Canvas(self.width, self.height)
+        self.canvas = _new_canvas(self.width, self.height)
         self._frame = 0
         # Per-stroke drawn point counts, advanced monotonically.
         self._drawn = [0] * len(self.prepared)
@@ -528,7 +716,9 @@ class DiagramAnimator:
             take = target - start
             want = len(points) if take >= weight else (max(0, int(round(len(points) * take / weight))) if weight > 0 else 0)
             if want > self._drawn[i]:
-                self.canvas.draw_points(points[self._drawn[i]:want], color, wdt, alpha, seed)
+                _lo = self._drawn[i] - 1 if self._drawn[i] > 0 else 0
+                self.canvas.draw_segments(points[_lo:want], color, wdt,
+                                          alpha, seed)
                 self._drawn[i] = want
         return self.canvas.bytes()
 
@@ -608,33 +798,96 @@ def _circle(center, radius, **kw):
     return d
 
 
-def template_chart(params):
-    """Rising chart: axes with arrowheads, faint grid, and an
-    arrowed curve through `values` (2..8 numbers). Canvas
-    900x560; plot area x 140..830, y 60..470."""
-    values = params["values"]
+def chart_grid_points(params):
+    """Single source of truth for the chart template geometry
+    (v1.41.0): the caller places drawtext labels from these
+    numbers, and template_chart draws from them, so labels and
+    art can never disagree.
+
+    Returns {"grid_ys", "curve_points", "plot", "value_range"}:
+    plot is {x0: 140, x1: 830, y0: 60, y1: 470, baseline: 500}
+    (the axes meet at (90, 500); the curve lives in y 60..470);
+    value_range is (lo, hi) after the 10% padding the template
+    applies. grid_ys maps each y_grid_values entry through the
+    same normalization as the curve (y = 470 - 410*(v-lo)/span);
+    without y_grid_values it is the legacy [160, 260, 360].
+    curve_points are [[x, y], ...] in canvas coordinates.
+    Labels are NEVER baked into the art — the caller draws
+    them as AgentCut texts from grid_ys / curve_points.
+    """
+    values = [float(v) for v in params["values"]]
     lo, hi = min(values), max(values)
     span = (hi - lo) or 1.0
     lo -= span * 0.10
     hi += span * 0.10
     span = hi - lo
     n = len(values)
-    xs = [140 + (830 - 140) * (i / (n - 1) if n > 1 else 0.5) for i in range(n)]
+    xs = [140 + (830 - 140) * (i / (n - 1) if n > 1 else 0.5)
+          for i in range(n)]
     ys = [470 - (470 - 60) * (v - lo) / span for v in values]
+    grid_values = params.get("y_grid_values")
+    if grid_values is not None:
+        grid_ys = [470 - (470 - 60) * (float(v) - lo) / span
+                   for v in grid_values]
+    else:
+        grid_ys = [160, 260, 360]
+    return {"grid_ys": grid_ys,
+            "curve_points": [[round(x), round(y)]
+                             for x, y in zip(xs, ys)],
+            "plot": {"x0": 140, "x1": 830, "y0": 60, "y1": 470,
+                     "baseline": 500},
+            "value_range": (lo, hi)}
+
+
+def template_chart(params):
+    """Rising chart: axes with arrowheads, faint grid, and an
+    arrowed curve through `values` (2..8 numbers). Canvas
+    900x560; plot area x 140..830, y 60..470.
+
+    v1.41.0: `y_grid_values` (list of numbers) replaces the
+    fixed gridlines with lines at the caller's values, mapped
+    through the same normalization as the curve — so a grid
+    line MEANS a value the caller can label. `fill: true`
+    adds a translucent yellow area under the curve: a comb of
+    vertical strokes from the curve down to the baseline,
+    sampled every ~14px along the interpolated curve, drawn
+    BEFORE the curve (so the curve stays crisp on top) at
+    small explicit weights (5 each, ~10% of the draw window),
+    so the fill never eats the curve's draw time.
+    """
+    geo = chart_grid_points(params)
+    pts = geo["curve_points"]
     strokes = []
     # Hand order: axes first, then the faint grid, then the
-    # curve. Grid lines are long, so without an explicit small
-    # weight they would eat most of the draw window by
-    # length-weighting (verified: grid-first took ~70% of the
-    # window and the curve only appeared at the very end).
+    # fill, then the curve. Grid lines are long, so without an
+    # explicit small weight they would eat most of the draw
+    # window by length-weighting (verified: grid-first took
+    # ~70% of the window and the curve only appeared at the
+    # very end).
     strokes.append(_arrow([(90, 500), (90, 40)], color="white", width=7, head_size=30))
     strokes.append(_arrow([(90, 500), (850, 500)], color="white", width=7, head_size=30))
-    for gy in (160, 260, 360):
-        strokes.append(_line([(140, gy), (830, gy)], color="white", width=3, alpha=0.35, weight=50))
+    for gy in geo["grid_ys"]:
+        strokes.append(_line([(140, int(round(gy))), (830, int(round(gy)))], color="white", width=3, alpha=0.35, weight=50))
+    if params.get("fill"):
+        # Interpolated curve samples, every ~14px in x, each
+        # dropping a vertical to the baseline.
+        raw = [(float(p[0]), float(p[1])) for p in pts]
+        x = raw[0][0]
+        seg = 0
+        while x <= raw[-1][0]:
+            while seg + 1 < len(raw) and raw[seg + 1][0] < x:
+                seg += 1
+            (x0, y0), (x1, y1) = raw[seg], raw[min(seg + 1, len(raw) - 1)]
+            t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+            y = y0 + (y1 - y0) * t
+            strokes.append(_line([(int(round(x)), int(round(y))),
+                                  (int(round(x)), 500)],
+                                 color="yellow", width=3, alpha=0.25,
+                                 weight=5))
+            x += 14
     # The curve itself (white), with its tip re-drawn in
     # yellow as a short arrow stroke over the last segment:
     # yellow is emphasis only, and the tip is the emphasis.
-    pts = [[round(x), round(y)] for x, y in zip(xs, ys)]
     strokes.append(_line(pts, color="white", width=9))
     if len(pts) >= 2:
         strokes.append(_arrow(pts[-2:], color="yellow", width=9, head_size=40))

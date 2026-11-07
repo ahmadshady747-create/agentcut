@@ -1,3 +1,3 @@
 """AgentCut: an agent-first video editor. No human timeline UI."""
 
-__version__ = "1.40.0"
+__version__ = "1.44.0"

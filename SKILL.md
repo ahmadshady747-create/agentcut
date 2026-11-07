@@ -342,10 +342,18 @@ AgentCut edit and verify them.
   and `chime` (the same metallic ring, for money figures
   and key numbers), `click` (labels, scene switches),
   `ding` (titles), `thud` (explosive entrances). Or give a
-  local audio file path. `sfx_volume` defaults to 0.35
-  (0..2). SFX alone still produce a valid audio stream.
-  1.37.1: timing holds with `default_image_motion` on and
-  off (built-ins are time-gated; file SFX use adelay
+  local audio file path. `sfx_volume` defaults to the
+  plan volume (0..2); an explicit `sfx_volume` always
+  wins. 1.42.0 discipline: `compute_sfx_plan` keeps only
+  chapter-transition, diagram-reveal and major-callout
+  SFX, with a 15s cooldown (ties: chapter > diagram >
+  callout), attenuation `sfx_attenuation_db` (default 16,
+  0..30; auto volume 0.8 * 10^(-att/20) ≈ 0.127 at the
+  default), and pitch alternating 1.03 / 0.97 by kept
+  index. The plan is in `info["sfx_plan"]` (kept, dropped
+  with reasons). SFX alone still produce a valid audio
+  stream. 1.37.1: timing holds with `default_image_motion`
+  on and off (built-ins are time-gated; file SFX use adelay
   alone) — the 1.37.0 code played every SFX from t=0
   under motion because atrim after adelay discarded the
   delay silence.
@@ -444,9 +452,11 @@ output width, `position` preset, or x/y pixel offsets
 winning per axis) over a `start`..`end` window. It draws
 stroke by stroke, in list order, over `draw` seconds
 (default: min(4s, window), must fit inside the window),
-then holds the complete diagram until `end` — the hold is
-a freeze on the last frame, never a replay. The final
-frame equals the complete diagram exactly (tested).
+then holds the complete diagram for `hold_seconds`
+(default 8.0s, 0..60 — 1.42.0: a diagram no longer
+freezes for the whole scene) and fades it out over 1.0s
+(the card fades with it). The final frame equals the
+complete diagram exactly (tested).
 
 - Custom strokes: `{"kind": "polyline"|"arrow"|"line"|
   "circle"|"ellipse"|"rect"|"arc", ...}` in diagram-local
@@ -554,3 +564,245 @@ clips alike — none is tied to a style.
 - Defaults: plain texts now default to the (2,2) shadow
   when neither axis is set (mirroring captions); texts
   crossing the 5% action-safe rect warn only, never error.
+
+## Life & typography package (1.41.0)
+
+Built from a real verdict on a 10-minute video ("voice + dead
+silence, bad writing, beginner typography, no charts, no
+life"). Every item below is general, none video-specific.
+
+- Sound: `music_bed_inaudible` QA warning when the bed's
+  effective level under ducking is >18 dB below narration
+  (the old video measured 22.84 dB). `duck_amount_db` 0..30,
+  precedence: explicit `ducking` > `duck_amount_db` > auto
+  sidechain > plain mix. Diagrams take `sfx`; explainer
+  brief takes `sfx_density: rich/minimal` and passes
+  `duck_amount_db` through when music exists. A bed at 0.3
+  under 12 dB ducking is inaudible on phone speakers by
+  measurement — never ship that mix.
+- Titles persist: kinetic/text base words hold to the next
+  chunk's start or the text's end by default; `hold: false`
+  restores chunk-window ends. Text path only; captions stay
+  timed cues.
+- Charts: `y_grid_values` + `fill` (translucent comb under
+  the curve); grid labels are drawtext, never baked art;
+  values are caller-supplied and must be labelled
+  illustrative unless attributed. Diagrams take `card`
+  (bool), `card_color`, `card_opacity` (default black 0.45).
+- Display font: texts take `font` (registry key). Arabic
+  display face is `noto-sans-bold` (Noto Sans Arabic Bold,
+  OFL, in fonts/ with its licence). Tajawal Bold was tried
+  and rejected: it lacks isolated presentation forms and
+  this FFmpeg drawtext joins via FriBidi forms, not GSUB —
+  it renders tofu. Unknown font names fail loudly; Arabic
+  never falls back to Latin. Type scale (fractions of frame
+  height): title 0.055, heading 0.044, label 0.030, caption
+  0.028, card 0.055; weight comes from the bold file. Box
+  is opt-in: title/heading/label ship box-free, `card` is
+  the opt-in rounded translucent backdrop.
+- Collision-proof layout: `resolve_overlaps: true` cascades
+  a keyword pop downward (+16px steps, max 20) past texts,
+  captions and diagram boxes in shared windows; moves land
+  in `info["overlap_moves"]`, the project is never mutated,
+  and warnings are computed on the resolved layout (a
+  resolved project reports zero overlap warnings). New
+  `text_text_overlap_warning` for pop-vs-label and
+  title-vs-pop. Preset-positioned pops warn, never move.
+- Mastering: crf 17, preset medium (veryfast only for
+  preview callers), bt709 final node + metadata, +faststart,
+  resolution VBV caps. Master loudnorm is linear two-pass,
+  default I=-14, `output.loudnorm_i` selects -16; per-track
+  linear + measured; sidechain exactly
+  threshold=0.03:ratio=4:attack=40:release=500:knee=4;
+  AAC 192k at 48000 Hz. `output.color_pipeline: rgb`
+  (gbrp internal, single final conversion) is opt-in; the
+  default stays `yuv` — a default flip needs a migration
+  round, not a silent change.
+- ASS karaoke: per-word drawtext karaoke is gone. Any item
+  with `word_timings` renders as ONE .ass file through the
+  ass filter (libass present in this FFmpeg build). One
+  Dialogue per word window, full line, active word coloured
+  inside the line; plain base Dialogues cover gaps and
+  holds; chunk mode is plain highlight Dialogues. No `\t`
+  (sticks past its window) and no scale tags (reflow
+  neighbours). ORDER RULE — get this wrong and titles read
+  backwards: TAGGED lines are emitted in reverse word order
+  (libass does not reorder across tags); UNTAGGED plain/gap
+  lines stay in logical order (FriBidi reorders them; a
+  second reversal displays them backwards — this shipped
+  once in the AI-race rebuild render 1, was caught by its
+  frame gate, fixed, and re-rendered).
+- Wrap: relative-width table (narrow 0.25, connected 0.45,
+  wide 0.60, space 0.30, diacritics 0.0, Latin 0.55) replaces
+  flat 0.6 x size; wrapped text caps at 80% of video width.
+- Diagrams: capsule SDF segments (coverage clamp(0.5 + r -
+  d), 15px gap break for arrow barbs); Pillow, when present,
+  is used automatically at 2x + LANCZOS, else stdlib SDF.
+  Chalk grain is gone by design.
+- Camera: image camera/Ken Burns pre-scale 4x, zoompan at
+  2Wx2H, lanczos + accurate_rnd downscale (0.25 output px
+  rounding); video camera stays 2x. Measured: 4x is the only
+  factor with zero plateaus on a slow pan.
+- Modern look: explainer `look: modern` — vignette 0.4,
+  card titles, diagram cards by default, 10% safe-margin
+  zoning (titles/diagrams inside, captions in the bottom
+  band below diagrams). Background sentinel `canvas`
+  generates a dual-tone slate gradient PNG beside the
+  output. Combine with real photo backgrounds where they
+  serve the scene; do not use flat gradients as the whole
+  scene.
+
+## Refactoring package (1.42.0)
+
+Built from six defects observed in a delivered 10-minute
+video (AI-race v2): mangled Arabic ligatures in captions,
+scrambled kinetic word order, a callout touching a
+diagram card, frozen diagrams and one-minute stills, SFX
+spam, and a soft phone copy. Every fix is general, none
+video-specific; the rebuilt video is the proof.
+
+- Ligatures: `text_shaping=1` is explicit on every
+  drawtext. Both bundled Arabic fonts were verified with
+  fontTools (complete GSUB/GPOS, لا ligature present);
+  there is no Presentation Forms reshaping anywhere —
+  clean UTF-8 only. Seven words (عملاقة، التالي، بالسوق،
+  بالمئة، الرسالة، بالطاقة، فالسؤال) proven clean in
+  rendered frames. Tajawal stays rejected (see 1.41.0).
+- Word order: never split an Arabic phrase into per-word
+  drawtext filters. ASS colour highlighting anchors every
+  tag boundary with RLM (U+200F) — at line start and after
+  every closing colour tag — with WrapStyle: 2 and RTL
+  alignment. TAGGED lines are emitted in reverse word
+  order (libass does not reorder across tags); UNTAGGED
+  lines stay in logical order. Proven by a
+  template-matching regression test: "الهجوم المضاد من
+  الحافة" and "أربعة وثمانين بالمئة" keep correct order
+  at EVERY highlight index — sample frames INSIDE every
+  kinetic window, never hold frames only.
+- Zone manager: strict non-overlapping bands (fractions
+  of frame height, 9:16 and 16:9) — Header 5–18%,
+  Diagram 22–56%, Callout 60–70%, Subtitle 76–92%.
+  Callouts auto-shift below an active diagram box with
+  ≥40px padding; the moves are in `info["zone_moves"]`
+  (zone wins over overlap moves). Caption anchor is
+  clamped to ≤0.92H when `resolve_overlaps` is true.
+  Titles, diagrams and captions warn, never move.
+- No stagnation: diagrams hold `hold_seconds` (default
+  8.0, 0..60) then fade out over 1.0s. Still-image clips
+  longer than 12s get automatic multi-stop sub-cuts
+  (N = max(1, round(D/10)) glides, wide 1.0 → zoom 1.18 →
+  pan 1.12 → pan 1.12 → wide 1.0, pan flips per clip
+  index) unless the clip has an explicit camera, punch
+  or ken_burns, or a blur fit; `info["auto_subcuts"]`
+  lists them. Opt out per project (`auto_subcuts:
+  false`) or per clip (`auto_subcuts: false`). The big
+  main title shows only in the first 6s, then shrinks
+  to a small top badge (`shrink_after` ≥0.5s, `shrink_size`,
+  `shrink_y`; defaults half-size at y=24).
+- SFX discipline: see the SFX bullet above (15s
+  cooldown, chapter > diagram > callout priority,
+  `sfx_attenuation_db` default 16, pitch 1.03/0.97,
+  `info["sfx_plan"]`). On the v2 project the plan keeps
+  17 of 24 entries with a 15.30s minimum gap; measured
+  against real narration, the pop peaks ~13–17 dB below
+  the voice.
+- Encoding: master verified and kept — crf 17, preset
+  medium, bt709, +faststart, AAC 192k at 48 kHz, VBV
+  caps scaled by resolution (below 1080p: 8M/16M).
+  Phone copy (delivery, e.g. for a storage link):
+  `-b:v 800k -maxrate 1000k -crf 21 -preset medium
+  -b:a 128k` — 78 MB measured on the v3 rebuild (video 973k,
+  audio 127k; −crf 21 governs, −b:v is overridden in CRF
+  mode, −maxrate 1000k caps spikes). The master is never re-encoded to make the
+  phone copy; the phone copy is a separate encode.
+
+## Motion graphics (1.43.0)
+
+Project-level `motion` (absolute start/end, like `diagrams`).
+Seven kinds; no new MCP tool — create/patch/validate/render
+already carry `project.json`.
+
+- `shape`: rect/rounded rect/circle/ellipse/line/polygon.
+  Keyframed x, y, scale, rotation, opacity. Easing per
+  segment: linear, smoothstep, ease_in, ease_out,
+  ease_in_out (a segment's easing comes from its END
+  keyframe when non-linear, else its START keyframe, else
+  linear). x/y are the shape CENTER; rotation is degrees
+  clockwise; scale multiplies geometry only, stroke width
+  stays constant. Keyframe times are ABSOLUTE timeline
+  seconds inside the element window.
+- `counter`: a number counting up/down across its window.
+  Rendered as a live drawtext `%{eif}` expression (inline,
+  expansion=normal, never a textfile). decimals is 0 or 1
+  (eif formats integers only on this build); from/to must be
+  >= 0; prefix/suffix strings; a literal Latin `%` is
+  impossible — use ٪ (U+066A). An Arabic suffix renders LEFT
+  of the digits, an Arabic prefix RIGHT; Latin affixes stay
+  in Western order. x/y are the CENTER of the counter.
+- `bars`: values list (2..8 numbers >= 0, one > 0), labels
+  one per value, colors single or list (8-colour palette
+  default), stagger (0..0.5, default 0.12) and grow
+  (0.1..1, default 0.5) with (n-1)*stagger + grow <= 1 so
+  every bar finishes; grid, bar_gap. Bars grow with
+  smoothstep stagger; the value label appears when its bar
+  completes, the category label at its stagger start.
+- `donut`/`pie`: values + labels + colors as bars; segments
+  sweep in from the top, clockwise, with 2-degree gaps.
+  donut_ratio 0..0.9 (default 0.55); pie takes no
+  donut_ratio. Segment label ("label: value") appears when
+  its sweep completes.
+- `line_chart`: values list; the line draws progressively
+  across the WHOLE window at constant pen speed, with a
+  moving yellow head dot and white dots on reached points;
+  a value label appears when the head reaches its point.
+- `lower_third`: rounded-rect card + text. Card slides in
+  from the left and fades over `enter` (0..2s, default 0.6),
+  holds, slides out and fades over `exit` (0..2s, default
+  0.6); enter + exit must fit the window. The text slides
+  with the SAME linear motion and fades with the same ramps
+  (card and text stay in lockstep); the card is the box, so
+  the text has none. The card's rest position (x, y, w, h)
+  must sit fully inside the frame; card_color, card_opacity
+  (default 0.75), corner_radius (default 16, <= min(w,h)/2).
+- `path` is NOT a separate kind: a polyline path IS a
+  sequence of x/y keyframes — set keyframe times for
+  arc-length pacing.
+- Compositing: one transparent PNG-codec video per element
+  at project fps, overlaid ABOVE video/images/diagrams and
+  BELOW captions/texts. Identical consecutive frames are
+  cached (holds and static elements cost one render).
+  The rasterizer is 1x with coverage-based edge AA (NOT
+  2x supersampled: 720x1280 RGBA x 750 frames is ~2.8 GB
+  through the pipe; 2x would quadruple it).
+- Validation: structured errors with fix hints for unknown
+  kind, keyframe times outside the window, keyframes out of
+  order, geometry outside the frame, duplicate ids, invalid
+  easing. Charts must sit fully inside the frame (they do
+  not slide); shapes and lower-thirds may extend outside by
+  at most one bbox-size per side (slide-in/out).
+- Determinism: the same motion spec renders byte-identical
+  frames (pinned by a test). Projects without `motion`
+  render byte-identically to 1.42.0.
+- Limits: derived motion labels are NOT covered by the
+  collision/zone checks — their placement is the author's
+  responsibility. Counter affixes and chart labels share
+  the font-coverage rule: Noto Naskh Arabic has no glyph
+  for `-`, `–`, `—` (nor `%`/`#`) — avoid them in Arabic
+  text, or use `font: "noto-sans-bold"` (has the hyphen).
+  A line-chart value label's box can partly cover the head
+  dot at the frontier.
+
+## Editing application + typography system (1.44.0)
+
+AgentCut does NO analysis and NO AI. These features consume local JSON files produced by AgentMedia tools (`detect_beats`, `track_object`, `analyze_reframe`) and apply them deterministically — same input file, same output.
+
+- `beat_cut` (project-level): `{file, every=1, window=[start, end]}` — splits clips at selected beats from the beats file (beats in `beats`, at least 2). Segments shorter than 0.2s are dropped, never made; total duration unchanged. Rejects `speed_curve`/`loop_count`/`camera`/`punch_in`/`freeze_at` on split clips. Cut times are listed in `info["beat_cuts"]`.
+- `track` on overlays and texts: `{file, offset_x=0, offset_y=0}` — position sampled every frame from the track file (AgentMedia `track_object` shape: `{frame_size, track: [{t, x, y, w, h}]}`), linear interpolation, hold first/last point outside the track. Overlays anchor top-left at the point; texts centre on the box centre. Keyframes + `track` on one element is a validation error; no overlap with the element window is an error, partial coverage is a warning.
+- `reframe` on video clips only: `{windows_file, target_aspect}` — per-frame crop windows (AgentMedia `analyze_reframe` shape); crop is inserted before trim, dimensions forced even for yuv420p. All windows must share one crop size; partial coverage is a warning (hold nearest window). Rejects `camera`/`stabilize`/blur fits/`freeze_at`/`reverse`/`speed_curve` on the same clip.
+- Text `preset` (texts/captions): `typewriter` (whole words only — never splits an Arabic word mid-joining), `slide_in`, `pop_in`, `fade_up`, `kinetic_words`, `highlight_sweep`, `underline_swipe`. `reveal_mask` is rejected (animated crop is not feasible on this FFmpeg build). `preset` + `word_timings`/`animation`/`reveal` is rejected. `animation` gains `pop_in`.
+- Typography styles: named `style` on texts/captions — `display` (0.075, white, noto-sans-bold, shadow 3,3, rounded black box 0.55), `subtitle` (0.038, white, noto-sans-bold, no box), `quote` (0.042, yellow, noto-sans-bold, rounded black box 0.35). The old `title`/`heading`/`label`/`caption`/`card` values are byte-frozen — never change their resolved values. Project-level `typography: {default_style}` applies to items without an explicit style (opt-in only; absent = old behaviour). `style` on lower thirds and `label_style` on motion charts/counters ride the same shared resolver — one system for all text surfaces.
+- Custom `transition` on clips: `zoom_out`, `whip_pan`, `glitch`, `light_leak` — a post-join effect pass straddling each cut (audio stays plain concat, unlike xfade). Duration < both clip durations, default 0.5; the first clip cannot carry one. Existing xfade names are untouched.
+- Multi-track: clips accept `track: 0|1` (default 0). Track 1 clips are full-frame overlays at an explicit numeric `start` (required); they never extend the total duration (error if they run past it); `transition` on track 1 is an error.
+- `adjustments` (project-level): `[{start, end, grade?, effects?}]` — `grade` must be a `GRADE_PRESETS` name, `effects` reuse the effects vocabulary, at least one required. Applies to the base video only (overlays/texts/motion sit above, unaffected).
+- Easing: `ease_out_back` added to the shared easing system (validate, render, motion) — pop_in overshoots to ~1.06x at mid-entrance.
+- Byte-identity: every new feature is opt-in; projects without the new fields render byte-identically to 1.43.0.

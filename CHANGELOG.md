@@ -1,3 +1,332 @@
+## 1.44.0 — Editing-application package + typography system (AgentMedia 0.10.0 data applied deterministically)
+
+AgentCut does NO analysis and NO AI: it consumes local JSON files produced by AgentMedia tools (detect_beats, track_object, analyze_reframe) and applies them deterministically — same input file, same output. 64 new tests join the existing 247, for 311 total. Proof: `~/workspace/editing-application-logs/proof/application_proof.mp4` (34s, 720x1280, 30fps, yuv420p) + `beat_cut_proof.mp4` + `adjustment_proof.mp4` + `track_follow_proof.mp4` + `reframe_proof.mp4` (360x640), frames eye-checked INSIDE every feature window.
+
+- `beat_cut`: project-level `{file, every, window}` — splits clips at AgentMedia detect_beats times (every Nth beat by global index, window-filtered); segments < 0.2s are dropped, never made; total duration unchanged. Proof: real 120 BPM beats (0.987/1.985/2.984) land exactly on the cut — frame diff across beats 4.04/4.03/4.03 vs 0.00 inside.
+- `follow_track`: overlays and texts accept `track: {file, offset_x, offset_y}` — position sampled every frame from AgentMedia track_object points (linear interpolation, hold first/last outside the track); overlays anchor top-left, texts centre on the box centre. Proof (real fixture): red box centre matches the square at t=0.5/2.0/3.5 within the 4px sampling step.
+- `reframe`: clips accept `reframe: {windows_file, target_aspect}` — per-frame crop windows from AgentMedia analyze_reframe, even dimensions enforced for yuv420p. Proof (real fixture): white-square centre-x 139/182/182 (spread 43) vs 58/98.5/139 (spread 81) without reframe; the t=0.5 offset is correct edge clamping (crop cannot move left past x=0).
+- Animated text presets (7): `typewriter` (whole words only — never splits an Arabic word mid-joining), `slide_in`, `pop_in`, `fade_up`, `kinetic_words`, `highlight_sweep`, `underline_swipe`. `reveal_mask` deliberately dropped: an animated crop is not feasible on this FFmpeg build (crop/drawbox w/h are config-time), and the geq-alpha alternative needs an fps-fragile looped-PNG input.
+- Advanced transitions (4, post-join effect pass straddling each cut, audio stays plain concat): `zoom_out`, `whip_pan`, `glitch`, `light_leak`. Proof: zoom_out corners black at the cut, whip centre black at the midpoint, glitch frame diff 86.46 vs 0.00 baseline, light_leak warm centre (G 87) at the cut.
+- Multi-track + adjustment layers: clips accept `track: 0|1` (track 1 = full-frame overlay at an explicit `start`, never extends total duration); project-level `adjustments: [{start, end, grade?, effects?}]` apply a grade/effects to the base video only, for their window. Proof: noir over [27,29] turns the colour test pattern grey (and saturated panels grey in the standalone clip); lime track-1 covers blue in [31,33) only.
+- Typography system (one shared `_resolve_text_style` for texts, captions, keyword pops, lower thirds and motion labels): named styles `display`, `subtitle`, `quote` added (old `title`/`heading`/`label`/`caption`/`card` byte-frozen); project-level `typography: {default_style}` opts a whole project in. Entrances on the shared easing system (smoothstep/ease_in/ease_out/ease_in_out + ease_out_back, added cleanly in one branch each); rounded pill cards, highlight bars sweeping behind words (RTL-correct, never splits a word), underline swipes. Gradient text deliberately left out: drawtext takes a solid fontcolor only. Proof: showcase segment + before/after pair (plain 48px "المستقبل" vs display 96px bold on a rounded pill).
+- Byte-identity: every new feature is opt-in; projects without the new fields render byte-identically (examples/basic.json byte-identity tests pass).
+- Two real defects found by empirical renders and fixed: drawtext emitted y UNQUOTED (a comma-bearing track expression broke the filter graph); two elements sharing one track file collided in info["data_files"] (offsets now live on the element, data is pure file data).
+
+## 1.43.0 — Motion graphics (After Effects-style animated vector elements)
+
+AgentCut could move a camera, pop kinetic words and draw a
+diagram in ~2s — then the frame froze. The motion layer keeps
+elements ALIVE across their whole window: a pure-stdlib
+supersampled span rasterizer (`src/agentcut/motion.py`, zero
+new dependencies) renders transparent RGBA PNG frames at
+project fps, composited ABOVE video/images/diagrams and BELOW
+captions/texts, with identical consecutive frames cached.
+21 new tests join the existing 226, for 247 total. Proof:
+`~/workspace/motion-graphics-logs/proof/motion_proof.mp4`
+(24s, 720x1280, 30fps, yuv420p; rendered in 73.4s), eye-checked
+at start/mid/end INSIDE every animation.
+
+- `motion`: a project-level list (absolute start/end, like
+  `diagrams`). Kinds: `shape` (rect/rounded rect/circle/
+  ellipse/line/polygon with keyframed x, y, scale, rotation,
+  opacity and per-segment easing: linear, smoothstep, ease_in,
+  ease_out, ease_in_out); `counter` (a live number counting
+  up/down — a drawtext `%{eif}` expression evaluated per
+  frame, decimals 0 or 1, prefix/suffix including Arabic ٪);
+  `bars` (values grow with stagger across the window, value
+  labels, grid); `donut`/`pie` (segments sweep in); `line_chart`
+  (progressive draw across the WHOLE window with a moving
+  head/dot and value labels); `lower_third` (rounded-rect card
+  sliding+fading in, holding, sliding+fading out, with its text
+  sliding in lockstep through the normal drawtext/BiDi path).
+  `path` is NOT a separate kind: a polyline path IS a sequence
+  of x/y keyframes (author sets keyframe times for arc-length
+  pacing) — documented in `motion.py`.
+- Validation carries structured errors with fix hints for
+  unknown kind, keyframe times outside the element window,
+  keyframes out of order, geometry outside the frame, duplicate
+  ids, invalid easing name. Charts must finish inside the
+  window ((n−1)·stagger + grow ≤ 1); the chart raster bbox
+  must sit fully inside the frame; shapes and lower-thirds may
+  slide in from off-screen by at most one bbox-size per side.
+- Determinism: the same motion spec produces byte-identical
+  frames, pinned by a test. Projects without `motion` render
+  byte-identically (verified against `examples/basic.json`).
+- Counter limits (this FFmpeg build): eif formats are d/u/x/X
+  only, so decimals is 0 or 1; from/to must be ≥ 0; a literal
+  Latin `%` is impossible (`%%` gives "Stray %" inline AND in
+  textfile) — use ٪ (U+066A). Arabic suffix renders LEFT of
+  the digits, Arabic prefix RIGHT — verified by eye
+  ("٪4" at t=0.7, "٪79" at t=3.8, exact values).
+- Derived motion labels are NOT covered by the collision/zone
+  checks — their placement is the author's responsibility.
+- Residual found by the proof eye-check (pre-existing font
+  coverage, NOT a motion defect): the bundled Noto Naskh
+  Arabic has NO glyph for U+002D (hyphen), U+2013 or U+2014 —
+  verified by cmap inspection — so `-`/`–`/`—` in Arabic text
+  render as the same tofu box (same class as `#` since 1.32.1).
+  Noto Sans Arabic Bold HAS the hyphen; DejaVu has all three.
+  Avoid those characters in Arabic text, including motion
+  counter affixes and chart labels. Cosmetic residual: a
+  line-chart value label's box can partly cover the head dot
+  at the frontier; the dot stays partly visible.
+- No new MCP tool: create/patch/validate/render already carry
+  `project.json` (tool count stays 22).
+
+## 1.42.0 — Refactoring package (six defects from a delivered video)
+
+Built because the AI-race v2 video (720x1280, 591.68s, 10
+chapters) came back with six concrete defects, each verified
+against real frames before fixing: ligatures mangled in
+captions, kinetic word order scrambled inside highlight
+windows, a callout touching a diagram card, diagrams frozen
+for 40s over one-minute stills, SFX spam, and a soft phone
+copy. Each fix is general, never video-specific; the v3
+rebuild of that video with this package is the proof. 23 new
+tests join the existing 200, for 223 total — plus 3 more
+from the R6 encoding/version pins and the R7b spacing fix,
+for 226 total.
+
+- FIX 1 — LIGATURES: `text_shaping=1` is now explicit on
+  every drawtext. Both bundled Arabic fonts were verified
+  with fontTools (complete GSUB/GPOS, لا ligature present);
+  there is no manual Presentation Forms (U+FE70..U+FEFF)
+  reshaping anywhere — clean UTF-8 only, pinned by a test.
+  Seven words (عملاقة، التالي، بالسوق، بالمئة، الرسالة،
+  بالطاقة، فالسؤال) proven clean in rendered frames. The
+  parent's still-frame check had NOT confirmed the
+  corruption; the shaping-level proof is what settled it.
+- FIX 2 — WORD ORDER: kinetic word-highlight keeps correct
+  order at EVERY highlight index. Tagged ASS lines are
+  emitted in run order with RLM (U+200F) anchors at line
+  start and after every closing colour tag, WrapStyle: 2,
+  RTL alignment. Proven by a template-matching regression
+  test ("الهجوم المضاد من الحافة", "أربعة وثمانين بالمئة"
+  at every index) — the parent confirmed the scramble is
+  real in v2 (t=362 "الوكلاء المقود يمسكون", t=427 "الهجوم
+  الحافة من المضاد") and index-dependent, so verification
+  samples frames INSIDE every kinetic window, never hold
+  frames only. (The earlier "no scrambling" claim was
+  wrong for exactly that reason.) R7b follow-up, found in
+  the v3 frames: the highlighted word also lost its
+  LEADING SPACE at every index > 0 (16/26 kinetic frames:
+  "الوكلاءيمسكون") because the gap was emitted as the
+  leading space of the before-run after a tag boundary,
+  which libass drops; the gap is now emitted inside the
+  highlighted run, before the closing tag. Pinned by a
+  rendered group-count test (4 word groups at min_gap=6
+  at every index and the hold).
+- FIX 3 — VERTICAL ZONE MANAGER: strict non-overlapping
+  bands for 9:16 and 16:9 — Header 5–18%, Diagram 22–56%,
+  Callout/Emphasis 60–70%, Subtitle 76–92%.
+  `check_vertical_zones` moves callouts below an active
+  diagram box with >=40px padding (the v2 03:13 case moved
+  758.56 -> 782.56) and reports `info["zone_moves"]`; zone
+  wins over overlap moves. Caption anchor clamps to
+  <=0.92H when `resolve_overlaps` is true. Titles, diagrams
+  and captions warn, never move.
+- FIX 4 — NO STAGNATION: diagrams take `hold_seconds`
+  (default 8.0, 0..60) then fade out over 1.0s (card fades
+  too) instead of freezing for the whole scene. Still-image
+  clips longer than 12s get automatic multi-stop sub-cuts
+  (N = max(1, round(D/10)) glides, wide 1.0 -> zoom 1.18 ->
+  pan 1.12 -> pan 1.12 -> wide 1.0, pan flips per clip
+  index), before the continuity pass, listed in
+  `info["auto_subcuts"]`; opt out per project or per clip.
+  The big main title shows only in the first 6s, then
+  shrinks to a small top badge (`shrink_after` >=0.5s,
+  `shrink_size`, `shrink_y`; defaults half-size at y=24).
+- FIX 5 — SFX DISCIPLINE: `compute_sfx_plan` keeps only
+  chapter-transition, diagram-reveal and major-callout SFX
+  with a 15s cooldown (ties: chapter > diagram > callout;
+  starts rounded to ms so float dust cannot decide a tie),
+  attenuated to -16 dB by default (`sfx_attenuation_db`
+  0..30; explicit `sfx_volume` always wins), pitch
+  alternating 1.03 / 0.97 by kept index (built-ins scale
+  frequency constants inside sin(2*PI*...), file SFX use
+  atempo before adelay). The plan is in
+  `info["sfx_plan"]` (kept, dropped with reasons). On the
+  v2 project: 24 entries -> 17 kept / 7 dropped, minimum
+  kept gap 15.30s. Measured against real narration, the
+  pop peaks 13.4 dB below the voice peak (16.7 dB by window
+  mean) — straddling the -14..-18 dB band at the default.
+  The prompt's ">80 SFX" was wrong: v2 has exactly 24.
+  Two 1.37.x SFX tests were updated spec-driven: their
+  thresholds were calibrated to the old default volume
+  0.35, so they now set an explicit `sfx_volume` 0.35
+  (timing/duration/spectra intent unchanged), and the
+  1.37.1 mixed project was re-spaced to cooldown-compliant
+  starts (1.0 / 17.0 / 33.0) with the shared-start pop
+  asserted as dropped by the plan.
+- FIX 6 — ENCODING: master verified and kept — crf 17,
+  preset medium, bt709 end to end, +faststart, AAC 192k at
+  48 kHz, resolution-scaled VBV caps. The prompt's
+  "726/127 kbps" was the PHONE COPY, not the master
+  (master was already 7.7 Mbps / 192k). Documented phone-
+  copy preset: `-b:v 800k -maxrate 1000k -crf 21 -preset
+  medium -b:a 128k` (78 MB measured on the v3 rebuild:
+  video 973k, audio 127k; -crf 21 governs, -b:v is
+  overridden in CRF mode, -maxrate 1000k caps spikes). The green artifact at 01:55-02:02 is the scene-3
+  photo's own green ticker boards (no green text layer in
+  the project); a formal with/without-background isolation
+  render is part of the v3 proof.
+
+## 1.41.0 — Life & typography package (plus the six senior-engineer fixes)
+
+Built because a real 10-minute video came back "voice + dead
+silence, bad writing, beginner typography, no charts, no life".
+Step 0 of the loop extracted a frame at every kinetic-title and
+keyword-pop window of that video and proved, by eye, the
+mechanisms behind each complaint — then fixed each mechanism
+in general, never video-specifically. The rebuild of that video
+with this package is the proof (see the 1.41.0 notes at the end).
+41 new tests join the existing 159, for 200 total.
+
+- SOUND THAT IS HEARD: producer QA warning
+  `music_bed_inaudible` fires when a music track's effective
+  level under ducking sits more than 18 dB below narration
+  (measured LUFS, not guessed — the old video's mix measured
+  a 22.84 dB gap). New `duck_amount_db` control (0..30) with
+  exact precedence: explicit `ducking` object wins, then
+  `duck_amount_db`, then the auto sidechain, then a plain mix.
+  The old default — bed at 0.3 volume under 12 dB ducking —
+  is inaudible on phone speakers by measurement, not opinion.
+  Denser SFX in the produce path: scene-transition, chart-
+  reveal and keyword SFX (diagrams take `sfx` now), plus
+  `produce_explainer` brief flag `sfx_density: rich/minimal`
+  and a `duck_amount_db` passthrough.
+- LIFE: scene/kinetic titles persist by default — base words
+  now hold to the next chunk's start or the text's end
+  (`hold: false` restores the old chunk-window end; text path
+  only, captions stay timed cues). Chart template gains
+  `y_grid_values` (gridlines at caller values) and `fill`
+  (translucent area fill under the curve), with
+  `chart_grid_points` as the single source of truth; labels
+  stay drawtext, never baked into diagram art. `title_style`
+  presets give legibility without a black box behind every
+  line, and the box is now documented as opt-in, not the
+  house look (title/heading/label already ship box-free;
+  `card` is the opt-in rounded translucent backdrop).
+- TYPOGRAPHY SYSTEM: one OFL Arabic display font joins
+  `fonts/` — Noto Sans Arabic Bold (`noto-sans-bold`,
+  licence shipped). Tajawal Bold was fetched, rendered and
+  REJECTED: it lacks isolated presentation forms, and this
+  FFmpeg build's drawtext joins via FriBidi presentation
+  forms, not HarfBuzz GSUB shaping — so Tajawal renders tofu
+  on extremely common letters. Noto Sans Arabic Bold (751
+  presentation forms, none missing) renders joined, RTL-
+  correct, zero tofu, verified by frame. New `font` option on
+  texts (registry keys; unknown names fail loudly, Arabic
+  never silently falls back to Latin). Type scale documented:
+  title 0.055 / heading 0.044 / label 0.030 / caption 0.028 /
+  card 0.055 of frame height, weight via the bold file.
+- COLLISION-PROOF LAYOUT: `resolve_overlaps: true` moves a
+  keyword pop below any text/caption/diagram it overlaps
+  (cascade +16px, up to 20 steps, original y restored with a
+  warning if it cannot clear inside the frame); moves are
+  reported in `info["overlap_moves"]` and the project is never
+  mutated. New `text_text_overlap_warning` covers pop-vs-
+  label and title-vs-pop, the case the old layer pass could
+  not see. Warnings are computed on the RESOLVED layout, so a
+  resolved project reports zero overlap warnings.
+- FIX 1 — COLOR & MASTERING: new encoding defaults — crf 17,
+  preset medium (veryfast only when a preview caller passes
+  it explicitly), bt709 final node (lanczos + accurate_rnd +
+  full_chroma_int) and bt709 metadata, +faststart, and
+  resolution-scaled VBV caps (1080p 16M/32M, 4K 40M/80M,
+  below-1080p scaled by pixels). Explicit `video_bitrate` /
+  `video_crf` still win. Internal-graph full-range gbrp ships
+  behind `output.color_pipeline: rgb` (opt-in); the default
+  stays `yuv` because the suite pins the yuv graph's
+  join/overlay behaviour and a default flip needs a dedicated
+  migration round with per-feature colour verification.
+- FIX 5 — AUDIO, NO PUMPING: master loudnorm is now linear
+  two-pass (measure the mix first, then constant gain — no
+  time-varying pumping), default I=-14 with
+  `output.loudnorm_i` selecting the spec's -16; per-track
+  loudnorm is linear + measured, shifted by static volume;
+  sidechain is exactly
+  threshold=0.03:ratio=4:attack=40:release=500:knee=4; audio
+  encodes AAC 192k at 48000 Hz (this also fixes the old
+  96 kHz sample-rate anomaly).
+- FIX 2 — ARABIC TYPOGRAPHY, NATIVE ASS: per-word drawtext
+  karaoke is DELETED. Active word-highlight renders as ONE
+  unified .ass file through the ass filter (libass + HarfBuzz
+  + FriBidi; verified present in this FFmpeg build), drawing
+  the Arabic line as a single connected sentence with the
+  active word highlighted INSIDE it by colour tag. No
+  `\t` transforms (measured: they stick past their window)
+  and no scale tags (measured: they reflow neighbours); colour
+  alone keeps the line layout identical across events. Rule
+  proven by frame inspection and now pinned by test: TAGGED
+  lines are emitted in reverse word order (libass does not
+  reorder across tags), UNTAGGED plain/gap/chunk lines stay in
+  logical order (FriBidi reorders them itself — reversing
+  them double-reverses the line and displays it backwards;
+  this exact bug shipped in the first rebuild render and was
+  caught by its frame gate, fixed, and re-rendered). Wrap
+  uses a relative-width weight table (narrow 0.25 / connected
+  0.45 / wide 0.60 / space 0.30 / diacritics 0.0 / Latin 0.55)
+  instead of flat 0.6 x size, and wrapped text is capped at
+  80% of video width (was 90%).
+- FIX 3 — DIAGRAMS, CAPSULE SDF: stamped-disc line drawing is
+  replaced by continuous capsule SDF segments (coverage =
+  clamp(0.5 + r - d, 0, 1) per pixel, gap-breaking at 15px so
+  arrow-barb jumps never draw connecting lines). Beading and
+  staircasing on slanted lines, curves and arcs are gone;
+  the chalk grain from stamped discs is gone by design (clean
+  vector lines). When Pillow is already present it is used
+  automatically with 2x supersampling + LANCZOS downscale;
+  otherwise the stdlib SDF engine runs — no new required
+  dependency. The animator's last frame is still byte-
+  identical to a direct full render on each path.
+- FIX 4 — TRUE SUB-PIXEL CAMERA: image camera and Ken Burns
+  pre-scale 4x, run zoompan at 2Wx2H, then downscale with
+  lanczos + accurate_rnd (crop rounding becomes 0.25 output
+  pixels). Video camera stays at the spec's 2x minimum.
+  Measured on a clean single pan: 1x staircases (111/149
+  plateaus, ~2.3px jumps), 2x half-steps (72/149 plateaus),
+  4x true sub-pixel (0/149 plateaus, ~0.5px steps) with
+  identical framing across factors.
+- FIX 6 — MODERN EXPLAINER LAYOUT: diagram `card`
+  (rounded translucent rect under the animated diagram for
+  its whole window, default black at 0.45) plus a `modern`
+  produce look (vignette 0.4, card titles, diagram cards by
+  default, 10% safe-margin zoning for titles/diagrams, the
+  caption band kept clear below) plus a dual-tone canvas
+  sentinel background (deep slate to slate-teal vertical
+  gradient, vignette at render time).
+- PROOF — AI-RACE REBUILD v2: same Kaggle narration, same
+  591.68s timeline, same script and cuts (nothing re-voiced).
+  Flat gradients replaced by 10 real Wikimedia photos
+  (attributed), 3-stop camera paths throughout, charts with
+  grid labels + fill + cards in scenes 3/4/6, display font
+  with no boxes on titles/pops, hold persistence past 5s,
+  harmonic music bed at 0.8 volume + 6 dB ducking (bed QA
+  silent; bed partials proven present by frequency
+  measurement), denser SFX (whooshes, pops, dings). Render-2
+  probe: 591.68s, 720x1280, 30fps, yuv420p, bt709 x3, AAC
+  48000 Hz / 192k, 10 chapters at exact scene starts,
+  faststart. Frames eye-verified in 7 moments including every
+  Step-0 moment (scene-7/8 titles, scene-4 pop, scene-3/6
+  charts, scene-1, scene-10). Residuals, stated plainly:
+  kinetic word timings remain proportional estimates; diagram
+  values remain relative/illustrative; captions keep their
+  small backdrop by design; 8 grid-label layer warnings are
+  chart-internal margin labels by design; 9 estimator warnings
+  are refuted by true-ink measurement; render loudnorm
+  measured -15.85 LUFS / +0.64 dBTP vs targets -14 / -1.5
+  (linear-gain targeting follow-up on a hot source; voice
+  and bed levels verified correct by direct measurement).
+- DOCUMENTED CALIBRATIONS (not silent weakenings): R1 chunk
+  margin 20px total; R7a pixel tolerances (max delta 4
+  kinetic / 2 segment-text) replacing byte-exactness that
+  crf 17 + lanczos accurate_rnd made unrepeatable across
+  encoder paths (the core cache-miss == cache-hit guarantee
+  still holds exactly); R8 fits scan and caption guard
+  calibration; R10 card probe correction. The parent judges
+  these; they are recorded here, not hidden.
+
 ## 1.40.0 — General visual-craft upgrade
 
 All eight features are general: they work on video, image,

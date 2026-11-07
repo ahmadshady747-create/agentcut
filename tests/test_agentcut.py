@@ -5,6 +5,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 import zlib
 
@@ -24,6 +25,33 @@ def _crop_mean(path, t, x, y, w, h):
     data = subprocess.run(cmd, capture_output=True).stdout
     n = len(data) // 3
     return tuple(sum(data[i] for i in range(k, len(data), 3)) / n for k in range(3))
+
+
+def _crop_diff(path, t0, t1, x, y, w, h):
+    """Mean absolute per-channel pixel difference between two
+    frames' crops — a change detector for animated text/numbers
+    whose mean brightness may stay the same."""
+    def _grab(t):
+        cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+               "-vf", f"crop={w}:{h}:{x}:{y}", "-frames:v", "1",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        return subprocess.run(cmd, capture_output=True).stdout
+    a, b = _grab(t0), _grab(t1)
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    return sum(abs(a[i] - b[i]) for i in range(n)) / n
+
+def _crop_max(path, t, x, y, w, h):
+    """Brightest channel value in a crop — a presence detector
+    for small bright features (digits, text) on a dark board,
+    where a mean would dilute them to nothing."""
+    cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+           "-vf", f"crop={w}:{h}:{x}:{y}", "-frames:v", "1",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    data = subprocess.run(cmd, capture_output=True).stdout
+    return max(data) if data else 0
+
 
 def _png_px(path):
     """Pixel reader for an ffmpeg PNG frame (stdlib only)."""
@@ -74,6 +102,69 @@ def _png_px(path):
         return tuple(row[x * ch:(x + 1) * ch])
 
     return w, h, px
+
+
+def _ink_mask(path, t, y0=100, y1=150, x0=90, x1=270):
+    """Colour-agnostic ink mask of a frame band (for kinetic
+    order checks): pixels whose RGB sum exceeds 300, so white
+    and yellow glyphs count the same and thin-stroke edge
+    pixels are included. Returns a set of (x, y) pixels."""
+    frame = os.path.join(os.path.dirname(path), "test_loop142_frame.png")
+    _w, _h, px = _frame_png(path, t, frame)
+    ink = set()
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            r, g, b = px(x, y)[:3]
+            if r + g + b > 300:
+                ink.add((x, y))
+    return ink
+
+
+def _ink_groups(ink, min_gap=3):
+    """Split an ink mask into left-to-right clusters at
+    zero-ink column runs of >= min_gap. Returns a list of
+    (x0, x1, mask) with the mask relative to (x0, y0 of the
+    band is kept absolute in y; x relative to x0)."""
+    if not ink:
+        return []
+    cols = {}
+    for (x, y) in ink:
+        cols[x] = cols.get(x, 0) + 1
+    lo, hi = min(cols), max(cols)
+    groups, cur, gap = [], [], 0
+    for x in range(lo, hi + 1):
+        if cols.get(x, 0) > 0:
+            if gap >= min_gap and cur:
+                groups.append(cur)
+                cur = []
+            gap = 0
+            cur.append(x)
+        else:
+            gap += 1
+    if cur:
+        groups.append(cur)
+    out = []
+    for g in groups:
+        x0, x1 = min(g), max(g)
+        m = frozenset((x - x0, y) for (x, y) in ink if x0 <= x <= x1)
+        out.append((x0, x1, m))
+    return out
+
+
+def _best_template_iou(template, frame_ink, x0=90, x1=270):
+    """Slide a template mask (relative coords) across a frame
+    ink mask in x; return (best IoU, best x0)."""
+    tw = max(x for (x, _y) in template) + 1
+    best, best_x = -1.0, None
+    for ox in range(x0, x1 - tw + 1):
+        placed = frozenset((x + ox, y) for (x, y) in template)
+        box = frozenset((x, y) for (x, y) in frame_ink
+                        if ox <= x < ox + tw)
+        union = placed | box
+        iou = len(placed & box) / len(union) if union else 0.0
+        if iou > best:
+            best, best_x = iou, ox
+    return best, best_x
 
 
 def _frame_png(path, t, out):
@@ -2622,8 +2713,9 @@ class TestAgentCut(unittest.TestCase):
                    "أسطر لكي يظهر كاملا داخل الإطار")
         lines = wrap_caption_lines(long_ar, 36, 324)
         self.assertGreater(len(lines), 1)
+        from agentcut.srt import _word_width
         for ln in lines:
-            self.assertLessEqual(len(ln) * 36 * 0.6, 324 + 1e-6)
+            self.assertLessEqual(_word_width(ln, 36), 324 + 1e-6)
         self.assertEqual(" ".join(lines), long_ar)
         self.assertEqual(len(wrap_caption_lines(
             "كلمةطويلةجداجداجداجداجداجداجدا", 36, 100)), 1)
@@ -3002,7 +3094,13 @@ class TestAgentCut(unittest.TestCase):
                      "clips": [{"id": "a", "kind": "image",
                                 "src": "data/test_red.png", "duration": 3}],
                      "texts": [{"text": "X", "start": 0.5, "end": 2.5,
-                                "sfx": name}]}
+                                # Calibration level: Fix 5 attenuates
+                                # the default to 0.127, so these
+                                # timing/duration thresholds are
+                                # measured at the old default 0.35.
+                                # The production level is covered by
+                                # TestLoop142 (test_fix5_*).
+                                "sfx": name, "sfx_volume": 0.35}]}
                 out = os.path.join(tmp, f"{name}.mp4")
                 ok, info = render_project(p, out)
                 self.assertTrue(ok, info)
@@ -3145,6 +3243,9 @@ class TestAgentCut(unittest.TestCase):
                           "src": "data/test_green.png", "duration": 2}]
                 if sfx:
                     clips[2]["sfx"] = sfx
+                    # Calibration level (see the 1.37.0 test above):
+                    # Fix 5 attenuates the default to 0.127.
+                    clips[2]["sfx_volume"] = 0.35
                 return clips
             # Clip SFX at 4.0, motion on (twice) and off.
             for motion in (True, True, False):
@@ -3161,20 +3262,40 @@ class TestAgentCut(unittest.TestCase):
                                      -60.0, f"motion={motion} pre")
                 self.assertGreater(_vol_window(out, 4.0, 5.0),
                                    -30.0, f"motion={motion} win")
-            # Text SFX at 4.0 with motion on (the r16 case), plus
-            # caption SFX at 1.0 and two text SFX sharing 2.0.
+            # Text SFX at 33.0 with motion on (the r16 case), plus
+            # caption SFX at 1.0 and two text SFX sharing 17.0.
+            # Fix 5 (1.42.0): the 15s cooldown means the three
+            # starts must be >=15s apart, and a shared start
+            # fires exactly ONE SFX (the first collected wins).
+            # The mixed timeline is therefore 36s, and the plan
+            # must show the shared-start pop as dropped.
+            _mixed_clips = [{"id": "a", "kind": "image",
+                             "src": "data/test_red.png", "duration": 17},
+                            {"id": "b", "kind": "image",
+                             "src": "data/test_blue_solid.png",
+                             "duration": 16},
+                            {"id": "c", "kind": "image",
+                             "src": "data/test_green.png", "duration": 3}]
             p = {"id": "sfx", "version": 1,
                  "default_image_motion": True,
                  "output": {"width": 360, "height": 640, "fps": 30},
-                 "clips": _clips(),
-                 "texts": [{"text": "Ding", "start": 4.0, "end": 5.0,
-                            "sfx": "ding"},
-                           {"text": "One", "start": 2.0, "end": 3.0,
-                            "sfx": "ding"},
-                           {"text": "Two", "start": 2.0, "end": 3.0,
-                            "y": 200, "sfx": "pop"}],
+                 "clips": _mixed_clips,
+                 "texts": [{"text": "Ding", "start": 33.0, "end": 34.0,
+                            "sfx": "ding", "sfx_volume": 0.35},
+                           {"text": "One", "start": 17.0, "end": 18.0,
+                            "sfx": "ding", "sfx_volume": 0.35},
+                           {"text": "Two", "start": 17.0, "end": 18.0,
+                            "y": 200, "sfx": "pop",
+                            "sfx_volume": 0.35}],
                  "captions": [{"text": "Cash", "start": 1.0,
-                               "end": 1.9, "sfx": "cash"}]}
+                               "end": 1.9, "sfx": "cash",
+                               "sfx_volume": 0.35}]}
+            from agentcut.validate import validate_project as _vp
+            _ok, _info = _vp(p)
+            self.assertEqual(_ok, [], _ok)
+            _dropped = [(d["start"], d["name"])
+                        for d in _info["sfx_plan"]["dropped"]]
+            self.assertEqual(_dropped, [(17.0, "pop")])
             out = os.path.join(tmp, "mixed.mp4")
             ok, info = render_project(p, out)
             self.assertTrue(ok, info)
@@ -3182,11 +3303,11 @@ class TestAgentCut(unittest.TestCase):
                                  -60.0, "mixed pre")
             self.assertGreater(_vol_window(out, 1.0, 1.9),
                                -30.0, "mixed caption win")
-            self.assertGreater(_vol_window(out, 2.0, 2.9),
+            self.assertGreater(_vol_window(out, 17.0, 17.9),
                                -30.0, "mixed shared-start win")
             self.assertLessEqual(_vol_window(out, 3.0, 3.9),
                                  -60.0, "mixed gap")
-            self.assertGreater(_vol_window(out, 4.0, 4.9),
+            self.assertGreater(_vol_window(out, 33.0, 33.9),
                                -30.0, "mixed text win")
             # File-path SFX at 4.0 with motion on.
             beep = os.path.join(tmp, "beep.wav")
@@ -3361,8 +3482,18 @@ class TestAgentCut(unittest.TestCase):
             self.assertTrue(ok, info)
             y1, x1, n1 = _yellow_stats(out, 1.0)
             y2, x2, n2 = _yellow_stats(out, 2.0)
-            self.assertGreater(n1, 100, f"w1 yellow {n1}")
-            self.assertGreater(n2, 100, f"w2 yellow {n2}")
+            # v1.41.0 Fix 2 calibration: libass rasterizes the
+            # same small word (هذا, 3 thin Naskh letters at
+            # size 40) with fewer strict-threshold yellow pixels
+            # than drawtext did (measured: 47/32 strict, 93/130
+            # pale-yellow, baseline 0 with no caption). The
+            # feature under test is the highlight MOVING
+            # (centroid assertion below, unchanged and passing);
+            # the counts only guard "a highlight is present at
+            # all", and 25 keeps a wide margin over the absent
+            # case (0) while accommodating the new renderer.
+            self.assertGreater(n1, 25, f"w1 yellow {n1}")
+            self.assertGreater(n2, 25, f"w2 yellow {n2}")
             self.assertLess(x2, x1 - 20,
                             f"highlight moved RTL: {x1} -> {x2}")
         finally:
@@ -4382,7 +4513,38 @@ class TestRefactoring(unittest.TestCase):
             direct_frames = self._framemd5_list(direct)
             miss_frames = self._framemd5_list(miss)
             self.assertEqual(len(direct_frames), len(miss_frames))
-            self.assertEqual(direct_frames[:60], miss_frames[:60])
+            # v1.41.0: frames 0-59 (image + text) must match
+            # exactly OR within a +-2-level residual. The old
+            # exactness was an artifact of veryfast/crf 23
+            # quantization erasing +-1 drawtext blending
+            # residuals between the direct path (text drawn
+            # on the clip chain) and the assembly path (text
+            # drawn on segment video); medium/crf 17 plus
+            # lanczos+accurate_rnd (both spec-required)
+            # preserve them (measured: frame 41, 8 V bytes
+            # at delta 1, propagating via prediction). The
+            # guarantee kept is perceptual identity, far
+            # tighter than this test's own accepted 8-level
+            # video-frame residual. The core guarantee above
+            # (miss == hit, byte-identical) is untouched.
+            for _i in range(60):
+                if direct_frames[_i] == miss_frames[_i]:
+                    continue
+                _raws = []
+                for _mp in (direct, miss):
+                    _raws.append(subprocess.run(
+                        ["ffmpeg", "-v", "error", "-i", _mp, "-vf",
+                         "select='eq(n\\,%d)'" % _i, "-frames:v", "1",
+                         "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
+                        capture_output=True).stdout)
+                self.assertEqual(len(_raws[0]), len(_raws[1]))
+                _diffs = [abs(x - y) for x, y in
+                          zip(_raws[0], _raws[1])]
+                self.assertLessEqual(max(_diffs, default=0), 2,
+                                     "frame %d differs by more than "
+                                     "2 levels" % _i)
+                self.assertLessEqual(
+                    sum(_diffs) / max(1, len(_diffs)), 0.05)
             self.assertEqual(self._pcm(direct), self._pcm(miss))
             # Fingerprint: same inputs same hash, changed duration differs.
             _e, vinfo = validate_project(proj)
@@ -4517,7 +4679,7 @@ class TestRefactoring(unittest.TestCase):
         lines = wrap_subtitle_text(ar, 360, 48)
         self.assertGreater(len(lines), 1)
         self.assertEqual(" ".join(lines).split(), ar.split())
-        self.assertEqual(wrap_caption_lines(ar, 48, 360 * 0.9), lines)
+        self.assertEqual(wrap_caption_lines(ar, 48, 360 * 0.8), lines)
         self.assertEqual(wrap_lines("one two three", 48, 1000), ["one two three"])
         cues = [{"text": "Hello {world}", "start": 0.5, "end": 2.0},
                 {"text": "Second", "start": 65.0, "end": 67.5}]
@@ -4739,12 +4901,33 @@ class TestDelta(unittest.TestCase):
         errors, _info = validate_project(p)
         self.assertNotEqual(errors, [])
 
-    # ---- Axis 2: final-master loudnorm ----
+    # ---- Axis 2: final-master loudnorm (v1.41.0: linear) ----
     def test_delta_master_loudnorm(self):
+        from agentcut.render import build_ffmpeg_args
         p = self._vm_project()
         p["output"]["master_loudnorm"] = True
-        g = self._graph(p)
-        self.assertIn("loudnorm=I=-14:TP=-1.5:LRA=11", g)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        measured = {"input_i": -15.0, "input_tp": -1.0,
+                    "input_lra": 8.0, "input_thresh": -34.0}
+        argv, _, td = build_ffmpeg_args(
+            p, info, "/tmp/x.mp4", master_loudnorm_measured=measured)
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        g = " ".join(argv)
+        self.assertIn("loudnorm=I=-14:TP=-1.5:LRA=11:linear=true:"
+                      "measured_I=-15.00:measured_TP=-1.00:"
+                      "measured_LRA=8.00:measured_thresh=-34.00", g)
+        # Skip path: no loudnorm stage at all.
+        argv, _, td = build_ffmpeg_args(
+            p, info, "/tmp/x.mp4", skip_master_loudnorm=True)
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        self.assertNotIn("loudnorm", " ".join(argv))
+        # Neither measured nor skip: a direct graph builder
+        # must choose (render_project always measures first).
+        with self.assertRaises(ValueError):
+            build_ffmpeg_args(p, info, "/tmp/x.mp4")
         # Silent timeline (no audio tracks) skips mastering
         # rather than failing on a -inf loudnorm measurement.
         p = self._img_project()
@@ -4901,8 +5084,11 @@ class TestDelta(unittest.TestCase):
         g = self._graph(p)
         self.assertIn("zoompan", g)
         self.assertIn("(3-2*(", g)  # smoothstep form, not linear
-        self.assertIn("scale=1440:2560", g)  # 2x pre-scale before zoompan
-        self.assertIn("s=720x1280", g)
+        # v1.41.0 Fix 4: 4x pre-scale, zoompan at 2x output,
+        # lanczos downscale to output (was 2x pre-scale, s=WxH).
+        self.assertIn("scale=2880:5120", g)
+        self.assertIn("s=1440x2560", g)
+        self.assertIn("scale=720:1280:flags=lanczos+accurate_rnd", g)
         self.assertIn("fps=30", g)
 
     def test_delta_kb_even_output_dims(self):
@@ -5305,13 +5491,19 @@ class TestVisualLoop(unittest.TestCase):
         tmp = os.path.join(BASE, "data", "test_visual_tmp")
         os.makedirs(tmp, exist_ok=True)
         try:
-            # Graph: base words at 48, highlight words popped to
-            # 60 (48 * 1.25), in the highlight colour with a box.
+            # v1.41.0 Fix 2: word_timings items render through
+            # ONE ass filter, never per-word drawtext filters.
+            # The highlight is a colour inside the connected
+            # line (per-word-window Dialogues in karaoke.ass),
+            # not a popped fontsize — see build_karaoke_ass for
+            # why \t/scale were rejected (measured \t sticking
+            # plus scale reflow). The frame assertions below
+            # still prove the highlight switches words.
             p = self._kinetic_project(emphasis=True)
             graph = self._graph(p)
-            self.assertIn("fontsize='48'", graph)
-            self.assertIn("fontsize='60'", graph)
-            self.assertIn("fontcolor=yellow", graph)
+            self.assertIn("ass=", graph)
+            self.assertIn("fontsdir=", graph)
+            self.assertNotIn("drawtext", graph)
             out = os.path.join(tmp, "kinetic.mp4")
             ok, info = render_project(p, out)
             self.assertTrue(ok, info)
@@ -5326,7 +5518,33 @@ class TestVisualLoop(unittest.TestCase):
                        "-frames:v", "1", "-f", "image2pipe",
                        "-vcodec", "png", "-"]
                 return subprocess.run(cmd, capture_output=True).stdout
-            self.assertEqual(_frame(0.5), _frame(0.9))
+            # v1.41.0: static-scene frames are compared by
+            # pixels, not PNG bytes. The old byte-identity was
+            # an artifact of veryfast/crf 23 quantization
+            # erasing x264's per-frame RD variation on
+            # identical inputs; medium/crf 17 (spec-required)
+            # preserves it (measured: 135/691200 bytes,
+            # max delta 3 — invisible). The guarantee kept
+            # is perceptual identity: same picture, tiny
+            # deltas. Across the word switch the pictures
+            # still differ hugely.
+            def _pixels(png_bytes):
+                import tempfile as _tf
+                with _tf.NamedTemporaryFile(suffix=".png",
+                                            delete=False) as _f:
+                    _f.write(png_bytes)
+                    _p = _f.name
+                _raw = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-i", _p, "-f",
+                     "rawvideo", "-pix_fmt", "rgb24", "-"],
+                    capture_output=True).stdout
+                os.unlink(_p)
+                return _raw
+            _a, _b = _pixels(_frame(0.5)), _pixels(_frame(0.9))
+            self.assertEqual(len(_a), len(_b))
+            self.assertLessEqual(
+                max((abs(x - y) for x, y in zip(_a, _b)), default=0),
+                4)
             self.assertNotEqual(_frame(0.5), _frame(1.5))
             # A non-kinetic control text does not switch.
             p2 = self._kinetic_project()
@@ -5339,7 +5557,14 @@ class TestVisualLoop(unittest.TestCase):
             f05 = subprocess.run(cmd, capture_output=True).stdout
             cmd[4] = "1.5"
             f15 = subprocess.run(cmd, capture_output=True).stdout
-            self.assertEqual(f05, f15)
+            # v1.41.0: same pixel-tolerance rule as above
+            # (static control scene; byte-identity was a
+            # veryfast/crf 23 artifact).
+            _c, _d = _pixels(f05), _pixels(f15)
+            self.assertEqual(len(_c), len(_d))
+            self.assertLessEqual(
+                max((abs(x - y) for x, y in zip(_c, _d)), default=0),
+                4)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -5746,6 +5971,4385 @@ class TestVisualLoop(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertNotIn("text_outside_safe_area",
                          [w["code"] for w in info["warnings"]])
+
+
+class TestLoop141(unittest.TestCase):
+    """Life & Typography package (1.41.0), round 1: kinetic ink
+    measurement + chunk fit."""
+
+    def test_measure_arabic_word_ink_returns_true_width(self):
+        from agentcut.render import _measure_word_ink, find_font_for_text
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            w = _measure_word_ink("المتنافسون",
+                                  find_font_for_text("المتنافسون"),
+                                  60, td, {})
+        self.assertIsNotNone(w, "measurement must not fall back")
+        # Ground truth from a stdlib PNG decode is 227px; the
+        # fixed cropdetect call measures 224.
+        self.assertGreaterEqual(w, 200)
+        self.assertLessEqual(w, 240)
+
+    def test_fit_chunk_widths(self):
+        from agentcut.render import _fit_chunk_widths
+        ws, sp, sc = _fit_chunk_widths([100.0, 120.0], 18.0, 720)
+        self.assertEqual(sc, 1.0)
+        self.assertEqual((ws, sp), ([100.0, 120.0], 18.0))
+        ws, sp, sc = _fit_chunk_widths([400.0, 400.0], 18.0, 720)
+        self.assertLess(sc, 1.0)
+        self.assertAlmostEqual(sum(ws) + sp, 700.0, places=6)
+        self.assertAlmostEqual(ws[0] / ws[1], 1.0, places=6)
+
+    def test_kinetic_arabic_title_fits_frame(self):
+        # The Step-0 defect: the 4-word scene-8 title at size 60
+        # clipped its last word at the left edge (fallback widths
+        # totalled 774px > 720). With true ink widths (470px) it
+        # fits; the frame must show the last word inside the
+        # frame and nothing touching the left edge.
+        import tempfile
+        p = {"id": "loop141", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 2, "size": 60,
+                        "x": "center", "y": 200, "color": "yellow",
+                        "word_timings": [
+                            {"word": "الهجوم", "start": 0.2,
+                             "end": 0.6},
+                            {"word": "المضاد", "start": 0.6,
+                             "end": 1.0},
+                            {"word": "من", "start": 1.0, "end": 1.4},
+                            {"word": "الحافة", "start": 1.4,
+                             "end": 1.8}]}]}
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "k.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 1.0, frame)
+            self.assertEqual((w, h), (720, 1280))
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            edge = any(yellowish(x, y)
+                       for x in range(0, 4)
+                       for y in range(200, 285, 4))
+            self.assertFalse(edge,
+                             "title ink must not touch the left edge")
+            # v1.41.0 Fix 2 recalibration: libass centres by
+            # font advances, so the line spans ~210..510 (tighter
+            # than the old drawtext ink layout's ~125..595). The
+            # last word (leftmost, ~210..282) is what this scan
+            # must catch; 0..250 still excludes the next word
+            # (starting ~296), so the check stays specific.
+            inner = any(yellowish(x, y)
+                        for x in range(0, 251, 2)
+                        for y in range(200, 285, 4))
+            self.assertTrue(inner,
+                            "last word must be visible inside the frame")
+
+
+    def test_duck_amount_db_synthesizes_ducking(self):
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        base = {"id": "dadb", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "pattern.png"),
+                           "duration": 2}],
+                "audio": [{"src": "data/test_media/clip1.mp4",
+                           "kind": "voice", "volume": 1.0},
+                          {"src": "data/test_media/clip2.mp4",
+                           "kind": "music", "volume": 0.8}]}
+        p = dict(base, duck_amount_db=6)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertAlmostEqual(info["ducking"]["amount_db"], 6.0)
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        graph = " ".join(argv)
+        # Deterministic automation, not the sidechain path.
+        self.assertNotIn("sidechaincompress", graph)
+        # Explicit ducking always wins over duck_amount_db.
+        p2 = dict(base, duck_amount_db=6,
+                  ducking={"voice_track": 0, "amount_db": 12,
+                           "windows": [{"start": 0, "end": 2}]})
+        errors, info2 = validate_project(p2)
+        self.assertEqual(errors, [], errors)
+        self.assertAlmostEqual(info2["ducking"]["amount_db"], 12.0)
+        # Validation errors: range, type, missing tracks.
+        for bad in (31, -1, "loud", True):
+            errors, _ = validate_project(dict(base, duck_amount_db=bad))
+            self.assertTrue(errors, bad)
+        no_music = dict(base, duck_amount_db=6)
+        no_music["audio"] = [no_music["audio"][0]]
+        errors, _ = validate_project(no_music)
+        self.assertTrue(errors)
+        no_voice = dict(base, duck_amount_db=6)
+        no_voice["audio"] = [no_voice["audio"][1]]
+        errors, _ = validate_project(no_voice)
+        self.assertTrue(errors)
+
+    def test_bed_audibility_gap_pure(self):
+        from agentcut.render import bed_audibility_gap
+        # Old AI-race mix, from measured LUFS: voice -15.99,
+        # bed -16.37, volume 0.3, duck 12 -> gap ~22.8 dB.
+        gap = bed_audibility_gap(-15.99, -16.37, 0.3, 12)
+        self.assertGreater(gap, 18.0)
+        # Fixed mix: bed 0.8, duck 6 -> gap ~8.3 dB.
+        gap = bed_audibility_gap(-15.99, -16.37, 0.8, 6)
+        self.assertLess(gap, 18.0)
+        self.assertEqual(bed_audibility_gap(-16.0, -16.0, 0.0, 12),
+                         float("inf"))
+
+    def _sine_pair(self, tmp):
+        voice = os.path.join(tmp, "voice.mp3")
+        music = os.path.join(tmp, "music.mp3")
+        for path, freq in ((voice, 440), (music, 220)):
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", f"sine=frequency={freq}:duration=2",
+                            "-c:a", "libmp3lame", path],
+                           check=True, timeout=60)
+        return voice, music
+
+    def test_music_bed_warning_old_vs_fixed_mix(self):
+        from agentcut.render import check_music_bed
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            voice, music = self._sine_pair(td)
+            base = {"id": "bed", "version": 1,
+                    "output": {"width": 360, "height": 640, "fps": 30},
+                    "clips": [{"id": "a", "kind": "image",
+                               "src": os.path.join(BASE, "data",
+                                                   "test_media",
+                                                   "pattern.png"),
+                               "duration": 2}]}
+
+            def _check(vol, duck):
+                p = dict(base, audio=[
+                    {"src": voice, "kind": "voice", "volume": 1.0},
+                    {"src": music, "kind": "music", "volume": vol}],
+                    ducking={"voice_track": 0, "amount_db": duck,
+                             "windows": [{"start": 0, "end": 2}]})
+                errors, info = validate_project(p)
+                self.assertEqual(errors, [], errors)
+                return check_music_bed(info)
+            old = _check(0.3, 12)
+            self.assertIsNotNone(old)
+            self.assertTrue(old["warn"], old)
+            self.assertGreater(old["gap_db"], 18.0)
+            fixed = _check(0.8, 6)
+            self.assertIsNotNone(fixed)
+            self.assertFalse(fixed["warn"], fixed)
+            # Sidechain path: no honest number, so no warning.
+            p = dict(base, audio=[
+                {"src": voice, "kind": "voice", "volume": 1.0},
+                {"src": music, "kind": "music", "volume": 0.3}])
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            self.assertIsNone(check_music_bed(info))
+
+    def test_producer_qa_warns_on_inaudible_bed(self):
+        from agentcut.render import produce_video
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            voice, music = self._sine_pair(td)
+            brief = {"id": "qa-bed", "format": "square",
+                     "clips": [{"src": os.path.join(
+                         BASE, "data", "test_media", "poster.png"),
+                         "duration": 2}],
+                     "audio": [{"src": voice, "kind": "voice",
+                                "volume": 1.0},
+                               {"src": music, "kind": "music",
+                                "volume": 0.3}],
+                     "ducking": {"voice_track": 0, "amount_db": 12,
+                                 "windows": [{"start": 0, "end": 2}]}}
+            out = os.path.join(td, "qa-bed.mp4")
+            ok, info = produce_video(brief, out)
+            self.assertTrue(ok, info)
+            self.assertTrue(any("music_bed_inaudible" in w
+                                for w in info["qa"]["warnings"]),
+                            info["qa"]["warnings"])
+
+    def test_diagram_sfx_validates_and_schedules(self):
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        p = {"id": "dgsfx", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 4}],
+             "diagrams": [{"id": "d1", "template": "chart",
+                           "params": {"values": [10, 12, 14]},
+                           "start": 1, "end": 3.5, "draw": 1.0,
+                           "sfx": "ding"}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["diagrams"][0]["sfx"], "ding")
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        self.assertIn("sfx", " ".join(argv))
+        bad = {"id": "dgsfx-bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "duration": 2}],
+               "diagrams": [{"id": "d1", "template": "chart",
+                             "params": {"values": [10, 12]},
+                             "start": 0, "end": 2, "sfx": "nope"}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+
+    def _explainer_brief(self, tmp, **extra):
+        voice = os.path.join(tmp, "n.mp3")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=1",
+                        "-c:a", "libmp3lame", voice],
+                       check=True, timeout=60)
+        srt = os.path.join(tmp, "c.srt")
+        with open(srt, "w", encoding="utf-8") as fh:
+            fh.write("1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+        brief = {"id": "rich", "style": "blackboard",
+                 "background": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                 "title": "T", "motion": "gentle",
+                 "scenes": [
+                     {"id": "s1", "title": "One", "narration": voice,
+                      "captions": srt,
+                      "diagram": {"template": "chart",
+                                  "params": {"values": [10, 12]}},
+                      "keywords": [{"text": "KEY", "start": 0.2,
+                                    "end": 0.8}]},
+                     {"id": "s2", "title": "Two", "narration": voice,
+                      "captions": srt,
+                      "diagram": {"template": "chart",
+                                  "params": {"values": [10, 12]}},
+                      "keywords": [{"text": "KEY", "start": 0.2,
+                                    "end": 0.8}]}]}
+        brief.update(extra)
+        return brief
+
+    def test_produce_explainer_rich_sfx(self):
+        from agentcut.render import produce_explainer
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            brief = self._explainer_brief(td, sfx_density="rich")
+            out = os.path.join(td, "rich.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            proj = info["project"]
+            self.assertEqual(proj["clips"][1].get("sfx"), "whoosh")
+            self.assertIsNone(proj["clips"][0].get("sfx"))
+            self.assertTrue(all(t.get("sfx") == "pop"
+                                for t in proj["texts"]
+                                if t.get("text") == "KEY"))
+            self.assertTrue(all(d.get("sfx") == "ding"
+                                for d in proj["diagrams"]))
+            self.assertIn("warnings", info)
+            brief2 = self._explainer_brief(td)
+            out2 = os.path.join(td, "min.mp4")
+            ok2, info2 = produce_explainer(brief2, out2)
+            self.assertTrue(ok2, info2)
+            proj2 = info2["project"]
+            self.assertIsNone(proj2["clips"][1].get("sfx"))
+            self.assertTrue(all("sfx" not in t for t in proj2["texts"]
+                                if t.get("text") == "KEY"))
+            self.assertTrue(all("sfx" not in d
+                                for d in proj2["diagrams"]))
+            bad = self._explainer_brief(td, sfx_density="loud")
+            ok3, info3 = produce_explainer(bad, os.path.join(td, "x.mp4"))
+            self.assertFalse(ok3)
+            self.assertEqual(info3["code"], "INVALID_SCHEMA")
+
+
+    def _hold_project(self, hold):
+        p = {"id": "loop141-hold", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 4}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 4, "size": 60,
+                        "x": "center", "y": 200, "color": "yellow",
+                        "word_timings": [
+                            {"word": "الهجوم", "start": 0.2,
+                             "end": 0.6},
+                            {"word": "المضاد", "start": 0.6,
+                             "end": 1.0},
+                            {"word": "من", "start": 1.0, "end": 1.4},
+                            {"word": "الحافة", "start": 1.4,
+                             "end": 1.8}]}]}
+        if hold is not None:
+            p["texts"][0]["hold"] = hold
+        return p
+
+    def test_kinetic_title_holds_to_text_end(self):
+        # R3: the Step-0 limitation — a scene title lived only
+        # in its first 5s (here: word windows end at 1.8s of a
+        # 4s text). By default the base words now persist to
+        # the text's own end, so the title is still on screen
+        # at t=3.0, in base yellow, with no highlight box
+        # (highlights keep their word windows).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "h.mp4")
+            ok, info = render_project(self._hold_project(None), out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 3.0, frame)
+            self.assertEqual((w, h), (720, 1280))
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            self.assertTrue(any(yellowish(x, y)
+                                for x in range(0, 720, 2)
+                                for y in range(200, 285, 2)),
+                            "title must still be visible at t=3.0")
+
+    def test_kinetic_title_hold_false_keeps_chunk_window(self):
+        # hold: false restores the old behaviour: nothing of
+        # the title remains after the chunk window ends.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "h0.mp4")
+            ok, info = render_project(self._hold_project(False), out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 3.0, frame)
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            self.assertFalse(any(yellowish(x, y)
+                                 for x in range(0, 720, 2)
+                                 for y in range(200, 285, 2)),
+                             "title must be gone at t=3.0 with hold false")
+            bad = self._hold_project("yes")
+            errors, _ = validate_project(bad)
+            self.assertTrue(errors)
+
+
+    def test_chart_grid_points_and_fill(self):
+        from agentcut.diagrams import chart_grid_points, template_chart
+        # Default gridlines unchanged (backward compatibility).
+        g = chart_grid_points({"values": [10, 12, 14, 18]})
+        self.assertEqual(g["grid_ys"], [160, 260, 360])
+        self.assertEqual(g["plot"], {"x0": 140, "x1": 830, "y0": 60,
+                                     "y1": 470, "baseline": 500})
+        self.assertEqual(len(g["curve_points"]), 4)
+        # Custom grid values map through the same normalization
+        # as the curve: value 14 sits exactly on curve point 3.
+        g2 = chart_grid_points({"values": [10, 12, 14, 18],
+                                "y_grid_values": [10, 14, 18]})
+        self.assertAlmostEqual(g2["grid_ys"][1],
+                               g2["curve_points"][2][1], delta=1.0)
+        # Fill: ~50 translucent yellow verticals, all before
+        # the white curve stroke; no-fill template unchanged.
+        _, _, st = template_chart({"values": [10, 12, 14, 18],
+                                   "fill": True,
+                                   "y_grid_values": [10, 14, 18]})
+        fills = [s for s in st if s.get("color") == "yellow"
+                 and s.get("weight") == 5]
+        self.assertGreater(len(fills), 40)
+        curve_i = next(i for i, s in enumerate(st)
+                       if s.get("kind") == "polyline"
+                       and s.get("color") == "white"
+                       and s.get("width") == 9)
+        self.assertTrue(all(st.index(f) < curve_i for f in fills))
+        _, _, st0 = template_chart({"values": [10, 12, 14, 18]})
+        self.assertEqual(len(st0), 7)
+        # Validation of the new params.
+        base = {"id": "ch", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "pattern.png"),
+                           "duration": 2}],
+                "diagrams": [{"id": "d1", "template": "chart",
+                              "params": {"values": [10, 12],
+                                         "fill": True,
+                                         "y_grid_values": [10, 12]},
+                              "start": 0, "end": 2}]}
+        errors, info = validate_project(base)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["diagrams"][0]["params"]["fill"], True)
+        bad = {"id": "ch-bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "duration": 2}],
+               "diagrams": [{"id": "d1", "template": "chart",
+                             "params": {"values": [10, 12],
+                                        "fill": "yes"},
+                             "start": 0, "end": 2}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+        bad2 = {"id": "ch-bad2", "version": 1,
+                "output": {"width": 360, "height": 640, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "pattern.png"),
+                           "duration": 2}],
+                "diagrams": [{"id": "d1", "template": "chart",
+                              "params": {"values": [10, 12],
+                                         "y_grid_values": ["high"]},
+                              "start": 0, "end": 2}]}
+        errors, _ = validate_project(bad2)
+        self.assertTrue(errors)
+
+    def test_chart_fill_renders_yellow_area(self):
+        # Real render: the translucent fill must tint the plot
+        # area yellow — blended over the dark board it reads as
+        # dark olive (r-b well above the board's ~0), not as
+        # bright yellow, so the check is a tint excess, not a
+        # brightness threshold. The opaque yellow tip sits
+        # above the scanned band and cannot false-positive it.
+        import tempfile
+        p = {"id": "chfill", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 4}],
+             "diagrams": [{"id": "d1", "template": "chart",
+                           "params": {"values": [10, 12, 14, 18],
+                                      "fill": True},
+                           "start": 0, "end": 4, "draw": 3.5,
+                           "size": 0.9, "x": 36, "y": 400}]}
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "ch.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 3.9, frame)
+
+            def fill_tint(x, y):
+                r, g, b = px(x, y)[:3]
+                return (r - b) > 30 and g > 80
+            # Diagram at x=36, size 0.9: plot interior maps to
+            # roughly x 162..783, fill band y ~500..850.
+            self.assertTrue(any(fill_tint(x, y)
+                                for x in range(170, 780, 4)
+                                for y in range(700, 850, 4)),
+                            "fill area must tint the plot")
+
+
+    def test_display_font_option(self):
+        # Noto Sans Arabic Bold validates, renders, and shows text;
+        # an unknown font name fails validation with a fix.
+        import tempfile
+        p = {"id": "dispfont", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 2, "size": 60,
+                        "x": "center", "y": 200, "color": "yellow",
+                        "font": "noto-sans-bold"}]}
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        bad = {"id": "dispfont-bad", "version": 1,
+               "output": {"width": 720, "height": 1280, "fps": 30},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "board.png"),
+                          "duration": 2}],
+               "texts": [{"text": "hello", "start": 0, "end": 2,
+                          "font": "comic-sans"}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(errors)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "d.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 1.0, frame)
+            self.assertEqual((w, h), (720, 1280))
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            self.assertTrue(any(yellowish(x, y)
+                                for x in range(0, 720, 2)
+                                for y in range(200, 285, 2)),
+                            "Noto Sans Arabic title must render")
+
+    def test_display_font_kinetic_fits(self):
+        # Kinetic measurement must use the item font: a
+        # Noto Sans Arabic kinetic title fits the frame (nothing
+        # touches the left edge), proving the measurement
+        # follows the font instead of the Noto default.
+        import tempfile
+        p = {"id": "dispkin", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 2, "size": 60,
+                        "x": "center", "y": 200, "color": "yellow",
+                        "font": "noto-sans-bold",
+                        "word_timings": [
+                            {"word": "الهجوم", "start": 0.2,
+                             "end": 0.6},
+                            {"word": "المضاد", "start": 0.6,
+                             "end": 1.0},
+                            {"word": "من", "start": 1.0, "end": 1.4},
+                            {"word": "الحافة", "start": 1.4,
+                             "end": 1.8}]}]}
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "k.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 1.0, frame)
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            self.assertFalse(any(yellowish(x, y)
+                                 for x in range(0, 4)
+                                 for y in range(200, 285, 4)),
+                             "Noto Sans Arabic kinetic title must not touch "
+                             "the left edge")
+
+    def test_card_style_renders_backdrop(self):
+        # The card preset fills box geometry from the style,
+        # so the graph gains the rounded geq backdrop; the
+        # frame shows the title text over it.
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        import tempfile
+        p = {"id": "card", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "عنوان البطاقة",
+                        "start": 0, "end": 2, "style": "card",
+                        "x": "center", "y": 200}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            _shutil.rmtree(_td, ignore_errors=True)
+        graph = " ".join(argv)
+        self.assertIn("geq", graph)
+        self.assertIn("box0", graph)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "c.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 1.0, frame)
+
+            def whitish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 180 and b > 180
+            self.assertTrue(any(whitish(x, y)
+                                for x in range(0, 720, 2)
+                                for y in range(200, 285, 2)),
+                            "card title text must render")
+
+
+
+    def test_text_text_overlap_warning(self):
+        # v1.41.0: two texts whose estimated boxes overlap in a
+        # shared window warn; disjoint windows do not.
+        import copy
+        base = {"id": "tt", "version": 1,
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "clips": [{"id": "a", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "board.png"),
+                           "duration": 4}],
+                "texts": [{"text": "LABELTEXT", "start": 1, "end": 3,
+                           "size": 44, "x": "center", "y": 360,
+                           "color": "white"},
+                          {"text": "POP", "start": 1, "end": 3,
+                           "size": 54, "x": "center", "y": 340,
+                           "color": "yellow", "sfx": "pop"}]}
+        errors, info = validate_project(base)
+        self.assertEqual(errors, [], errors)
+        codes = [w.get("code") for w in info.get("warnings", [])]
+        self.assertIn("text_text_overlap_warning", codes)
+        apart = copy.deepcopy(base)
+        apart["texts"][1]["start"] = 3.5
+        apart["texts"][1]["end"] = 4.0
+        apart["clips"][0]["duration"] = 4
+        errors, info = validate_project(apart)
+        self.assertEqual(errors, [], errors)
+        codes = [w.get("code") for w in info.get("warnings", [])]
+        self.assertNotIn("text_text_overlap_warning", codes)
+
+    def test_resolve_overlaps_moves_pop_below_diagram(self):
+        # v1.41.0, scene-4 generalization: a pop overlapping a
+        # diagram box moves below the whole diagram, the
+        # overlap warning disappears, and the project itself
+        # is NOT mutated (the renderer applies the move).
+        p = {"id": "res-diag", "version": 1, "resolve_overlaps": True,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 4}],
+             "texts": [{"text": "POP", "start": 1, "end": 3,
+                        "size": 54, "x": "center", "y": 500,
+                        "color": "yellow", "sfx": "pop"}],
+             "diagrams": [{"id": "d1", "template": "balance",
+                           "start": 0, "end": 4, "draw": 3.5,
+                           "size": 0.72, "x": 101, "y": 420}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        moves = info.get("overlap_moves", [])
+        self.assertEqual(len(moves), 1, moves)
+        self.assertEqual(moves[0]["index"], 0)
+        self.assertEqual(moves[0]["old_y"], 500)
+        # Diagram box: y 420, height 518*560/900 = 322.2, so
+        # the pop must land below 420 + 322.2 + 16.
+        self.assertGreater(moves[0]["new_y"], 758)
+        codes = [w.get("code") for w in info.get("warnings", [])]
+        self.assertNotIn("layer_text_overlap_warning", codes)
+        self.assertNotIn("text_text_overlap_warning", codes)
+        self.assertEqual(p["texts"][0]["y"], 500)
+
+    def test_resolve_overlaps_moves_pop_below_label_and_renders(self):
+        # v1.41.0, new case: a pop overlapping a label text
+        # moves below the label, and the render shows it at
+        # the new y (not the old y). v1.42.0, Fix 3: the zone
+        # manager then moves it again, into the callout band
+        # [768, 896] (no diagram active, so top-aligned at
+        # 768) — the render assertion follows the FINAL
+        # position (zone wins over cascade), while the cascade
+        # assertion above still pins the intermediate move.
+        import tempfile
+        p = {"id": "res-label", "version": 1, "resolve_overlaps": True,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 4}],
+             "texts": [{"text": "LABELTEXT", "start": 1, "end": 3,
+                        "size": 44, "x": "center", "y": 360,
+                        "color": "white"},
+                       {"text": "POP", "start": 1, "end": 3,
+                        "size": 54, "x": "center", "y": 340,
+                        "color": "yellow", "sfx": "pop"}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        moves = info.get("overlap_moves", [])
+        self.assertEqual(len(moves), 1, moves)
+        self.assertEqual(moves[0]["index"], 1)
+        # Label box: y 360, height 44*1.4 = 61.6, so the pop
+        # lands at 360 + 61.6 + 16 = 437.6.
+        self.assertAlmostEqual(moves[0]["new_y"], 437.6, places=1)
+        zone = info.get("zone_moves", [])
+        self.assertEqual(len(zone), 1, zone)
+        self.assertEqual(zone[0]["index"], 1)
+        self.assertAlmostEqual(zone[0]["old_y"], 437.6, places=1)
+        self.assertEqual(zone[0]["new_y"], 768.0)
+        codes = [w.get("code") for w in info.get("warnings", [])]
+        self.assertNotIn("text_text_overlap_warning", codes)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "r.mp4")
+            ok, _ = render_project(p, out)
+            self.assertTrue(ok, _)
+            frame = os.path.join(td, "f.png")
+            w, h, px = _frame_png(out, 2.0, frame)
+
+            def yellowish(x, y):
+                r, g, b = px(x, y)[:3]
+                return r > 180 and g > 150 and b < 120
+            self.assertTrue(any(yellowish(x, y)
+                                for x in range(0, 720, 2)
+                                for y in range(768, 844, 2)),
+                            "moved pop must render at its zone y")
+            self.assertFalse(any(yellowish(x, y)
+                                 for x in range(0, 720, 2)
+                                 for y in range(340, 416, 2)),
+                             "moved pop must NOT render at its old y")
+            self.assertFalse(any(yellowish(x, y)
+                                 for x in range(0, 720, 2)
+                                 for y in range(437, 514, 2)),
+                             "moved pop must NOT render at the cascade y")
+
+    def test_resolve_overlaps_type(self):
+        p = {"id": "res-type", "version": 1, "resolve_overlaps": "yes",
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}]}
+        errors, _ = validate_project(p)
+        self.assertTrue(errors)
+        self.assertTrue(any(e.get("field") == "resolve_overlaps"
+                            for e in errors), errors)
+
+
+    def test_encoding_defaults_v141(self):
+        # v1.41.0 (Fix 1): crf 17, preset medium, bt709
+        # metadata, faststart, resolution-scaled VBV cap,
+        # bt709 final node, 192k/48k audio — and exactly one
+        # out_range=tv in the graph (the final node).
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "enc", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "audio": [{"src": os.path.join(BASE, "data", "test_media",
+                                             "clip1.mp4"),
+                         "kind": "music", "volume": 0.8}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        self.assertIn("17", argv[argv.index("-crf") + 1])
+        self.assertEqual(argv[argv.index("-preset") + 1], "medium")
+        self.assertEqual(argv[argv.index("-colorspace") + 1], "bt709")
+        self.assertEqual(argv[argv.index("-color_primaries") + 1], "bt709")
+        self.assertEqual(argv[argv.index("-color_trc") + 1], "bt709")
+        self.assertEqual(argv[argv.index("-movflags") + 1], "+faststart")
+        self.assertIn("colorprim=bt709:transfer=bt709:colormatrix=bt709",
+                      argv[argv.index("-x264-params") + 1])
+        # 720x1280 = 921,600 px < 1080p tier -> 8M/16M.
+        self.assertEqual(argv[argv.index("-maxrate") + 1], "8M")
+        self.assertEqual(argv[argv.index("-bufsize") + 1], "16M")
+        self.assertEqual(argv[argv.index("-b:a") + 1], "192k")
+        self.assertEqual(argv[argv.index("-ar") + 1], "48000")
+        g = " ".join(argv)
+        self.assertIn("out_color_matrix=bt709", g)
+        self.assertIn("flags=lanczos+accurate_rnd+full_chroma_int", g)
+        self.assertEqual(g.count("out_range=tv"), 1)
+        self.assertIn("[vfinal]", g)
+
+    def test_sidechain_smooth_params_v141(self):
+        # v1.41.0 (Fix 5): the auto sidechain uses the smooth
+        # spec parameters, not the old hard 0.02/8/200/1000.
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "sc", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 4}],
+             "audio": [{"src": os.path.join(BASE, "data", "test_media",
+                                             "clip1.mp4"),
+                         "kind": "music", "volume": 0.8},
+                        {"src": os.path.join(BASE, "data", "test_media",
+                                             "clip2.mp4"),
+                         "kind": "voice", "volume": 1.0, "start": 1.0}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        g = " ".join(argv)
+        self.assertIn("sidechaincompress=threshold=0.03:ratio=4:"
+                      "attack=40:release=500:knee=4", g)
+
+    def test_loudnorm_i_option_v141(self):
+        # v1.41.0: output.loudnorm_i selects the master
+        # target (default -14; the spec's -16 is a choice).
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "li", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30,
+                        "master_loudnorm": True, "loudnorm_i": -16},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 4}],
+             "audio": [{"src": os.path.join(BASE, "data", "test_media",
+                                             "clip1.mp4"),
+                         "kind": "music", "volume": 0.8}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        measured = {"input_i": -15.0, "input_tp": -1.0,
+                    "input_lra": 8.0, "input_thresh": -34.0}
+        argv, _, td = build_ffmpeg_args(
+            p, info, "/tmp/x.mp4", master_loudnorm_measured=measured)
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11:linear=true",
+                      " ".join(argv))
+        bad = {"id": "li-bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30,
+                          "loudnorm_i": 0},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "duration": 2}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e.get("field") == "output.loudnorm_i"
+                            for e in errors), errors)
+
+    def test_per_track_linear_loudnorm_v141(self):
+        # v1.41.0: a loudnorm track is measured and rendered
+        # with the linear form (constant gain, no pumping).
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "pt", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "pattern.png"),
+                        "duration": 4}],
+             "audio": [{"src": os.path.join(BASE, "data", "test_media",
+                                             "clip1.mp4"),
+                         "kind": "voice", "volume": 1.0,
+                         "loudnorm": True}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        g = " ".join(argv)
+        self.assertIn("linear=true:measured_I=", g)
+
+
+    def test_color_pipeline_rgb_renders_v141(self):
+        # v1.41.0 (Fix 1): rgb mode runs the internal graph
+        # in full-range gbrp/gbrap with a single final
+        # conversion to yuv420p. Multi-feature project
+        # (clip treatment + overlay + text + diagram +
+        # grade) must render, probe as yuv420p/bt709, and
+        # its graph must contain gbrp/gbrap with exactly
+        # one yuv420p (the final node).
+        import tempfile
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "rgb", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30,
+                        "color_pipeline": "rgb"},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2, "grade": "cinematic",
+                        "treatment": {"vignette": 0.3,
+                                      "shadow": 0.5}}],
+             "overlays": [{"id": "ov", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "pattern.png"),
+                           "start": 0, "duration": 2}],
+             "texts": [{"text": "RGB", "start": 0, "end": 2,
+                        "size": 48, "x": "center", "y": 100}],
+             "diagrams": [{"id": "d1", "template": "balance",
+                           "start": 0, "end": 2, "draw": 1.5,
+                           "size": 0.5, "x": 50, "y": 300}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        g = " ".join(argv)
+        self.assertIn("format=gbrp", g)
+        self.assertIn("format=gbrap", g)
+        self.assertEqual(g.count("format=yuv420p"), 1)
+        with tempfile.TemporaryDirectory() as td2:
+            out = os.path.join(td2, "rgb.mp4")
+            ok, rinfo = render_project(p, out)
+            self.assertTrue(ok, rinfo)
+            probe = ffprobe(out)
+            streams = {s["codec_type"]: s for s in probe["streams"]}
+            self.assertEqual(streams["video"]["pix_fmt"], "yuv420p")
+            self.assertEqual(streams["video"]["color_space"], "bt709")
+            frame = os.path.join(td2, "f.png")
+            w, h, _ = _frame_png(out, 1.0, frame)
+            self.assertEqual((w, h), (360, 640))
+
+    def test_color_pipeline_yuv_default_v141(self):
+        # Default (no option) keeps the historical chain:
+        # yuv420p throughout, no gbrp/gbrap anywhere.
+        from agentcut.render import build_ffmpeg_args
+        p = {"id": "yuv", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        g = " ".join(argv)
+        self.assertNotIn("gbrp", g)
+        self.assertNotIn("gbrap", g)
+        self.assertGreater(g.count("format=yuv420p"), 1)
+        bad = {"id": "yuv-bad", "version": 1,
+               "output": {"width": 360, "height": 640, "fps": 30,
+                          "color_pipeline": "cmyk"},
+               "clips": [{"id": "a", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "board.png"),
+                          "duration": 2}]}
+        errors, _ = validate_project(bad)
+        self.assertTrue(any(e.get("field") == "output.color_pipeline"
+                            for e in errors), errors)
+
+    def test_color_pipeline_cached_v141(self):
+        # Segment fingerprint includes the pipeline, so an
+        # rgb cached render reuses its own segments and
+        # still produces a valid deliverable.
+        import tempfile
+        from agentcut.render import render_project_cached
+        p = {"id": "rgb-cache", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30,
+                        "color_pipeline": "rgb"},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}]}
+        with tempfile.TemporaryDirectory() as td:
+            cache = os.path.join(td, "cache")
+            miss = os.path.join(td, "miss.mp4")
+            ok, info = render_project_cached(p, miss, cache_dir=cache)
+            self.assertTrue(ok, info)
+            hit = os.path.join(td, "hit.mp4")
+            ok, info = render_project_cached(p, hit, cache_dir=cache)
+            self.assertTrue(ok, info)
+            self.assertEqual(info["segments_reused"], 1)
+            probe = ffprobe(hit)
+            streams = {s["codec_type"]: s for s in probe["streams"]}
+            self.assertEqual(streams["video"]["pix_fmt"], "yuv420p")
+
+    # ---- Round 9: Fix 3 capsule SDF + Fix 4 sub-pixel camera ----
+    def test_sdf_coverage_matches_formula(self):
+        # Engine-level: dense (step 2, no wobble) slanted line,
+        # radius 3, alpha 0.95. For pixels near the edge, the
+        # canvas alpha must equal the capsule SDF formula
+        # alpha * clamp(0.5 + r - d) for the pixel centre's
+        # true distance d to the line — exact, not scalloped.
+        import math as _math
+        from agentcut.diagrams import Canvas
+        c = Canvas(300, 200)
+        pts = [(20.0 + 260.0 * i / 130.0, 20.0 + 130.0 * i / 130.0)
+               for i in range(131)]
+        c.draw_segments(pts, (255, 255, 255), 6, 0.95, 0)
+        dx, dy = 260.0, 130.0
+        L = _math.hypot(dx, dy)
+        nx, ny = -dy / L, dx / L
+        for t in (0.3, 0.5, 0.7):
+            bx, by = 20.0 + dx * t, 20.0 + dy * t
+            for off in (-1.0, 0.0, 1.0, 2.0, 3.0, 4.0):
+                px, py = bx + nx * off, by + ny * off
+                ix, iy = int(_math.floor(px)), int(_math.floor(py))
+                cx, cy = ix + 0.5, iy + 0.5
+                d = abs((cx - 20.0) * nx + (cy - 20.0) * ny)
+                want = 0.95 * min(1.0, max(0.0, 0.5 + 3.0 - d))
+                got = c.buf[(iy * 300 + ix) * 4 + 3] / 255.0
+                self.assertAlmostEqual(got, want, delta=0.05,
+                                       msg=f"t={t} off={off} d={d:.2f}")
+
+    def test_sdf_gap_breaking_and_continuity(self):
+        # Dense runs joined by a 30px jump: the jump chord
+        # stays empty, while each run is continuous.
+        from agentcut.diagrams import Canvas
+        run1 = [(20.0 + 2.0 * i, 100.0) for i in range(21)]
+        run2 = [(200.0 + 2.0 * i, 60.0) for i in range(21)]
+        c = Canvas(300, 200)
+        c.draw_segments(run1 + run2, (255, 255, 255), 6, 0.95, 0)
+        # Jump chord midpoint (110, 80): no ink.
+        self.assertEqual(c.buf[(80 * 300 + 110) * 4 + 3], 0)
+        # Both runs solid at their centres.
+        self.assertGreater(c.buf[(100 * 300 + 40) * 4 + 3], 200)
+        self.assertGreater(c.buf[(60 * 300 + 220) * 4 + 3], 200)
+
+    def test_sdf_animator_last_frame_identical(self):
+        # Per-path property: the animator's last frame is
+        # byte-identical to a direct full render, with real
+        # (non-empty) content, on whichever canvas path this
+        # environment selects (PIL supersampled or stdlib).
+        from agentcut.diagrams import (DiagramAnimator,
+                                       render_diagram_rgba)
+        strokes = [{"kind": "polyline",
+                    "points": [[10, 10], [100, 50], [200, 40]],
+                    "width": 5},
+                   {"kind": "line",
+                    "points": [[20, 150], [250, 150]], "width": 4},
+                   {"kind": "arrow",
+                    "points": [[30, 180], [220, 180]], "width": 5}]
+        anim = DiagramAnimator(strokes, 300, 200, 30, 2.0)
+        last = None
+        while True:
+            f = anim.next_frame()
+            if f is None:
+                break
+            last = f
+        direct = render_diagram_rgba(strokes, 300, 200, 1.0)
+        self.assertEqual(last, direct)
+        self.assertGreater(
+            sum(1 for i in range(3, len(direct), 4) if direct[i] > 0),
+            1000)
+
+    def test_sdf_pil_auto_path(self):
+        # PIL present -> supersampled canvas selected
+        # automatically; absent -> stdlib canvas. Either way the
+        # canvas draws SDF segments (never stamped discs).
+        from agentcut.diagrams import _new_canvas, _PIL_IMAGE
+        cv = _new_canvas(100, 100)
+        if _PIL_IMAGE is not None:
+            self.assertEqual(type(cv).__name__, "_ScaledCanvas")
+        else:
+            self.assertEqual(type(cv).__name__, "Canvas")
+        cv.draw_segments([(10.0 + 2.0 * i, 50.0) for i in range(41)],
+                         (255, 255, 255), 6, 0.95, 0)
+        self.assertGreater(cv.opaque_pixel_count(), 0)
+
+    def test_camera_image_supersamples_4x(self):
+        # v1.41.0 Fix 4: image camera pre-scales 4x, zoompan
+        # outputs 2x, lanczos downscales to output. Video
+        # camera keeps 2x (spec minimum) — covered by the
+        # existing camera graph test, which asserts zoompan
+        # terms but no output size.
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        p = {"id": "cam4x", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2,
+                        "camera": [
+                            {"t": 0, "x": 0.3, "y": 0.5,
+                             "scale": 1.0},
+                            {"t": 2.0, "x": 0.7, "y": 0.5,
+                             "scale": 1.2}]}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        try:
+            graph = " ".join(argv)
+            self.assertIn("scale=1440:2560", graph)
+            self.assertIn("s=720x1280", graph)
+            self.assertIn("scale=360:640:flags=lanczos+accurate_rnd",
+                          graph)
+        finally:
+            if td:
+                _shutil.rmtree(td, ignore_errors=True)
+
+    # ---- Round 8: Fix 2 native ASS karaoke + wrap table + 80% cap ----
+    def test_ass_karaoke_unified_no_per_word_drawtext(self):
+        # A kinetic title renders through ONE ass filter; the
+        # .ass file holds one Dialogue per word window (full
+        # connected line, highlight inside it) plus the hold
+        # Dialogue — and the graph holds no drawtext at all for
+        # a project whose only text is kinetic.
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        p = {"id": "loop141-ass", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "HELLO WORLD", "start": 0, "end": 2,
+                        "size": 48, "x": "center", "y": 100,
+                        "word_timings": [{"word": "HELLO", "start": 0.2,
+                                          "end": 1.0},
+                                         {"word": "WORLD", "start": 1.0,
+                                          "end": 1.8}]}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        try:
+            graph = " ".join(argv)
+            self.assertIn("ass=", graph)
+            self.assertIn("fontsdir=", graph)
+            self.assertNotIn("drawtext", graph)
+            with open(os.path.join(td, "karaoke.ass"),
+                      encoding="utf-8") as _fh:
+                ass = _fh.read()
+            self.assertNotIn("\\t(", ass)
+            dialogues = [ln for ln in ass.splitlines()
+                         if ln.startswith("Dialogue:")]
+            # 2 word windows + 1 hold (text ends at 2.0, last
+            # chunk window ends at 1.8).
+            self.assertEqual(len(dialogues), 3)
+            import re as _re
+            bodies = [_re.sub(r"\{[^}]*\}", "", ln.split(",", 9)[9])
+                        for ln in dialogues]
+            self.assertEqual(bodies, ["HELLO WORLD"] * 3)
+            # Word windows highlight exactly their word; the
+            # hold Dialogue is a plain base line (no colour tag).
+            self.assertIn("{\\c", dialogues[0])
+            self.assertIn("{\\c", dialogues[1])
+            self.assertNotIn("{\\c", dialogues[2])
+        finally:
+            if td:
+                _shutil.rmtree(td, ignore_errors=True)
+
+    def test_ass_karaoke_arabic_run_order(self):
+        # v1.42.0 Fix 2: TAGGED Arabic word lines are emitted in
+        # RUN order — window i emits [words after i] + [the
+        # highlighted word] + [words before i], each run's words
+        # in logical order — with RLM anchors (line start +
+        # after every closing colour tag) and WrapStyle: 2.
+        # libass places tag-delimited runs LTR in emission
+        # order while shaping words RTL within each run, so
+        # plain logical order scrambles the line AND the naive
+        # full reversal scrambles it the other way (both proven
+        # by reproduction renders in R1). For 2 words the run
+        # order happens to read ["المضاد", "الهجوم"] in both
+        # windows; the 4-word TestLoop142 test pins the full
+        # run order. Untagged plain/gap lines stay logical
+        # (see test_ass_plain_and_gap_keep_logical_arabic_order).
+        from agentcut.srt import build_karaoke_ass
+        import re as _re
+        ev = [{"kind": "karaoke", "start": 0.2, "end": 1.0,
+               "font": ("Noto Naskh Arabic", 0), "size": 60,
+               "base_color": "white", "hi_color": "yellow", "align": 8,
+               "x": 360, "y": 200,
+               "words": [{"word": "الهجوم", "start": 0.2, "end": 0.6},
+                         {"word": "المضاد", "start": 0.6, "end": 1.0}]}]
+        ass = build_karaoke_ass(ev, 720, 1280)
+        self.assertIn("WrapStyle: 2", ass)
+        dialogues = [ln for ln in ass.splitlines()
+                     if ln.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 2)
+        bodies = [_re.sub(r"\{[^}]*\}", "", ln.split(",", 9)[9])
+                  .replace("\u200f", "")
+                  for ln in dialogues]
+        self.assertEqual(bodies, ["المضاد الهجوم"] * 2)
+        # First window highlights word1 (الهجوم, rightmost);
+        # second window highlights word2 (المضاد, leftmost).
+        self.assertIn("{\\c&H0000FFFF&}الهجوم", dialogues[0])
+        self.assertIn("{\\c&H0000FFFF&}المضاد", dialogues[1])
+        # RLM anchors: line start and after the closing tag.
+        for ln in dialogues:
+            body = ln.split(",", 9)[9]
+            self.assertTrue(
+                body.startswith("{\\pos(360,200)}\u200f"), body)
+            self.assertIn("{\\c&H00FFFFFF&}\u200f", body)
+
+    def test_ass_karaoke_gap_event(self):
+        # A gap between word windows gets a plain base line, so
+        # coverage is continuous across the chunk.
+        from agentcut.srt import build_karaoke_ass
+        ev = [{"kind": "karaoke", "start": 0.0, "end": 1.5,
+               "font": ("DejaVu Sans", 0), "size": 36,
+               "base_color": "white", "hi_color": "yellow", "align": 8,
+               "x": 180, "y": 520,
+               "words": [{"word": "one", "start": 0.0, "end": 0.5},
+                         {"word": "two", "start": 0.8, "end": 1.5}]}]
+        ass = build_karaoke_ass(ev, 360, 640)
+        dialogues = [ln for ln in ass.splitlines()
+                     if ln.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 3)
+        self.assertIn("0:00:00.50,0:00:00.80", dialogues[2])
+        self.assertNotIn("{\\c", dialogues[2])
+        with self.assertRaises(ValueError):
+            build_karaoke_ass(
+                [{**ev[0], "base_color": "chartreuse"}], 360, 640)
+
+    def test_ass_plain_and_gap_keep_logical_arabic_order(self):
+        # v1.42.0 Fix 2: tagged word windows follow the RUN
+        # order (see test_ass_karaoke_arabic_run_order), while
+        # untagged plain/gap events stay in LOGICAL order with
+        # an RLM at line start. Reversing an untagged line
+        # double-reverses it and the title displays backwards
+        # (v2 frame finding, R11b).
+        from agentcut.srt import build_karaoke_ass
+        base = {"font": ("Noto Naskh Arabic", 0), "size": 60,
+                "base_color": "white", "hi_color": "yellow",
+                "align": 8, "x": 360, "y": 200}
+        ev = [{"kind": "karaoke", "start": 0.0, "end": 1.5,
+               "words": [{"word": "الهجوم", "start": 0.0, "end": 0.5},
+                         {"word": "المضاد", "start": 0.8, "end": 1.5}],
+               **base},
+              {"kind": "plain", "start": 1.5, "end": 2.5,
+               "text": "الهجوم المضاد", **base}]
+        ass = build_karaoke_ass(ev, 720, 1280)
+        dialogues = [ln for ln in ass.splitlines()
+                     if ln.startswith("Dialogue:")]
+
+        def _words(ln):
+            body = ln.split(",", 9)[9]
+            out, depth = [], 0
+            for ch in body:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                elif depth == 0 and ch != "\u200f":
+                    out.append(ch)
+            return "".join(out).split()
+
+        self.assertEqual(len(dialogues), 4)
+        # Tagged word windows: RUN order (for 2 words, both
+        # windows read ["المضاد", "الهجوم"] stripped).
+        self.assertEqual(_words(dialogues[0]), ["المضاد", "الهجوم"])
+        self.assertEqual(_words(dialogues[1]), ["المضاد", "الهجوم"])
+        # Untagged gap + hold: logical order (FriBidi orders them).
+        self.assertEqual(_words(dialogues[2]), ["الهجوم", "المضاد"])
+        self.assertEqual(_words(dialogues[3]), ["الهجوم", "المضاد"])
+        self.assertIn("0:00:00.50,0:00:00.80", dialogues[2])
+        self.assertNotIn("c&H", dialogues[2])
+        self.assertNotIn("c&H", dialogues[3])
+        # RLM anchors on every Arabic dialogue.
+        for ln in dialogues:
+            body = ln.split(",", 9)[9]
+            self.assertTrue(
+                body.startswith("{\\pos(360,200)}\u200f"), body)
+
+    def test_wrap_weight_table_and_80_cap(self):
+        from agentcut.srt import (_char_weight, _word_width, wrap_lines,
+                                  wrap_subtitle_text)
+        # Narrow < default < wide; diacritics add no width.
+        self.assertLess(_char_weight("ا"), _char_weight("ب"))
+        self.assertLess(_char_weight("ب"), _char_weight("م"))
+        self.assertEqual(_word_width("ب", 48), _word_width("ب\u064b", 48))
+        # Narrow words pack tighter than flat 0.6 ever allowed:
+        # three 3-alef words fit 150px by weight (136.8) but not
+        # by flat 0.6 (316.8).
+        self.assertEqual(wrap_lines("ااا ااا ااا", 48, 150),
+                         ["ااا ااا ااا"])
+        # 80% cap: "one two three" (319.2px) wraps at 288
+        # (0.8 x 360) although it fit the old 0.9 cap (324).
+        self.assertEqual(wrap_subtitle_text("one two three", 360, 48),
+                         ["one two", "three"])
+
+    # ---- Round 10: Fix 6 modern layout + diagram cards ----
+
+    def test_diagram_card_validation(self):
+        # Card fields validate like SFX: bool / colour / 0..1,
+        # carried into the resolved diagram only when clean.
+        def _proj(dg):
+            return {"version": 1, "id": "t",
+                    "output": {"width": 720, "height": 1280, "fps": 30},
+                    "clips": [{"id": "c1", "kind": "image",
+                               "src": os.path.join(
+                                   BASE, "data", "test_media", "board.png"),
+                               "duration": 2.0}],
+                    "diagrams": [dg]}
+        good = {"id": "d1", "template": "chart",
+                "params": {"values": [1, 2, 3]},
+                "start": 0.0, "end": 2.0, "size": 0.72,
+                "x": 101, "y": 420, "card": True, "card_opacity": 0.6}
+        errors, info = validate_project(_proj(good))
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(info["diagrams"][0]["card"])
+        self.assertEqual(info["diagrams"][0]["card_opacity"], 0.6)
+        self.assertEqual(
+            (info["diagrams"][0]["canvas_w"],
+             info["diagrams"][0]["canvas_h"]), (900, 560))
+        for bad, msg in (
+                ({"card": "yes"}, "card must be true or false"),
+                ({"card_opacity": 1.5}, "card_opacity must be"),
+                ({"card_color": "chartreuse"}, "unknown diagram card_color")):
+            dg = dict(good)
+            dg.update(bad)
+            errors, _ = validate_project(_proj(dg))
+            self.assertTrue(any(msg in e["message"] for e in errors),
+                            (bad, errors))
+
+    def test_diagram_card_graph_and_frame(self):
+        # The card input enters the graph, its overlay lands
+        # BEFORE the diagram overlay at the same place/size
+        # (both chains scale dw:-2), and the frame shows the
+        # board darkened under the card with the white diagram
+        # still drawn on top of it.
+        from agentcut.render import build_ffmpeg_args, render_project
+        from agentcut.diagrams import (encode_diagram_video,
+                                       rounded_card_rgba, write_png_rgba)
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-card-")
+        try:
+            board = os.path.join(BASE, "data", "test_media", "board.png")
+            dg = {"id": "d1", "template": "chart",
+                  "params": {"values": [10, 14, 18, 16, 20]},
+                  "start": 0.0, "end": 2.0, "draw": 1.0,
+                  "size": 0.72, "x": 101, "y": 420,
+                  "card": True, "card_opacity": 0.45}
+            proj = {"version": 1, "id": "cardt",
+                    "output": {"width": 720, "height": 1280, "fps": 30},
+                    "clips": [{"id": "c1", "kind": "image", "src": board,
+                               "duration": 2.0}],
+                    "diagrams": [dg]}
+            errors, info = validate_project(proj)
+            self.assertEqual(errors, [], errors)
+            rdg = info["diagrams"][0]
+            vid = os.path.join(tmp, "dg.mov")
+            encode_diagram_video(rdg, 30, vid)
+            card = os.path.join(tmp, "card.png")
+            write_png_rgba(card, rdg["canvas_w"], rdg["canvas_h"],
+                           rounded_card_rgba(rdg["canvas_w"],
+                                             rdg["canvas_h"], (0, 0, 0),
+                                             0.45))
+            rdg["_video"] = vid
+            rdg["_card"] = card
+            argv, _, td = build_ffmpeg_args(proj, info, "/tmp/x.mp4")
+            try:
+                graph = " ".join(argv)
+                self.assertIn(card, argv)
+                self.assertIn("cdg0", graph)
+                self.assertIn("vcdg0", graph)
+                # Both chains scale to the same display width.
+                self.assertGreaterEqual(graph.count("scale=518:-2"), 2)
+                # Card overlay precedes the diagram overlay.
+                self.assertLess(graph.index("vcdg0"), graph.index("vdg0"))
+            finally:
+                if td:
+                    import shutil as _shutil
+                    _shutil.rmtree(td, ignore_errors=True)
+            # Frames: card darkens the board under it, the
+            # diagram still draws white on top of the card.
+            out_card = os.path.join(tmp, "card.mp4")
+            ok, _ = render_project(proj, out_card, timeout=300)
+            self.assertTrue(ok)
+            proj2 = {"version": 1, "id": "cardt2",
+                     "output": {"width": 720, "height": 1280, "fps": 30},
+                     "clips": [{"id": "c1", "kind": "image", "src": board,
+                                "duration": 2.0}],
+                     "diagrams": [dict(dg, card=False)]}
+            out_plain = os.path.join(tmp, "plain.mp4")
+            ok, _ = render_project(proj2, out_plain, timeout=300)
+            self.assertTrue(ok)
+            _, _, pxc = _frame_png(out_card, 1.5, os.path.join(tmp, "fc.png"))
+            _, _, pxp = _frame_png(out_plain, 1.5, os.path.join(tmp, "fp.png"))
+            # (200, 450): inside the card, clear of chart
+            # strokes (right of the y-axis at ~150, above the
+            # curve and gridlines). Board 130 -> card 67.
+            sc = sum(pxc(200, 450)[:3])
+            sp = sum(pxp(200, 450)[:3])
+            self.assertLess(sc, sp - 30, (sc, sp))
+            # (50, 100): outside the card — renders agree.
+            oc = sum(pxc(50, 100)[:3])
+            op = sum(pxp(50, 100)[:3])
+            self.assertLess(abs(oc - op), 15, (oc, op))
+            # White diagram strokes visible over the card.
+            white = 0
+            for x in range(170, 620, 4):
+                for y in range(420, 740, 4):
+                    r, g, b = pxc(x, y)[:3]
+                    if r > 200 and g > 200 and b > 200:
+                        white += 1
+            self.assertGreater(white, 50, white)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_modern_look_layout_and_render(self):
+        # Modern explainer: card titles, carded diagrams by
+        # default, and the 10% safe-margin stack — fixed title
+        # at 128 (0.1 x 1280), scene title at 228 below it,
+        # keywords at 342 below that, diagram y 330 clamped
+        # to 436 (below the keyword line, above captions).
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-modern-")
+        try:
+            bg = os.path.join(BASE, "data", "test_media", "board.png")
+            v1 = os.path.join(tmp, "v1.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=2", v1],
+                           check=True)
+            s1 = os.path.join(tmp, "s1.srt")
+            with open(s1, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\n"
+                         "الجملة الأولى\n")
+            brief = {
+                "id": "modern-t", "style": "blackboard", "look": "modern",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": bg, "title": "عنوان",
+                "chapters": False, "motion": "gentle", "music": None,
+                "scenes": [
+                    {"id": "s1", "title": "مشهد",
+                     "narration": v1, "captions": s1,
+                     "diagram": {"template": "causes",
+                                 "params": {"rows": 2}, "draw": 1.0,
+                                 "size": 0.72, "x": 101, "y": 330},
+                     "keywords": [{"text": "كلمة", "start": 0.5,
+                                   "end": 1.5, "sfx": "pop"}]},
+                ]}
+            out = os.path.join(tmp, "modern.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            proj = info["project"]
+            fixed = proj["texts"][0]
+            self.assertEqual((fixed["text"], fixed["y"]), ("عنوان", 128))
+            stitle = [t for t in proj["texts"]
+                      if t["text"] == "مشهد"][0]
+            self.assertEqual(stitle["style"], "card")
+            self.assertEqual(stitle["y"], 228)
+            kw = [t for t in proj["texts"] if t["text"] == "كلمة"][0]
+            self.assertEqual(kw["y"], 342)
+            dg = proj["diagrams"][0]
+            self.assertTrue(dg["card"])
+            self.assertEqual((dg["x"], dg["y"]), (101, 436))
+            probe = json.loads(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams",
+                 "-of", "json", out],
+                capture_output=True, text=True, check=True).stdout)
+            video = [s for s in probe["streams"]
+                     if s["codec_type"] == "video"][0]
+            self.assertEqual((video["width"], video["height"]), (720, 1280))
+            self.assertTrue(info["review_frames"], info)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_canvas_background_generates_and_renders(self):
+        # background "canvas" writes a dual-tone canvas beside
+        # the output, the project references it, and the frame
+        # is darker at the top than at the bottom.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-canvas-")
+        try:
+            v1 = os.path.join(tmp, "v1.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=2", v1],
+                           check=True)
+            s1 = os.path.join(tmp, "s1.srt")
+            with open(s1, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\n"
+                         "الجملة الأولى\n")
+            brief = {
+                "id": "canvas-t", "style": "blackboard", "look": "modern",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": "canvas",
+                "chapters": False, "motion": "gentle", "music": None,
+                "scenes": [{"id": "s1", "title": "مشهد",
+                            "narration": v1, "captions": s1}]}
+            out = os.path.join(tmp, "canvas.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            canvas = os.path.join(tmp, "canvas-t-modern-canvas.png")
+            self.assertTrue(os.path.isfile(canvas), canvas)
+            self.assertEqual(info["project"]["clips"][0]["src"], canvas)
+            _, _, px = _frame_png(out, 1.0, os.path.join(tmp, "f.png"))
+            top = sum(px(360, 200)[:3])
+            bottom = sum(px(360, 1100)[:3])
+            self.assertLess(top, bottom - 10, (top, bottom))
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+class TestLoop142(unittest.TestCase):
+    # ---- Round 1 (Fix 2): ASS karaoke word order — run-order
+    # emission + RLM anchors. v2 frames proved the 1.41.0 model
+    # wrong: emitting tagged Arabic lines in REVERSE word order
+    # scrambles the display index-dependently (t=362 "الوكلاء
+    # المقود يمسكون", t=427 "الهجوم الحافة من المضاد"; t=533
+    # correct at that instant). The mechanism, proven by
+    # reproduction renders: libass places tag-delimited runs
+    # LEFT-TO-RIGHT in emission order while shaping words
+    # right-to-left WITHIN each run — so the fix emits runs in
+    # reverse reading order ([words after i] + [highlighted
+    # word i] + [words before i], each run logical), with RLM
+    # anchors at line start and after every closing colour tag
+    # and WrapStyle: 2. A plain logical-order + RLM attempt
+    # was tried first in this round and FAILED the frame check
+    # (highlight flipped to the wrong side) — the run order is
+    # what the frames prove.
+    def test_fix2_karaoke_ass_run_order_all_indices(self):
+        from agentcut.srt import build_karaoke_ass
+        import re as _re
+        words8 = ["الهجوم", "المضاد", "من", "الحافة"]
+        ev = [{"kind": "karaoke", "start": 0.0, "end": 5.0,
+               "font": ("Noto Naskh Arabic", 0), "size": 60,
+               "base_color": "white", "hi_color": "yellow", "align": 8,
+               "x": 360, "y": 200,
+               "words": [{"word": w, "start": i * 1.25,
+                          "end": (i + 1) * 1.25}
+                         for i, w in enumerate(words8)]}]
+        ass = build_karaoke_ass(ev, 720, 1280)
+        self.assertIn("WrapStyle: 2", ass)
+        dialogues = [ln for ln in ass.splitlines()
+                     if ln.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 4)
+        # Run-order emission (Fix 2): window i emits [words
+        # after i] + [highlighted word i] + [words before i],
+        # each run's words in logical order. Stripped of tags
+        # and RLM, the bodies must equal exactly that.
+        expected = [
+            ["المضاد", "من", "الحافة", "الهجوم"],
+            ["من", "الحافة", "المضاد", "الهجوم"],
+            ["الحافة", "من", "الهجوم", "المضاد"],
+            ["الحافة", "الهجوم", "المضاد", "من"],
+        ]
+        for i, ln in enumerate(dialogues):
+            body = ln.split(",", 9)[9]
+            got = _re.sub(r"\{[^}]*\}", "", body).replace(
+                "\u200f", "").split()
+            self.assertEqual(got, expected[i], (i, body))
+            # RLM anchors: line start (after {\pos}) and after
+            # every closing colour tag.
+            self.assertTrue(
+                body.startswith("{\\pos(360,200)}\u200f"), body)
+            self.assertIn("{\\c&H00FFFFFF&}\u200f", body)
+            # Exactly one word highlighted, and it is word i.
+            self.assertIn("{\\c&H0000FFFF&}%s" % words8[i], body)
+            self.assertEqual(body.count("{\\c&H0000FFFF&}"), 1)
+        # Second title from the v2 frames: "أربعة وثمانين بالمئة"
+        # (3 words) must follow the same run order at every index.
+        words3 = ["أربعة", "وثمانين", "بالمئة"]
+        ev3 = [{"kind": "karaoke", "start": 0.0, "end": 3.0,
+                "font": ("Noto Naskh Arabic", 0), "size": 60,
+                "base_color": "white", "hi_color": "yellow", "align": 8,
+                "x": 360, "y": 200,
+                "words": [{"word": w, "start": float(i),
+                           "end": float(i + 1)}
+                          for i, w in enumerate(words3)]}]
+        ass3 = build_karaoke_ass(ev3, 720, 1280)
+        dialogues3 = [ln for ln in ass3.splitlines()
+                      if ln.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues3), 3)
+        expected3 = [
+            ["وثمانين", "بالمئة", "أربعة"],
+            ["بالمئة", "وثمانين", "أربعة"],
+            ["بالمئة", "أربعة", "وثمانين"],
+        ]
+        for i, ln in enumerate(dialogues3):
+            body = ln.split(",", 9)[9]
+            got = _re.sub(r"\{[^}]*\}", "", body).replace(
+                "\u200f", "").split()
+            self.assertEqual(got, expected3[i], (i, body))
+
+    # ---- Round 2 (Fix 1): ligatures / text shaping.
+    # Both bundled Arabic fonts carry complete OpenType
+    # Arabic tables (GSUB liga/rlig/fina/medi/init + GPOS
+    # mark/mkmk, incl. the لا ligature uniFEFB/uniFEFC —
+    # verified with fontTools), and no code reshapes logical
+    # Arabic into Presentation Forms (the only FE70..FEFF
+    # hits in src/ are detection, not reshaping). What was
+    # missing: drawtext never asked for shaping explicitly.
+    def test_fix1_every_drawtext_has_text_shaping(self):
+        # Every drawtext filter in the built graph — text,
+        # caption, and review timecode — must carry
+        # text_shaping=1 explicitly (v1.42.0 Fix 1).
+        from agentcut.render import build_ffmpeg_args
+        import shutil as _shutil
+        p = {"id": "loop142-shaping", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 2}],
+             "texts": [{"text": "HELLO", "start": 0, "end": 2,
+                        "size": 48, "x": "center", "y": 100}],
+             "captions": [{"text": "مرحبا", "start": 0, "end": 2}],
+             "timecode": True}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        try:
+            graph = " ".join(argv)
+            parts = graph.split("drawtext=")[1:]
+            # Text + caption + review timecode = 3 drawtexts.
+            self.assertEqual(len(parts), 3, graph)
+            for part in parts:
+                chunk = part.split("[", 1)[0]
+                self.assertIn("text_shaping=1", chunk, chunk)
+        finally:
+            if td:
+                _shutil.rmtree(td, ignore_errors=True)
+
+    def test_fix1_shaping_signal(self):
+        # Shaping demonstrably works with the bundled Noto
+        # Naskh font: "لا بالمئة" renders 37% narrower with
+        # half the ink clusters at text_shaping=1 than at 0
+        # (joining + the لا ligature compress the line). The
+        # test compares the two directly, so it is
+        # self-calibrating, not pinned to magic widths.
+        import subprocess as _sp
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="agentcut-shape-")
+        try:
+            word_path = os.path.join(tmp, "word.txt")
+            with open(word_path, "w", encoding="utf-8") as fh:
+                fh.write("لا بالمئة")
+            font = os.path.join(BASE, "fonts",
+                                "NotoNaskhArabic-Regular.ttf")
+
+            def _measure(shaping):
+                out = os.path.join(tmp, f"s{shaping}.png")
+                _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                         "-i", "color=c=black:s=800x200",
+                         "-vf", (f"drawtext=fontfile={font}:"
+                                 f"textfile={word_path}:fontsize=60:"
+                                 f"fontcolor=white:x=20:y=60:"
+                                 f"expansion=none:text_shaping={shaping}"),
+                         "-frames:v", "1", out],
+                        check=True, timeout=60)
+                _w, _h, px = _png_px(out)
+                xs = []
+                for y in range(_h):
+                    for x in range(_w):
+                        r, g, b = px(x, y)[:3]
+                        if r + g + b > 300:
+                            xs.append(x)
+                self.assertTrue(xs, f"no ink at shaping={shaping}")
+                cols = set(xs)
+                clusters, cur, gap = 0, False, 0
+                for x in range(min(xs), max(xs) + 1):
+                    if x in cols:
+                        if gap >= 3 and cur:
+                            clusters += 1
+                        cur, gap = True, 0
+                    else:
+                        gap += 1
+                if cur:
+                    clusters += 1
+                return max(xs) - min(xs) + 1, clusters
+
+            w1, c1 = _measure(1)
+            w0, c0 = _measure(0)
+            self.assertLess(w1, 0.8 * w0, (w1, w0))
+            self.assertLess(c1, c0, (c1, c0))
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fix1_no_presentation_forms_reshaping(self):
+        # Logical Arabic in must stay logical Arabic out:
+        # bidi_display_text may add only directional controls
+        # (RLE/PDF/RLM), never Presentation Forms
+        # (U+FE70..U+FEFF). The spec's "delete any manual
+        # reshaping" is satisfied by absence; this pins it.
+        from agentcut.render import bidi_display_text
+        for text in ("عملاقة", "بالمئة", "بالسوق", "فالسؤال",
+                     "لا إله إلا الله", "الرسالة بالطاقة!"):
+            out = bidi_display_text(text)
+            bad = [ch for ch in out
+                   if "\uFE70" <= ch <= "\uFEFF"]
+            self.assertEqual(bad, [], (text, repr(out)))
+            # The logical text survives intact inside the
+            # directional controls.
+            stripped = out.replace("\u202b", "").replace(
+                "\u202c", "").replace("\u200f", "")
+            self.assertEqual(stripped, text, (text, repr(out)))
+
+    def test_fix2_rendered_kinetic_order_centroid(self):
+        # Renders the scene-8 title and checks, frame by frame,
+        # that the yellow highlight moves RIGHT-TO-LEFT across
+        # the four word windows (RTL): the centroid of yellow
+        # pixels must strictly decrease. The centroid alone
+        # CANNOT prove word order — the 1.41.0 reversed emission
+        # passed a centroid check while scrambling the line —
+        # so this test ALSO template-matches the hold line's
+        # ink clusters (the known-correct reference: hold
+        # titles read correctly in the v2 frames) against each
+        # kinetic window: every hold cluster must match in the
+        # window at a high IoU and in the SAME left-to-right
+        # sequence. (A column-profile comparison was tried
+        # first and REJECTED: it does not discriminate — the
+        # scrambled old-code window scored 0.088 against the
+        # hold while a correct new-code window scored 0.103.)
+        p = {"id": "loop142-kinetic", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 6}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 6, "size": 30,
+                        "x": "center", "y": 100,
+                        "word_timings": [
+                            {"word": "الهجوم", "start": 0.0, "end": 1.25},
+                            {"word": "المضاد", "start": 1.25, "end": 2.5},
+                            {"word": "من", "start": 2.5, "end": 3.75},
+                            {"word": "الحافة", "start": 3.75, "end": 5.0}]}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop142.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        # Hold-line templates (5-6s): large ink clusters only.
+        hold_ink = _ink_mask(out, 5.5)
+        hold_groups = [g for g in _ink_groups(hold_ink)
+                       if len(g[2]) >= 40]
+        self.assertGreaterEqual(len(hold_groups), 3, hold_groups)
+        centroids, spans = [], []
+        for t in (0.625, 1.875, 3.125, 4.375):
+            frame = os.path.join(BASE, "data", "test_loop142_frame.png")
+            w, h, px = _frame_png(out, t, frame)
+            yellow, ink = [], []
+            for y in range(90, 160):
+                for x in range(w):
+                    r, g, b = px(x, y)[:3]
+                    if r > 200 and g > 200 and b < 100:
+                        yellow.append(x)
+                    if r + g + b > 300:
+                        ink.append(x)
+            self.assertTrue(yellow, f"no yellow highlight at t={t}")
+            centroids.append(sum(yellow) / len(yellow))
+            spans.append((min(ink), max(ink)))
+            # Word order: every hold cluster must appear in
+            # this window, in the same left-to-right sequence.
+            window_ink = _ink_mask(out, t)
+            best_xs = []
+            for _x0, _x1, template in hold_groups:
+                score, best_x = _best_template_iou(template,
+                                                   window_ink)
+                self.assertGreater(score, 0.5,
+                                   (t, _x0, score, best_x))
+                best_xs.append(best_x)
+            for a, b in zip(best_xs, best_xs[1:]):
+                self.assertLess(a, b, (t, best_xs))
+        # RTL: the highlighted word moves left as the index grows.
+        for a, b in zip(centroids, centroids[1:]):
+            self.assertLess(b, a - 5, centroids)
+        # The line itself must not jump: its ink span stays put
+        # across windows (only the colour changes).
+        for lo, hi in spans[1:]:
+            self.assertLess(abs(lo - spans[0][0]), 20, spans)
+            self.assertLess(abs(hi - spans[0][1]), 20, spans)
+
+    def test_fix2b_kinetic_word_spacing(self):
+        # R7b (Fix 2, kinetic-space loss): the v3 frames showed
+        # the highlighted word losing its LEADING SPACE at every
+        # highlight index > 0 — 16/26 kinetic frames
+        # ("الوكلاءيمسكون", "الهجومالمضاد") — because the gap
+        # between the highlighted word and the before-run was
+        # emitted as the leading space of the before-run after
+        # the closing colour tag + RLM, and libass drops a
+        # leading space after a tag boundary. The fix emits that
+        # gap inside the highlighted run, before the closing tag
+        # (a trailing space survives; the after-run's trailing
+        # space rendered fine). This test pins the emission and
+        # renders the scene-8 title, counting ink groups at
+        # min_gap=6 (a word space is ~6px at size 30; sub-word
+        # gaps after non-joining letters are 1-3px): 4 words ->
+        # 4 groups at EVERY window midpoint AND the hold, with
+        # spans matching the hold. The old code gives 3 groups
+        # at indices 1-3 (measured in the R7b experiment:
+        # t=1.875 spans (105,141),(148,163),(170,251) —
+        # المضاد joined الهجوم). The R1 tests could not catch
+        # this: the ASS text is identical up to whitespace
+        # placement, and the centroid/template checks tolerated
+        # the ~6px reflow.
+        from agentcut.srt import build_karaoke_ass
+        words8 = ["الهجوم", "المضاد", "من", "الحافة"]
+        ev = [{"kind": "karaoke", "start": 0.0, "end": 5.0,
+               "font": ("Noto Naskh Arabic", 0), "size": 60,
+               "base_color": "white", "hi_color": "yellow", "align": 8,
+               "x": 360, "y": 200,
+               "words": [{"word": w, "start": i * 1.25,
+                          "end": (i + 1) * 1.25}
+                         for i, w in enumerate(words8)]}]
+        ass = build_karaoke_ass(ev, 720, 1280)
+        dialogues = [ln for ln in ass.splitlines()
+                     if ln.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 4)
+        for i, ln in enumerate(dialogues):
+            body = ln.split(",", 9)[9]
+            if i == 0:
+                # No before-run: no trailing space needed.
+                self.assertNotIn("{\\c&H0000FFFF&}%s " % words8[0],
+                                 body)
+            else:
+                # The gap sits inside the highlighted run,
+                # before the closing base tag — never as the
+                # leading space of the before-run.
+                self.assertIn("{\\c&H0000FFFF&}%s {\\c&H00FFFFFF&}"
+                              % words8[i], body)
+        # Rendered: same project as the R1 centroid test.
+        p = {"id": "loop142-kinetic-space", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": 6}],
+             "texts": [{"text": "الهجوم المضاد من الحافة",
+                        "start": 0, "end": 6, "size": 30,
+                        "x": "center", "y": 100,
+                        "word_timings": [
+                            {"word": "الهجوم", "start": 0.0,
+                             "end": 1.25},
+                            {"word": "المضاد", "start": 1.25,
+                             "end": 2.5},
+                            {"word": "من", "start": 2.5, "end": 3.75},
+                            {"word": "الحافة", "start": 3.75,
+                             "end": 5.0}]}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop142.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        hold_ink = _ink_mask(out, 5.5, y0=90, y1=160, x0=90, x1=270)
+        hold_groups = _ink_groups(hold_ink, min_gap=6)
+        self.assertEqual(len(hold_groups), 4, hold_groups)
+        hold_spans = [(g[0], g[1]) for g in hold_groups]
+        for t in (0.625, 1.875, 3.125, 4.375):
+            ink = _ink_mask(out, t, y0=90, y1=160, x0=90, x1=270)
+            groups = _ink_groups(ink, min_gap=6)
+            self.assertEqual(len(groups), 4, (t, groups))
+            spans = [(g[0], g[1]) for g in groups]
+            for (lo, hi), (hlo, hhi) in zip(spans, hold_spans):
+                self.assertLess(abs(lo - hlo), 3,
+                                (t, spans, hold_spans))
+                self.assertLess(abs(hi - hhi), 3,
+                                (t, spans, hold_spans))
+
+    # ---- Round 3 (Fix 3): vertical zone manager.
+    # The v2 03:13 case: the overlap cascade moved the scene-4
+    # pop to 16px below the diagram box, which reads as touching
+    # the card. The zone manager enforces strict bands (header
+    # 5-18%, diagram 22-56%, callout 60-70%, subtitle 76-92% of
+    # frame height) and a >=40px gap below any active diagram.
+    def _zone_project(self, width=720, height=1280, resolve=True,
+                      pop_size=54, pop_y=340, diag_size=0.72,
+                      diag_x=101, diag_y=420, pop_start=3.0,
+                      pop_end=5.0, diag_start=2.0, diag_end=11.0,
+                      title_y=200):
+        return {
+            "id": "zone-test", "version": 1,
+            "output": {"width": width, "height": height, "fps": 30},
+            "clips": [{"id": "c1", "kind": "image",
+                       "src": "data/test_media/board.png",
+                       "duration": 12.0}],
+            "diagrams": [{"id": "diag4", "start": diag_start,
+                          "end": diag_end, "draw": 3.5,
+                          "template": "balance",
+                          "params": {"left": 5, "right": 5},
+                          "size": diag_size, "x": diag_x, "y": diag_y,
+                          "card": True}],
+            "texts": [
+                {"text": "العنوان الرئيسي", "start": 0.0, "end": 12.0,
+                 "size": 54, "x": "center", "y": 80,
+                 "font": "noto-sans-bold"},
+                {"text": "عنوان المشهد العالق", "start": 0.0, "end": 5.0,
+                 "size": 60, "x": "center", "y": title_y,
+                 "font": "noto-sans-bold"},
+                {"text": "كيمي كي ثري", "start": pop_start, "end": pop_end,
+                 "size": pop_size, "color": "yellow", "x": "center",
+                 "y": pop_y, "animation": "pop",
+                 "animation_duration": 0.8, "sfx": "pop",
+                 "font": "noto-sans-bold"},
+                {"text": "المفتوح ضد المغلق", "start": diag_start,
+                 "end": diag_end, "size": 44, "color": "white",
+                 "x": "center", "y": 350, "font": "noto-sans-bold"},
+            ],
+            "captions": [{"text": "هذا نص توضيحي طويل يمتد على سطرين "
+                                  "أو ثلاثة أسطر لاختبار موضع الترجمة",
+                          "start": 0.0, "end": 6.0}],
+            "resolve_overlaps": resolve,
+        }
+
+    def test_fix3_pop_moved_40px_below_diagram(self):
+        # The exact v2 scene-4 geometry: diagram box bottom
+        # 742.56, cascade moved the pop to 758.56 (+16), the
+        # zone manager must push it to 782.56 (+40) — inside
+        # the callout band [768, 896].
+        ok, info = validate_project(self._zone_project())
+        self.assertEqual(ok, [], ok)
+        zone = {m["index"]: m for m in info.get("zone_moves", [])}
+        self.assertIn(2, zone)
+        self.assertEqual(zone[2]["old_y"], 758.56)
+        self.assertEqual(zone[2]["new_y"], 782.56)
+        self.assertLessEqual(782.56 + 54 * 1.4, 0.70 * 1280)
+        codes = [w["code"] for w in info.get("warnings", [])]
+        self.assertNotIn("callout_outside_zone", codes)
+        self.assertNotIn("caption_outside_subtitle_zone", codes)
+
+    def test_fix3_pop_without_diagram_goes_to_callout_top(self):
+        # No diagram active in the pop window: the pop still
+        # belongs in the callout band, top-aligned at 0.60H.
+        # (Diagram window 2.0-6.0 keeps draw 3.5s legal.)
+        proj = self._zone_project(pop_start=6.0, pop_end=8.0,
+                                  diag_start=2.0, diag_end=6.0)
+        ok, info = validate_project(proj)
+        self.assertEqual(ok, [], ok)
+        zone = {m["index"]: m for m in info.get("zone_moves", [])}
+        self.assertIn(2, zone)
+        self.assertEqual(zone[2]["new_y"], 768.0)
+
+    def test_fix3_zone_off_warns_never_moves(self):
+        # resolve_overlaps off: nothing moves, every zone
+        # violation is a warning, and the old caption anchor
+        # (block bottom 1210.4 > 1177.6) is preserved.
+        ok, info = validate_project(self._zone_project(resolve=False))
+        self.assertEqual(ok, [], ok)
+        self.assertEqual(info.get("zone_moves"), [])
+        self.assertEqual(info.get("overlap_moves"), [])
+        codes = [w["code"] for w in info.get("warnings", [])]
+        self.assertIn("callout_outside_zone", codes)
+        self.assertIn("caption_outside_subtitle_zone", codes)
+        self.assertIn("text_crosses_zone_boundary", codes)
+        from agentcut.render import build_ffmpeg_args
+        argv, total, td = build_ffmpeg_args(
+            self._zone_project(resolve=False), info, "/tmp/z.mp4")
+        graph = " ".join(argv)
+        self.assertIn("y='1160.0'", graph)
+
+    def test_fix3_caption_anchor_clamped(self):
+        # With the clamp on, the 2-line caption block tops at
+        # 1078.6 (bottom exactly 1177.6 = 0.92*1280); with it
+        # off, the old anchor tops at 1111.4 / 1160.0.
+        from agentcut.render import build_ffmpeg_args
+        for resolve, expect in ((True, "1078.6"), (False, "1111.4")):
+            ok, info = validate_project(self._zone_project(
+                resolve=resolve))
+            self.assertEqual(ok, [], ok)
+            argv, total, td = build_ffmpeg_args(
+                self._zone_project(resolve=resolve), info, "/tmp/z.mp4")
+            graph = " ".join(argv)
+            self.assertIn("y='" + expect, graph, graph[:400])
+            if resolve:
+                self.assertNotIn("y='1160.0'", graph)
+
+    def test_fix3_zones_scale_to_16x9(self):
+        # 1280x720: bands scale by H — callout [432, 504],
+        # header [36, 129.6], diagram [158.4, 403.2]. A size-36
+        # pop over a small diagram (bottom 338.9) lands at the
+        # callout top 432.0; the y=100 size-36 title crosses
+        # header/diagram.
+        proj = self._zone_project(
+            width=1280, height=720, pop_size=36, pop_y=200,
+            diag_size=0.3, diag_x=448, diag_y=100,
+            diag_start=2.0, diag_end=11.0, title_y=100)
+        ok, info = validate_project(proj)
+        self.assertEqual(ok, [], ok)
+        zone = {m["index"]: m for m in info.get("zone_moves", [])}
+        self.assertIn(2, zone)
+        self.assertEqual(zone[2]["new_y"], 432.0)
+        codes = [w["code"] for w in info.get("warnings", [])]
+        self.assertIn("text_crosses_zone_boundary", codes)
+
+    def test_fix3_rendered_pop_in_callout_band(self):
+        # End-to-end: render at 360x640, where the callout band
+        # is [384, 448] and the diagram bottom is 272. The pop
+        # (size 27, window 3-5s) must render with >=70% of its
+        # yellow ink inside the callout band.
+        import tempfile
+        from agentcut.render import render_project
+        proj = self._zone_project(
+            width=360, height=640, pop_size=27, pop_y=170,
+            diag_size=0.5, diag_x=50, diag_y=160,
+            diag_start=2.0, diag_end=11.0, title_y=64)
+        proj["texts"][0]["size"] = 30
+        proj["texts"][1]["size"] = 30
+        proj["texts"][3]["size"] = 22
+        proj["texts"][3]["y"] = 175
+        # One-line caption: a long caption wraps to 4 lines at
+        # 360 wide and its block rises into the callout band
+        # (the zone manager correctly warns about that — see
+        # the debug run — so the render test uses a short cue).
+        proj["captions"] = [{"text": "نص قصير للاختبار",
+                             "start": 0.0, "end": 6.0}]
+        tmp = tempfile.mkdtemp(prefix="agentcut-zone-")
+        out = os.path.join(tmp, "zone.mp4")
+        ok, res = render_project(proj, out)
+        self.assertTrue(ok, res)
+        self.assertTrue(os.path.exists(out))
+        frame = os.path.join(tmp, "zone_f4.png")
+        w, h, px = _frame_png(out, 4.0, frame)
+        self.assertEqual((w, h), (360, 640))
+        in_band = tot = 0
+        for y in range(h):
+            for x in range(w):
+                r, g, b = px(x, y)[:3]
+                if r > 150 and g > 150 and b < 100:
+                    tot += 1
+                    if 384 <= y <= 448:
+                        in_band += 1
+        self.assertGreater(tot, 200, "no yellow pop ink found")
+        self.assertGreaterEqual(in_band / tot, 0.7,
+                                (in_band, tot))
+
+    # ---- Round 4 (Fix 4): no stagnation — diagram hold,
+    # auto sub-cuts, title badge.
+    def _fix4_base(self, **over):
+        proj = {
+            "id": "fix4", "version": 1,
+            "output": {"width": 720, "height": 1280, "fps": 30},
+            "clips": [{"id": "c1", "kind": "image",
+                       "src": os.path.join(BASE, "data", "test_media",
+                                           "board.png"),
+                       "duration": 20.0}],
+            "texts": [],
+        }
+        proj.update(over)
+        return proj
+
+    def test_fix4_hold_default_and_validation(self):
+        p = self._fix4_base(diagrams=[{
+            "id": "d1", "start": 2.0, "end": 18.0, "draw": 3.5,
+            "template": "chart", "params": {"values": [1, 2, 3]},
+            "size": 0.5, "x": 100, "y": 400, "card": True}])
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        self.assertEqual(info["diagrams"][0]["hold_seconds"], 8.0)
+        for hold, good in ((0, True), (6.0, True), (10.0, True),
+                           (60, True), (61, False), (-1, False),
+                           ("x", False)):
+            p2 = self._fix4_base(diagrams=[dict(
+                p["diagrams"][0], hold_seconds=hold)])
+            ok2, _ = validate_project(p2)
+            if good:
+                self.assertEqual(ok2, [], (hold, ok2))
+            else:
+                self.assertTrue(ok2, hold)
+
+    def test_fix4_diagram_hold_fades_out(self):
+        # Diagram start 0, draw 1.0, hold 2.0 -> fully drawn
+        # at t=2, fading 3.0-4.0, gone by t=5. The chart is
+        # white strokes on the dark board; count bright pixels
+        # in the diagram box (180,400,360,224).
+        import tempfile
+        p = self._fix4_base(
+            diagrams=[{"id": "d1", "start": 0.0, "end": 6.0,
+                       "draw": 1.0, "hold_seconds": 2.0,
+                       "template": "chart",
+                       "params": {"values": [1, 2, 3]},
+                       "size": 0.5, "x": 180, "y": 400,
+                       "card": True}])
+        p["clips"][0]["duration"] = 6.0
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        from agentcut.render import render_project
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "hold.mp4")
+            ok, res = render_project(p, out)
+            self.assertTrue(ok, res)
+            counts = {}
+            for t in (2.0, 5.0):
+                frame = os.path.join(td, f"f{t}.png")
+                w, h, px = _frame_png(out, t, frame)
+                n = 0
+                for y in range(400, 624):
+                    for x in range(180, 540):
+                        r, g, b = px(x, y)[:3]
+                        if r + g + b > 300:
+                            n += 1
+                counts[t] = n
+            self.assertGreater(counts[2.0], 200, counts)
+            self.assertLess(counts[5.0], 0.1 * counts[2.0], counts)
+            self.assertLess(counts[5.0], 30, counts)
+
+    def test_fix4_auto_subcuts_generated_path(self):
+        clips = [
+            {"id": "long", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 30.0},
+            {"id": "mid", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 25.0},
+            {"id": "edge", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 12.0},
+            {"id": "optout", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 30.0,
+             "auto_subcuts": False},
+            {"id": "explicit", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 30.0,
+             "camera": [{"t": 0, "x": 0.5, "y": 0.5, "scale": 1.0},
+                        {"t": 30, "x": 0.5, "y": 0.5, "scale": 1.1}]},
+            {"id": "kb", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 30.0,
+             "ken_burns": "zoom_in"},
+            {"id": "blur", "kind": "image",
+             "src": os.path.join(BASE, "data", "test_media",
+                                 "board.png"), "duration": 30.0,
+             "fit": "blur"},
+        ]
+        p = self._fix4_base(clips=clips)
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        self.assertEqual(info.get("auto_subcuts"), ["long", "mid"])
+        by_id = {c["id"]: c for c in info["clips"]}
+        self.assertEqual(by_id["long"]["camera"], [
+            {"t": 0.0, "x": 0.5, "y": 0.5, "scale": 1.0},
+            {"t": 10.0, "x": 0.5, "y": 0.5, "scale": 1.18},
+            {"t": 20.0, "x": 0.58, "y": 0.5, "scale": 1.12},
+            {"t": 30.0, "x": 0.42, "y": 0.5, "scale": 1.12}])
+        self.assertEqual([kf["t"] for kf in by_id["mid"]["camera"]],
+                         [0.0, 12.5, 25.0])
+        for cid in ("edge", "optout", "kb", "blur"):
+            self.assertNotIn("camera", by_id[cid], cid)
+        self.assertEqual(len(by_id["explicit"]["camera"]), 2)
+        p2 = self._fix4_base(clips=clips, auto_subcuts=False)
+        ok, info = validate_project(p2)
+        self.assertEqual(ok, [], ok)
+        self.assertEqual(info.get("auto_subcuts"), [])
+
+    def test_fix4_auto_subcuts_rendered_motion(self):
+        # A 15s still with auto-subcuts must visibly move:
+        # frames at t=2 and t=12 differ far more than the
+        # same still rendered frozen (auto_subcuts: false),
+        # where the two frames are near-identical.
+        import tempfile
+        from agentcut.render import render_project
+        src = os.path.join(BASE, "data", "test_media", "pattern.png")
+        diffs = {}
+        for label, flag in (("motion", None), ("frozen", False)):
+            p = self._fix4_base(clips=[{
+                "id": "c1", "kind": "image", "src": src,
+                "duration": 15.0}])
+            if flag is False:
+                p["auto_subcuts"] = False
+            ok, info = validate_project(p)
+            self.assertEqual(ok, [], ok)
+            with tempfile.TemporaryDirectory() as td:
+                out = os.path.join(td, "m.mp4")
+                ok, res = render_project(p, out)
+                self.assertTrue(ok, res)
+                _, _, px2 = _frame_png(
+                    out, 2.0, os.path.join(td, "a.png"))
+                _, _, px12 = _frame_png(
+                    out, 12.0, os.path.join(td, "b.png"))
+                tot = 0.0
+                n = 0
+                for y in range(0, 1280, 4):
+                    for x in range(0, 720, 4):
+                        a = px2(x, y)[:3]
+                        b = px12(x, y)[:3]
+                        tot += sum(abs(ai - bi) for ai, bi in zip(a, b)) / 3
+                        n += 1
+                diffs[label] = tot / n
+        self.assertLess(diffs["frozen"], 1.0, diffs)
+        self.assertGreater(diffs["motion"], 3.0, diffs)
+
+    def test_fix4_title_badge_validation(self):
+        title = {"text": "سباق الذكاء الاصطناعي 2026", "start": 0.0,
+                 "end": 20.0, "size": 54, "x": "center", "y": 80,
+                 "font": "noto-sans-bold", "box": False,
+                 "shrink_after": 6.0, "shrink_size": 28,
+                 "shrink_y": 24}
+        ok, _ = validate_project(self._fix4_base(texts=[title]))
+        self.assertEqual(ok, [], ok)
+        bad = [
+            dict(title, shrink_after=0.2),
+            dict(title, shrink_after=19.8),
+            dict(title, shrink_after=25.0),
+            dict(title, shrink_after="x"),
+            dict(title, shrink_size=4),
+            dict(title, shrink_size=300),
+            dict(title, shrink_y=-5),
+            {k: v for k, v in title.items()
+             if k not in ("shrink_after",)},
+            dict(title, word_timings=[
+                {"word": "سباق", "start": 0.0, "end": 1.0},
+                {"word": "الذكاء", "start": 1.0, "end": 2.0},
+                {"word": "الاصطناعي", "start": 2.0, "end": 3.0},
+                {"word": "2026", "start": 3.0, "end": 4.0}]),
+            dict(title, reveal="word"),
+        ]
+        for b in bad:
+            ok2, errs = validate_project(self._fix4_base(texts=[b]))
+            self.assertTrue(errs, b)
+        cap = {"text": "نص", "start": 0.0, "end": 5.0,
+               "shrink_after": 2.0}
+        ok2, errs = validate_project(
+            self._fix4_base(captions=[cap]))
+        self.assertTrue(errs, errs)
+
+    def test_fix4_title_badge_defaults(self):
+        # No shrink_size/shrink_y: badge is half the title
+        # size (54 -> 27) at y=24.
+        from agentcut.render import build_ffmpeg_args
+        title = {"text": "سباق الذكاء الاصطناعي 2026", "start": 0.0,
+                 "end": 20.0, "size": 54, "x": "center", "y": 80,
+                 "font": "noto-sans-bold", "box": False,
+                 "shrink_after": 6.0}
+        ok, info = validate_project(self._fix4_base(texts=[title]))
+        self.assertEqual(ok, [], ok)
+        argv, total, td = build_ffmpeg_args(
+            self._fix4_base(texts=[title]), info, "/tmp/b.mp4")
+        graph = " ".join(argv)
+        self.assertIn("fontsize='27'", graph)
+        self.assertIn(":y='24':", graph)
+
+    def test_fix4_title_badge_renders(self):
+        # Big title at t=3 (rows 80-156), badge only at t=10
+        # (rows 24-63, big rows empty). White ink: all three
+        # channels above 180.
+        import tempfile
+        from agentcut.render import render_project
+        title = {"text": "سباق الذكاء الاصطناعي 2026", "start": 0.0,
+                 "end": 20.0, "size": 54, "x": "center", "y": 80,
+                 "font": "noto-sans-bold", "box": False,
+                 "shrink_after": 6.0, "shrink_size": 28,
+                 "shrink_y": 24}
+        p = self._fix4_base(texts=[title])
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "badge.mp4")
+            ok, res = render_project(p, out)
+            self.assertTrue(ok, res)
+
+            def white_ink(t, y0, y1):
+                frame = os.path.join(td, f"f{t}.png")
+                w, h, px = _frame_png(out, t, frame)
+                n = 0
+                for y in range(y0, y1):
+                    for x in range(0, 720, 2):
+                        r, g, b = px(x, y)[:3]
+                        if r > 180 and g > 180 and b > 180:
+                            n += 1
+                return n
+            self.assertGreater(white_ink(3.0, 80, 156), 100)
+            self.assertLess(white_ink(10.0, 80, 156), 10)
+            self.assertGreater(white_ink(10.0, 24, 63), 50)
+
+    # ---- Round 5 (Fix 5): SFX discipline — 15s cooldown,
+    # attenuation below the voiceover, alternating pitch.
+    def _fix5_project(self, **over):
+        board = os.path.join(BASE, "data", "test_media", "board.png")
+        proj = {
+            "id": "fix5", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 30},
+            "clips": [
+                {"id": "c1", "kind": "image", "src": board,
+                 "duration": 20.0, "sfx": "whoosh"},
+                {"id": "c2", "kind": "image", "src": board,
+                 "duration": 11.0, "sfx": "whoosh"},
+                {"id": "c3", "kind": "image", "src": board,
+                 "duration": 20.0},
+            ],
+            "texts": [
+                {"text": "نص أول", "start": 0.0, "end": 2.0,
+                 "size": 30, "x": "center", "y": 100, "sfx": "pop"},
+                {"text": "نص ثان", "start": 3.0, "end": 5.0,
+                 "size": 30, "x": "center", "y": 100, "sfx": "pop"},
+                {"text": "نص ثالث", "start": 16.0, "end": 18.0,
+                 "size": 30, "x": "center", "y": 100, "sfx": "pop"},
+            ],
+            "diagrams": [
+                {"id": "d1", "start": 10.0, "end": 14.0, "draw": 2.0,
+                 "template": "chart", "params": {"values": [1, 2, 3]},
+                 "size": 0.4, "x": 50, "y": 200, "sfx": "ding"},
+                {"id": "d2", "start": 31.0, "end": 35.0, "draw": 2.0,
+                 "template": "chart", "params": {"values": [1, 2, 3]},
+                 "size": 0.4, "x": 50, "y": 200, "sfx": "ding"},
+            ],
+        }
+        proj.update(over)
+        return proj
+
+    def test_fix5_cooldown_keeps_priority_order(self):
+        # Candidates: 0.0 chapter whoosh + 0.0 callout pop (tie
+        # -> chapter wins), 3.0 pop, 10.0 diagram ding, 16.0
+        # pop, 20.0 chapter whoosh, 31.0 diagram ding.
+        # Kept: 0.0 whoosh, 16.0 pop, 31.0 ding. Dropped: the
+        # 0.0 pop (tie), 3.0, 10.0, 20.0.
+        ok, info = validate_project(self._fix5_project())
+        self.assertEqual(ok, [], ok)
+        plan = info["sfx_plan"]
+        self.assertEqual([k["start"] for k in plan["kept"]],
+                         [0.0, 16.0, 31.0])
+        self.assertEqual([k["kind"] for k in plan["kept"]],
+                         ["chapter", "callout", "diagram"])
+        self.assertEqual([d["start"] for d in plan["dropped"]],
+                         [0.0, 3.0, 10.0, 20.0])
+        self.assertIn("whoosh", plan["dropped"][0]["reason"])
+        self.assertEqual(plan["attenuation_db"], 16.0)
+        for k in plan["kept"]:
+            self.assertAlmostEqual(k["volume"], 0.8 * 10 ** (-16 / 20),
+                                   places=4)
+        self.assertEqual([k["pitch"] for k in plan["kept"]],
+                         [1.03, 0.97, 1.03])
+
+    def test_fix5_attenuation_default_and_range(self):
+        p = self._fix5_project()
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        self.assertAlmostEqual(
+            info["sfx_plan"]["kept"][0]["volume"],
+            0.8 * 10 ** (-16 / 20), places=4)
+        for att, expect in ((0, 0.8), (30, 0.8 * 10 ** (-1.5))):
+            ok, info = validate_project(
+                self._fix5_project(sfx_attenuation_db=att))
+            self.assertEqual(ok, [], ok)
+            self.assertAlmostEqual(
+                info["sfx_plan"]["kept"][0]["volume"], expect,
+                places=4)
+        # Explicit sfx_volume wins over attenuation.
+        p2 = self._fix5_project()
+        p2["texts"][2]["sfx_volume"] = 0.5
+        ok, info = validate_project(p2)
+        self.assertEqual(ok, [], ok)
+        kept = {k["start"]: k for k in info["sfx_plan"]["kept"]}
+        self.assertEqual(kept[16.0]["volume"], 0.5)
+        for att in (31, -1, "x"):
+            ok, errs = validate_project(
+                self._fix5_project(sfx_attenuation_db=att))
+            self.assertTrue(errs, att)
+
+    def test_fix5_pitch_expression(self):
+        from agentcut.render import _pitch_sfx_expression, SFX_SOURCES
+        pop = SFX_SOURCES["pop"][0]
+        self.assertEqual(_pitch_sfx_expression(pop, 1.03),
+                         "sin(2*PI*927.0*t)*exp(-18*t)")
+        self.assertEqual(_pitch_sfx_expression(pop, 0.97),
+                         "sin(2*PI*873.0*t)*exp(-18*t)")
+        whoosh = SFX_SOURCES["whoosh"][0]
+        self.assertEqual(_pitch_sfx_expression(whoosh, 1.03),
+                         "sin(2*PI*(309.0*t+927.0*t*t))"
+                         "*(1-exp(-8*t))*exp(-2.5*t)")
+        cash = SFX_SOURCES["cash"][0]
+        pitched = _pitch_sfx_expression(cash, 0.97)
+        self.assertIn("1520.96*t", pitched)
+        self.assertIn("0.6*sin(2*PI*2030.21*t)", pitched)
+        # Decay envelopes and amplitudes are untouched.
+        self.assertIn("exp(-2.5*t)", pitched)
+        self.assertIn("exp(-3*t)", pitched)
+        self.assertEqual(_pitch_sfx_expression(
+            SFX_SOURCES["ding"][0], 1.0), SFX_SOURCES["ding"][0])
+
+    def test_fix5_plan_in_graph(self):
+        # The graph carries exactly the 3 kept SFX (as gated
+        # aevalsrc inputs) with pitch-scaled frequencies: the
+        # 16.0 pop at pitch 0.97 (873.0), the 0.0 whoosh at
+        # 1.03 (309.0/927.0), the 31.0 ding at 1.03 (1812.8).
+        from agentcut.render import build_ffmpeg_args
+        p = self._fix5_project()
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        argv, total, td = build_ffmpeg_args(p, info, "/tmp/s.mp4")
+        graph = " ".join(argv)
+        self.assertEqual(graph.count("aevalsrc="), 3)
+        # Frequencies are gated, so t is re-based: 873.0*(t-16.0).
+        self.assertIn("873.0*(t-16.0)", graph)
+        self.assertIn("309.0*(t-0.0)", graph)
+        self.assertIn("1812.8*(t-31.0)", graph)
+        self.assertNotIn("900*(t-16.0)", graph)
+
+    def test_fix5_rendered_sfx_cooldown_and_levels(self):
+        # Render the cooldown pattern (SFX only, no voice):
+        # kept windows are audible, dropped windows are
+        # silent, and the kept pop peaks near the design level
+        # (~-18 dBFS at volume 0.127, not the old -9 dBFS).
+        import tempfile
+        from agentcut.render import render_project
+        p = self._fix5_project()
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "sfx.mp4")
+            ok, res = render_project(p, out)
+            self.assertTrue(ok, res)
+
+            def window_db(start, dur=1.0):
+                r = subprocess.run(
+                    ["ffmpeg", "-v", "info", "-ss", str(start),
+                     "-t", str(dur), "-i", out, "-af",
+                     "volumedetect", "-f", "null", "-"],
+                    capture_output=True, text=True)
+                mx = None
+                for line in r.stderr.splitlines():
+                    if "max_volume" in line:
+                        mx = float(line.split("max_volume:")[1]
+                                   .split("dB")[0])
+                return mx
+            self.assertGreater(window_db(0.0), -30)
+            self.assertGreater(window_db(16.0), -30)
+            self.assertGreater(window_db(31.0), -30)
+            for t in (3.0, 10.0, 20.0):
+                self.assertLess(window_db(t), -60, t)
+            pop_max = window_db(16.0)
+            self.assertGreater(pop_max, -24)
+            self.assertLess(pop_max, -12)
+
+
+
+    # ---- Round 6 (Fix 6): encoding + version. Master
+    # encoding defaults are pinned here, and the package
+    # version is 1.42.0 everywhere.
+    def test_fix6_master_encoding_defaults(self):
+        # The master is already crf 17 / medium / bt709 /
+        # faststart / 192k / 48k (1.41.0); 1.42.0 verifies and
+        # keeps it. Below-1080p tier VBV cap is 8M/16M.
+        from agentcut.render import build_ffmpeg_args
+        board = os.path.join(BASE, "data", "test_media", "board.png")
+        p = {"id": "enc", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "c1", "kind": "image", "src": board,
+                        "duration": 2.0}]}
+        ok, info = validate_project(p)
+        self.assertEqual(ok, [], ok)
+        argv, total, td = build_ffmpeg_args(p, info, "/tmp/e.mp4")
+        graph = " ".join(argv)
+        self.assertIn("-crf 17", graph)
+        self.assertIn("-preset medium", graph)
+        self.assertIn("-maxrate 8M", graph)
+        self.assertIn("-bufsize 16M", graph)
+        self.assertIn("-pix_fmt yuv420p", graph)
+        self.assertIn("-colorspace bt709", graph)
+        self.assertIn("colorprim=bt709:transfer=bt709:"
+                      "colormatrix=bt709", graph)
+        self.assertIn("-movflags +faststart", graph)
+        self.assertIn("-b:a 192k", graph)
+        self.assertIn("-ar 48000", graph)
+
+    def test_fix6_version_is_1_44_0(self):
+        import agentcut
+        self.assertEqual(agentcut.__version__, "1.44.0")
+        with open(os.path.join(BASE, "VERSION")) as f:
+            self.assertEqual(f.read().strip(), "1.44.0")
+
+
+class TestLoop143(unittest.TestCase):
+    """Motion graphics (v1.43.0), Round 1: core rasterizer + shape."""
+
+    def _base_project(self, motion, duration=4.0):
+        return {"id": "loop143", "version": 1,
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "clips": [{"id": "c1", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "board.png"),
+                           "duration": duration}],
+                "motion": motion}
+
+    def _shape(self, **kw):
+        el = {"id": "s1", "kind": "shape", "shape": "circle",
+              "radius": 60, "fill": "yellow", "start": 0, "end": 4,
+              "keyframes": [{"t": 0, "x": 120, "y": 640},
+                            {"t": 4, "x": 600, "y": 640}]}
+        el.update(kw)
+        return el
+
+    def test_easing_values(self):
+        from agentcut.motion import apply_easing
+        for name in ("linear", "smoothstep", "ease_in", "ease_out",
+                     "ease_in_out"):
+            self.assertAlmostEqual(apply_easing(name, 0.0), 0.0)
+            self.assertAlmostEqual(apply_easing(name, 1.0), 1.0)
+        self.assertAlmostEqual(apply_easing("linear", 0.5), 0.5)
+        self.assertAlmostEqual(apply_easing("smoothstep", 0.5), 0.5)
+        self.assertAlmostEqual(apply_easing("ease_in", 0.5), 0.25)
+        self.assertAlmostEqual(apply_easing("ease_out", 0.5), 0.75)
+        self.assertAlmostEqual(apply_easing("ease_in_out", 0.5), 0.5)
+        # Monotonic: no easing ever goes backwards.
+        for name in ("linear", "smoothstep", "ease_in", "ease_out",
+                     "ease_in_out"):
+            prev = 0.0
+            for k in range(1, 11):
+                cur = apply_easing(name, k / 10.0)
+                self.assertGreaterEqual(cur, prev, (name, k))
+                prev = cur
+
+    def test_keyframe_interp_end_easing_wins(self):
+        # Mirrors render.py _interp_expr_eased: a segment's easing
+        # comes from its END keyframe when non-linear, else its
+        # START keyframe, else linear.
+        from agentcut.motion import interp_field
+        pts = [(0.0, 0.0, None), (4.0, 100.0, "ease_in")]
+        self.assertAlmostEqual(interp_field(pts, 2.0), 25.0)
+        pts = [(0.0, 0.0, "ease_out"), (4.0, 100.0, None)]
+        self.assertAlmostEqual(interp_field(pts, 2.0), 75.0)
+        pts = [(0.0, 0.0, "ease_in"), (4.0, 100.0, "ease_out")]
+        self.assertAlmostEqual(interp_field(pts, 2.0), 75.0)
+        self.assertAlmostEqual(interp_field(pts, 0.0), 0.0)
+        self.assertAlmostEqual(interp_field(pts, 4.0), 100.0)
+        self.assertAlmostEqual(interp_field(pts, 9.0), 100.0)
+
+    def test_canvas_fill_pixel_exact(self):
+        # Rasterizer unit check: opaque red rect on a transparent
+        # canvas — centre pixel exactly (255,0,0,255), corner
+        # pixel exactly transparent.
+        from agentcut.motion import MotionCanvas
+        c = MotionCanvas(100, 80)
+        c.fill_polygon([(20, 20), (80, 20), (80, 60), (20, 60)],
+                       (255, 0, 0), 1.0)
+        b = c.bytes()
+        self.assertEqual(b[(40 * 100 + 50) * 4:(40 * 100 + 50) * 4 + 4],
+                         bytes((255, 0, 0, 255)))
+        self.assertEqual(b[(5 * 100 + 5) * 4:(5 * 100 + 5) * 4 + 4],
+                         bytes((0, 0, 0, 0)))
+        # A translucent fill over an opaque fill blends (source-
+        # over): blue at 0.5 over red gives (127,0,127)-ish.
+        c2 = MotionCanvas(10, 10)
+        c2.fill_polygon([(0, 0), (10, 0), (10, 10), (0, 10)],
+                        (255, 0, 0), 1.0)
+        c2.fill_polygon([(0, 0), (10, 0), (10, 10), (0, 10)],
+                        (0, 0, 255), 0.5)
+        b2 = c2.bytes()
+        r, g, bl, a = b2[0:4]
+        self.assertEqual((r, bl, a), (128, 128, 255))
+        self.assertEqual(g, 0)
+
+    def test_shape_frame_determinism(self):
+        # Same element, same time -> byte-identical frame; same
+        # element encoded twice -> byte-identical video file.
+        from agentcut.motion import (encode_motion_video,
+                                     render_element_frame)
+        p = self._base_project([self._shape()])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        el = info["motion"][0]
+        f1 = render_element_frame(el, 2.0)
+        f2 = render_element_frame(el, 2.0)
+        self.assertEqual(f1, f2)
+        self.assertNotEqual(render_element_frame(el, 0.0),
+                            render_element_frame(el, 2.0))
+        d = os.path.join(BASE, "data")
+        v1 = os.path.join(d, "test_loop143_m1.mov")
+        v2 = os.path.join(d, "test_loop143_m2.mov")
+        encode_motion_video(el, 30, v1)
+        encode_motion_video(el, 30, v2)
+        with open(v1, "rb") as fh:
+            b1 = fh.read()
+        with open(v2, "rb") as fh:
+            b2 = fh.read()
+        self.assertEqual(b1, b2)
+        self.assertGreater(len(b1), 1000)
+
+    def test_motion_validation_errors(self):
+        # Each bad project must fail validation with a structured
+        # error naming the problem — never a silent drop.
+        def _errs(motion):
+            errors, _ = validate_project(self._base_project(motion))
+            return errors
+
+        def _has(motion, code):
+            return any(e.get("code") == code for e in _errs(motion))
+
+        bad_kind = self._shape(kind="spin")
+        self.assertTrue(_has([bad_kind], "INVALID_SCHEMA"))
+        bad_easing = self._shape(keyframes=[
+            {"t": 0, "x": 120, "y": 640},
+            {"t": 4, "x": 600, "y": 640, "easing": "bounce"}])
+        self.assertTrue(_has([bad_easing], "INVALID_SCHEMA"))
+        out_of_order = self._shape(keyframes=[
+            {"t": 2, "x": 300, "y": 640},
+            {"t": 1, "x": 200, "y": 640}])
+        self.assertTrue(_has([out_of_order], "INVALID_SCHEMA"))
+        outside_window = self._shape(keyframes=[
+            {"t": 0, "x": 120, "y": 640},
+            {"t": 5, "x": 600, "y": 640}])
+        self.assertTrue(_has([outside_window], "INVALID_SCHEMA"))
+        dup = [self._shape(), self._shape(id="s1")]
+        self.assertTrue(_has(dup, "INVALID_SCHEMA"))
+        far_away = self._shape(keyframes=[
+            {"t": 0, "x": 2000, "y": 640},
+            {"t": 4, "x": 2100, "y": 640}])
+        self.assertTrue(_has([far_away], "INVALID_SCHEMA"))
+        no_paint = self._shape()
+        del no_paint["fill"]
+        self.assertTrue(_has([no_paint], "INVALID_SCHEMA"))
+        bad_color = self._shape(fill="notacolor")
+        self.assertTrue(_has([bad_color], "INVALID_SCHEMA"))
+        no_xy = self._shape(keyframes=[{"t": 0}, {"t": 4}])
+        self.assertTrue(_has([no_xy], "INVALID_SCHEMA"))
+        # A valid shape passes, and an unlanded kind fails loudly
+        # (not silently dropped): counter lands in R3.
+        self.assertEqual(_errs([self._shape()]), [])
+        self.assertTrue(_has([{"id": "c1", "kind": "counter", "start": 0,
+                               "end": 4}], "INVALID_SCHEMA"))
+
+    def test_motion_slide_in_allowed(self):
+        # A slide-in may start up to one shape-width off-screen;
+        # a shape that never enters the frame is rejected.
+        el = self._shape(shape="rect", w=200, h=100, fill="red")
+        el["keyframes"] = [{"t": 0, "x": -100, "y": 640},
+                           {"t": 4, "x": 360, "y": 640}]
+        del el["radius"]
+        errors, _ = validate_project(self._base_project([el]))
+        self.assertEqual(errors, [], errors)
+
+    def test_no_motion_graph_unchanged(self):
+        # A project without motion gets no motion inputs and no
+        # motion filters — the graph is exactly the old one.
+        from agentcut.render import build_ffmpeg_args
+        p = self._base_project([])
+        del p["motion"]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info.get("motion"), [])
+        argv, total, td = build_ffmpeg_args(p, info, "/tmp/e.mp4")
+        graph = " ".join(argv)
+        self.assertNotIn("[mo", graph)
+        self.assertNotIn("[vmo", graph)
+        self.assertNotIn("motion_", graph)
+
+    def test_motion_shape_renders_and_moves(self):
+        # A yellow circle moves left -> centre -> right across 4s
+        # on the dark board. Crop means at the three positions
+        # must light up in turn and go dark again afterwards.
+        p = self._base_project([self._shape()])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+
+        def bright(t, cx):
+            r, g, b = _crop_mean(out, t, cx - 20, 620, 40, 40)
+            return r + g
+
+        self.assertGreater(bright(0.2, 122), 300)
+        self.assertLess(bright(0.2, 360), 150)
+        self.assertLess(bright(0.2, 598), 150)
+        self.assertGreater(bright(2.0, 360), 300)
+        self.assertLess(bright(2.0, 122), 150)
+        self.assertGreater(bright(3.8, 598), 300)
+        self.assertLess(bright(3.8, 360), 150)
+
+    def test_motion_rect_scale_and_rotation(self):
+        # A rect at centre (360, 640), w=200 h=100, scaling 1 -> 2:
+        # the point (500, 640) is outside the small rect and
+        # inside the big one. Rotation is checked at the unit
+        # level: 90 degrees swaps the w/h extents.
+        from agentcut.motion import shape_vertices
+        el = {"id": "r1", "kind": "shape", "shape": "rect",
+              "w": 200, "h": 100, "fill": "red", "start": 0, "end": 4,
+              "keyframes": [{"t": 0, "x": 360, "y": 640, "scale": 1.0},
+                            {"t": 4, "x": 360, "y": 640, "scale": 2.0}]}
+        p = self._base_project([el])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143b.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 0.2, 480, 620, 40, 40)
+        self.assertLess(r, 100, (r, g, b))
+        r, g, b = _crop_mean(out, 3.8, 480, 620, 40, 40)
+        self.assertGreater(r, 150, (r, g, b))
+        st0 = {"x": 360.0, "y": 640.0, "scale": 1.0, "rotation": 0.0,
+               "opacity": 1.0}
+        st90 = dict(st0, rotation=90.0)
+        v0 = shape_vertices(el, st0)
+        v90 = shape_vertices(el, st90)
+        xs0 = [p[0] for p in v0]
+        ys0 = [p[1] for p in v0]
+        xs90 = [p[0] for p in v90]
+        ys90 = [p[1] for p in v90]
+        self.assertAlmostEqual(max(xs0) - min(xs0), 200.0, delta=1.0)
+        self.assertAlmostEqual(max(ys0) - min(ys0), 100.0, delta=1.0)
+        self.assertAlmostEqual(max(xs90) - min(xs90), 100.0, delta=1.0)
+        self.assertAlmostEqual(max(ys90) - min(ys90), 200.0, delta=1.0)
+
+    # -- Round 2: bars, donut/pie, line_chart ---------------------
+
+    def _bars_el(self, **kw):
+        el = {"id": "bars1", "kind": "bars", "x": 60, "y": 120,
+              "w": 600, "h": 300, "values": [20, 45, 30, 60],
+              "labels": ["A", "B", "C", "D"],
+              "colors": ["#facc15", "#22d3ee", "#4ade80", "#f97316"],
+              "start": 0, "end": 4}
+        el.update(kw)
+        return el
+
+    def _donut_el(self, **kw):
+        el = {"id": "don1", "kind": "donut", "x": 360, "y": 700,
+              "radius": 130, "values": [50, 30, 20],
+              "labels": ["X", "Y", "Z"],
+              "colors": ["#facc15", "#22d3ee", "#4ade80"],
+              "start": 4, "end": 8}
+        el.update(kw)
+        return el
+
+    def _line_el(self, **kw):
+        el = {"id": "line1", "kind": "line_chart", "x": 60, "y": 980,
+              "w": 600, "h": 200, "values": [10, 30, 25, 50, 40],
+              "start": 8, "end": 12}
+        el.update(kw)
+        return el
+
+    def test_chart_validation_errors(self):
+        def _errs(motion):
+            errors, _ = validate_project(self._base_project(motion, duration=12.0))
+            return errors
+
+        def _has(motion, code):
+            return any(e.get("code") == code for e in _errs(motion))
+
+        self.assertEqual(_errs([self._bars_el()]), [])
+        self.assertEqual(_errs([self._donut_el()]), [])
+        self.assertEqual(_errs([self._line_el()]), [])
+        self.assertTrue(_has([self._bars_el(values=[10])],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._bars_el(values=[10] * 9)],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._bars_el(values=[10, -5])],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._bars_el(values=[0, 0])],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._bars_el(labels=["A"])],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._bars_el(colors=["nope"])],
+                             "INVALID_SCHEMA"))
+        # Stagger + grow must let the last bar finish.
+        self.assertTrue(_has([self._bars_el(stagger=0.4, grow=0.5)],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._donut_el(x=60, y=100, radius=500)],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._donut_el(kind="pie", donut_ratio=0.5)],
+                             "INVALID_SCHEMA"))
+        self.assertTrue(_has([self._line_el(values=[5])],
+                             "INVALID_SCHEMA"))
+
+    def test_chart_frame_determinism(self):
+        from agentcut.motion import render_element_frame
+        for el in (self._bars_el(), self._donut_el(), self._line_el()):
+            p = self._base_project([el], duration=12.0)
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            rel = info["motion"][0]
+            t = (rel["start"] + rel["end"]) / 2.0
+            self.assertEqual(render_element_frame(rel, t),
+                             render_element_frame(rel, t))
+
+    def test_motion_derived_texts(self):
+        from agentcut.render import _motion_derived_texts
+        p = self._base_project([self._bars_el(), self._donut_el(),
+                                self._line_el()], duration=12.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        texts = _motion_derived_texts(info, 720, 1280)
+        by_text = {t["text"]: t for t in texts}
+        # Bars: 4 category + 4 value labels. Category A appears
+        # at the bar's stagger start (t=0); value 60 appears
+        # when bar D finishes (3*0.12+0.5 = 0.86 of the window).
+        self.assertIn("A", by_text)
+        self.assertAlmostEqual(by_text["A"]["start"], 0.0)
+        self.assertIn("60", by_text)
+        self.assertAlmostEqual(by_text["60"]["start"], 3.44, places=2)
+        # Donut: "X: 50" appears when segment X finishes.
+        self.assertIn("X: 50", by_text)
+        self.assertAlmostEqual(by_text["X: 50"]["start"], 6.0, places=2)
+        # Line chart: the first point's label at the window start,
+        # the last point's at the window end.
+        self.assertIn("10", by_text)
+        self.assertAlmostEqual(by_text["10"]["start"], 8.0)
+        self.assertIn("40", by_text)
+        self.assertAlmostEqual(by_text["40"]["start"], 12.0, places=2)
+        # Every derived label is a plain text item with a centred
+        # x expression and a y inside the frame.
+        for t in texts:
+            self.assertIn("-text_w/2", t["x"])
+            self.assertGreaterEqual(t["y"], 0)
+            self.assertLessEqual(t["y"], 1280)
+
+    def test_bars_grow_render(self):
+        # Bar A (yellow, full height 100px, top y=320) is half
+        # grown at t=1.0 and full at t=3.5; bar D (orange, full
+        # height 300px) has not started at t=1.0.
+        p = self._base_project([self._bars_el()])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143c.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 1.0, 115, 330, 40, 40)
+        self.assertLess(r + g, 150, (r, g, b))
+        r, g, b = _crop_mean(out, 3.5, 115, 330, 40, 40)
+        self.assertGreater(r + g, 300, (r, g, b))
+        r, g, b = _crop_mean(out, 1.0, 565, 130, 40, 40)
+        self.assertLess(r, 100, (r, g, b))
+        r, g, b = _crop_mean(out, 3.5, 565, 130, 40, 40)
+        self.assertGreater(r, 150, (r, g, b))
+
+    def test_donut_sweep_render(self):
+        # Yellow X (right half) is absent at t=4.2 and full at
+        # t=7.5; green Z (top-left) is absent at t=5.0 and
+        # present at t=6.0. The hole stays dark at all times.
+        p = self._base_project([self._donut_el()], duration=12.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143d.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 4.2, 445, 685, 30, 30)
+        self.assertLess(r + g, 150, (r, g, b))
+        r, g, b = _crop_mean(out, 7.5, 445, 685, 30, 30)
+        self.assertGreater(r + g, 300, (r, g, b))
+        r, g, b = _crop_mean(out, 5.0, 258, 635, 30, 30)
+        self.assertLess(g, 120, (r, g, b))
+        r, g, b = _crop_mean(out, 6.0, 258, 635, 30, 30)
+        self.assertGreater(g, 150, (r, g, b))
+        r, g, b = _crop_mean(out, 7.5, 345, 685, 30, 30)
+        self.assertLess(r + g + b, 200, (r, g, b))
+
+    def test_pie_center_filled(self):
+        # A pie has no hole: its centre is filled, while the
+        # donut's centre stays dark (previous test's hole check).
+        p = self._base_project([self._donut_el(kind="pie")], duration=12.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143e.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 7.5, 345, 685, 30, 30)
+        self.assertGreater(r + g + b, 200, (r, g, b))
+
+    def test_line_chart_draws_progressively(self):
+        # Segment 1 (through x=150, y=1120) is undrawn at t=8.2
+        # and drawn at t=10.0; the yellow head reaches the last
+        # point (643, 1024 by arc length) only near the end.
+        p = self._base_project([self._line_el()], duration=12.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop143f.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 8.2, 145, 1115, 10, 10)
+        self.assertLess(r + g + b, 200, (r, g, b))
+        r, g, b = _crop_mean(out, 10.0, 145, 1115, 10, 10)
+        self.assertGreater(r + g + b, 300, (r, g, b))
+        r, g, b = _crop_mean(out, 10.0, 633, 1014, 20, 20)
+        self.assertLess(r, 60, (r, g, b))
+        r, g, b = _crop_mean(out, 11.9, 633, 1014, 20, 20)
+        self.assertGreater(r, 80, (r, g, b))
+
+
+    # -- Round 3: counter + lower_third -----------------------
+
+    def _counter_el(self, **kw):
+        el = {"id": "cnt1", "kind": "counter", "start": 0.5, "end": 4.0,
+              "x": 360, "y": 640, "from": 0, "to": 84, "decimals": 0,
+              "suffix": "\u066a"}
+        el.update(kw)
+        return el
+
+    def _lt_el(self, **kw):
+        el = {"id": "lt1", "kind": "lower_third", "start": 0.5,
+              "end": 6.0, "x": 60, "y": 1000, "w": 500, "h": 90,
+              "text": "السباق نحو الذكاء الاصطناعي",
+              "card_color": "#c0392b"}
+        el.update(kw)
+        return el
+
+    def test_counter_drawtext_expression(self):
+        from agentcut.motion import counter_drawtext
+        # Arabic suffix BEFORE the number in logical order so it
+        # renders LEFT of the digits (correct Arabic placement).
+        txt = counter_drawtext(self._counter_el())
+        self.assertTrue(txt.startswith("\u066a%{eif\\:"), txt)
+        self.assertIn("%{eif\\:", txt)
+        self.assertTrue(txt.endswith("\\:d}"), txt)
+        # Arabic prefix AFTER the number so it renders RIGHT.
+        txt = counter_drawtext(self._counter_el(
+            prefix="\u062d\u0648\u0627\u0644\u064a", suffix=""))
+        self.assertTrue(txt.endswith(" \u062d\u0648\u0627\u0644\u064a"),
+                        txt)
+        # Latin prefix before, Latin suffix after (Western order).
+        txt = counter_drawtext(self._counter_el(prefix="$", suffix=""))
+        self.assertTrue(txt.startswith("$ "), txt)
+        txt = counter_drawtext(self._counter_el(prefix="", suffix="USD"))
+        self.assertTrue(txt.endswith(" USD"), txt)
+        # decimals=1 uses two eif expressions (int . frac).
+        txt = counter_drawtext(self._counter_el(decimals=1, **{"to": 12.5}))
+        self.assertEqual(txt.count("%{eif\\:"), 2, txt)
+        self.assertIn("floor(", txt)
+        # Easing is inside the expression (smoothstep = u^2(3-2u)).
+        txt = counter_drawtext(self._counter_el(easing="smoothstep"))
+        self.assertIn("(3-2*", txt)
+
+    def test_counter_validation_errors(self):
+        def _errs(el):
+            errors, _ = validate_project(self._base_project([el]))
+            return errors
+
+        def _has(errors, code):
+            return any(e.get("code") == code for e in errors)
+
+        bad = self._counter_el(decimals=2)
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el(suffix="%")
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el(**{"from": -1})
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el(easing="bounce")
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el(color="notacolor")
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el(x=900)
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._counter_el()
+        del bad["from"]
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        ok, _ = validate_project(self._base_project([self._counter_el()]))
+        self.assertEqual(ok, [], ok)
+
+    def test_lower_third_validation_errors(self):
+        def _errs(el):
+            errors, _ = validate_project(
+                self._base_project([el], duration=6.0))
+            return errors
+
+        def _has(errors, code):
+            return any(e.get("code") == code for e in errors)
+
+        bad = self._lt_el(enter=3.0, exit=3.0)
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._lt_el(x=300)
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._lt_el(text="   ")
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._lt_el(corner_radius=60)
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        bad = self._lt_el(font="no-such-font")
+        self.assertTrue(_has(_errs(bad), "INVALID_SCHEMA"), _errs(bad))
+        ok, _ = validate_project(
+            self._base_project([self._lt_el()], duration=6.0))
+        self.assertEqual(ok, [], ok)
+
+    def test_counter_renders_and_counts(self):
+        out = os.path.join("/tmp", "loop143-counter.mp4")
+        p = self._base_project([self._counter_el()])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok, out)
+        # Before the window: no counter (board only, no bright
+        # digits). Inside: white digits on a dark box. The digits
+        # are a small bright feature, so the check is the crop's
+        # brightest pixel, not its mean (the board dilutes a mean
+        # to ~50 even with white digits present).
+        self.assertLess(_crop_max(out, 0.2, 320, 605, 80, 45), 180)
+        self.assertGreater(_crop_max(out, 2.0, 320, 605, 80, 45), 200)
+        # The number actually changes across the window (1.0s in
+        # it reads ~12, 3.5s in it reads ~73): the digit pixels
+        # must differ, not just the mean brightness.
+        diff = _crop_diff(out, 1.0, 3.5, 320, 605, 80, 45)
+        self.assertGreater(diff, 1.0, diff)
+
+    def test_lower_third_enters_holds_exits(self):
+        out = os.path.join("/tmp", "loop143-lt.mp4")
+        p = self._base_project([self._lt_el()], duration=6.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok, out)
+        # Card colour #c0392b (r 192, g 57, b 43) vs the board
+        # (r-g about -14): r-g is the card signal.
+        r, g, b = _crop_mean(out, 0.2, 300, 1045, 50, 20)
+        self.assertLess(r - g, 20, (r, g, b))
+        # Mid-enter (u=0.5): the card covers x 0..280 at
+        # effective alpha 0.375 (opacity 0.5 x card_opacity
+        # 0.75), so r-g is ~29 — well above the board's ~-18.
+        r, g, b = _crop_mean(out, 0.8, 100, 1045, 50, 20)
+        self.assertGreater(r - g, 15, (r, g, b))
+        # Hold: card at rest, and the white text line on it.
+        r, g, b = _crop_mean(out, 3.0, 300, 1045, 50, 20)
+        self.assertGreater(r - g, 50, (r, g, b))
+        r, g, b = _crop_mean(out, 3.0, 100, 1025, 200, 40)
+        self.assertGreater(_crop_max(out, 3.0, 100, 1025, 200, 40),
+                           200, (r, g, b))
+        # Mid-exit: the card has slid back out past x 300.
+        r, g, b = _crop_mean(out, 5.8, 300, 1045, 50, 20)
+        self.assertLess(r - g, 20, (r, g, b))
+
+
+class TestLoop144(unittest.TestCase):
+    """Editing-application package (v1.44.0), Round 1: validation
+    + shared helpers for beat_cut, follow_track, reframe,
+    typography system, custom transitions, adjustments."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name, obj):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        return path
+
+    def _base(self, duration=4.0, **kw):
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "c1", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": duration}]}
+        p.update(kw)
+        return p
+
+    def _video_base(self, **kw):
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "v1", "kind": "video",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "clip1.mp4"),
+                        "trim_in": 0, "trim_out": 4}]}
+        p.update(kw)
+        return p
+
+    def _beats(self, times, bpm=120.0):
+        return self._write("beats.json", {"bpm": bpm, "beats": times})
+
+    def _track(self, t0=0.0, t1=2.0, n=11):
+        pts = [{"t": t0 + (t1 - t0) * k / (n - 1),
+                "x": 20 + 10 * k, "y": 20 + 5 * k,
+                "w": 40, "h": 40, "confidence": 1.0}
+               for k in range(n)]
+        return self._write("track.json",
+                           {"frame_size": {"width": 320, "height": 240},
+                            "track": pts})
+
+    def _reframe(self, frame=(640, 360), windows=None):
+        if windows is None:
+            windows = [{"t": 0.0, "x": 0, "y": 0, "w": 202, "h": 360},
+                       {"t": 2.0, "x": 100, "y": 0, "w": 202, "h": 360},
+                       {"t": 4.0, "x": 200, "y": 0, "w": 202, "h": 360}]
+        return self._write("reframe.json",
+                           {"frame_size": {"width": frame[0],
+                                           "height": frame[1]},
+                            "windows": windows})
+
+    def _err_codes(self, errors):
+        return [e["code"] for e in errors]
+
+    # ---- custom transitions
+    def test_144_custom_transition_validates(self):
+        p = self._base(duration=6.0)
+        p["clips"].append({"id": "c2", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "board.png"),
+                           "duration": 2.0, "transition": "zoom_out"})
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["clips"][1]["transition_duration"], 0.5)
+
+    def test_144_custom_transition_first_clip_errors(self):
+        p = self._base()
+        p["clips"][0]["transition"] = "whip_pan"
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_custom_transition_bad_name_errors(self):
+        p = self._base(duration=6.0)
+        p["clips"].append({"id": "c2", "kind": "image",
+                           "src": os.path.join(BASE, "data", "test_media",
+                                               "board.png"),
+                           "duration": 2.0, "transition": "spin"})
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    # ---- typography styles
+    def test_144_new_styles_resolve(self):
+        from agentcut.render import _resolve_text_style
+        item = {"text": "x", "style": "display", "start": 0, "end": 1}
+        out = _resolve_text_style(item, 1280)
+        self.assertEqual(out["size"], 96)
+        self.assertEqual(out["color"], "white")
+        self.assertEqual(out["font"], "noto-sans-bold")
+        self.assertTrue(out["box"])
+        self.assertEqual(out["box_radius"], 24)
+        item = {"text": "x", "style": "subtitle", "start": 0, "end": 1}
+        out = _resolve_text_style(item, 1280)
+        self.assertEqual(out["size"], 49)
+        self.assertEqual(out["font"], "noto-sans-bold")
+        self.assertFalse(out["box"])
+        item = {"text": "x", "style": "quote", "start": 0, "end": 1}
+        out = _resolve_text_style(item, 1280)
+        self.assertEqual(out["size"], 54)
+        self.assertEqual(out["color"], "yellow")
+        self.assertTrue(out["box"])
+
+    def test_144_old_styles_frozen(self):
+        # Pinned resolved values: the five pre-1.44.0 styles must
+        # never change, or old projects change their look.
+        from agentcut.render import _resolve_text_style
+        expect = {
+            "title": {"size": 70, "color": "yellow", "box": False},
+            "heading": {"size": 56, "color": "white", "box": False},
+            "label": {"size": 38, "color": "yellow", "box": False},
+            "caption": {"size": 36, "color": "white", "box": True},
+            "card": {"size": 70, "color": "white", "box": True,
+                     "box_radius": 18, "box_color": "black",
+                     "box_opacity": 0.45},
+        }
+        for name, want in expect.items():
+            out = _resolve_text_style({"text": "x", "style": name,
+                                       "start": 0, "end": 1}, 1280)
+            for key, val in want.items():
+                self.assertEqual(out[key], val, (name, key))
+            self.assertEqual(out["shadow_x"], 2, name)
+            self.assertEqual(out["shadow_y"], 2, name)
+
+    def test_144_style_explicit_wins(self):
+        from agentcut.render import _resolve_text_style
+        out = _resolve_text_style({"text": "x", "style": "display",
+                                   "size": 40, "color": "red",
+                                   "start": 0, "end": 1}, 1280)
+        self.assertEqual(out["size"], 40)
+        self.assertEqual(out["color"], "red")
+
+    # ---- ease_out_back
+    def test_144_ease_out_back_values(self):
+        from agentcut.motion import EASINGS, apply_easing
+        from agentcut.validate import EASING_VALUES
+        self.assertIn("ease_out_back", EASING_VALUES)
+        self.assertIn("ease_out_back", EASINGS)
+        self.assertAlmostEqual(apply_easing("ease_out_back", 0.0), 0.0)
+        self.assertAlmostEqual(apply_easing("ease_out_back", 1.0), 1.0)
+        # Standard overshoot: ~1.088 at the midpoint.
+        self.assertAlmostEqual(apply_easing("ease_out_back", 0.5),
+                               1.0877, places=3)
+
+    # ---- beat_cut
+    def test_144_beat_cut_splits_image(self):
+        p = self._base(duration=4.0)
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0, 3.0])}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual([c["duration"] for c in info["clips"]],
+                         [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual([c["id"] for c in info["clips"]],
+                         ["c1", "c1#b1", "c1#b2", "c1#b3"])
+        self.assertEqual(info["total_duration"], 4.0)
+        self.assertEqual(info["beat_cuts"],
+                         [{"time": 1.0, "clip_id": "c1"},
+                          {"time": 2.0, "clip_id": "c1"},
+                          {"time": 3.0, "clip_id": "c1"}])
+        self.assertEqual(info["clips"][0].get("transition", "none"), "none")
+        self.assertEqual(info["clips"][1]["transition"], "none")
+
+    def test_144_beat_cut_video_trim_mapping(self):
+        p = self._video_base()
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0, 3.0])}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual([(c["trim_in"], c["trim_out"])
+                          for c in info["clips"]],
+                         [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)])
+        self.assertEqual(info["total_duration"], 4.0)
+
+    def test_144_beat_cut_every_and_window(self):
+        beats = self._beats([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5])
+        p = self._base(duration=4.0)
+        p["beat_cut"] = {"file": beats, "every": 2}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual([c["time"] for c in info["beat_cuts"]],
+                         [0.5, 1.5, 2.5, 3.5])
+        p = self._base(duration=4.0)
+        p["beat_cut"] = {"file": beats, "window": [1.0, 3.0]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual([c["time"] for c in info["beat_cuts"]],
+                         [1.0, 1.5, 2.0, 2.5, 3.0])
+
+    def test_144_beat_cut_errors(self):
+        p = self._base()
+        p["beat_cut"] = {"file": os.path.join(self.tmp, "nope.json")}
+        errors, _ = validate_project(p)
+        self.assertIn("FILE_NOT_FOUND", self._err_codes(errors))
+        p = self._base()
+        p["beat_cut"] = {"file": self._beats([1.0])}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base()
+        p["beat_cut"] = {"file": self._beats([10.0, 11.0])}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base()
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0]), "every": 0}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base()
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0]),
+                         "window": [3.0, 3.5]}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_beat_cut_rejects_camera(self):
+        p = self._base(duration=4.0)
+        p["clips"][0]["camera"] = [{"t": 0, "x": 0.5, "y": 0.5,
+                                    "scale": 1.0},
+                                   {"t": 4, "x": 0.5, "y": 0.5,
+                                    "scale": 1.1}]
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0, 3.0])}
+        errors, info = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        # The clip is left unsplit on rejection.
+        self.assertEqual(len(info["clips"]), 1)
+
+    def test_144_beat_cut_min_segment(self):
+        # A beat 0.1s after the clip start is too close to make
+        # a segment: the cut is dropped, the clip stays whole.
+        p = self._base(duration=4.0)
+        p["beat_cut"] = {"file": self._beats([0.1, 2.0])}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual([c["time"] for c in info["beat_cuts"]], [2.0])
+        self.assertEqual(len(info["clips"]), 2)
+
+    # ---- follow_track
+    def test_144_track_overlay_validates(self):
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 0, "duration": 2, "size": 0.2,
+                          "position": "top_left",
+                          "track": {"file": self._track()}}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertIn("track_file", info["overlays"][0])
+        path = info["overlays"][0]["track_file"]
+        self.assertIn(path, info["data_files"])
+        self.assertEqual(info["data_files"][path]["kind"], "track")
+
+    def test_144_track_no_overlap_errors(self):
+        # Element-RELATIVE: the overlay source time is [0, 1];
+        # a track covering 5..7 does not overlap it.
+        p = self._base(duration=6.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 5, "duration": 1, "size": 0.2,
+                          "position": "top_left",
+                          "track": {"file": self._track(t0=5.0,
+                                                       t1=7.0)}}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_track_partial_coverage_warns(self):
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 0, "duration": 4, "size": 0.2,
+                          "position": "top_left",
+                          "track": {"file": self._track()}}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        codes = [w["code"] for w in info["warnings"]]
+        self.assertIn("track_partial_coverage", codes)
+
+    def test_144_track_missing_file_errors(self):
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 0, "duration": 2, "size": 0.2,
+                          "position": "top_left",
+                          "track": {"file": os.path.join(self.tmp,
+                                                         "nope.json")}}]
+        errors, _ = validate_project(p)
+        self.assertIn("FILE_NOT_FOUND", self._err_codes(errors))
+
+    def test_144_track_keyframes_conflict_errors(self):
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 0, "duration": 2, "size": 0.2,
+                          "position": "top_left",
+                          "keyframes": [{"t": 0, "x": 10, "y": 10},
+                                        {"t": 2, "x": 20, "y": 20}],
+                          "track": {"file": self._track()}}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_track_text_validates(self):
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "تابع", "start": 0, "end": 2,
+                       "track": {"file": self._track()}}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(info["data_files"]), 1)
+
+    # ---- reframe
+    def test_144_reframe_validates(self):
+        p = self._video_base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(), "target_aspect": "9:16"}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertIn("reframe_file", info["clips"][0])
+        path = info["clips"][0]["reframe_file"]
+        self.assertEqual(info["data_files"][path]["kind"], "reframe")
+
+    def test_144_reframe_frame_size_mismatch_errors(self):
+        p = self._video_base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(frame=(320, 240)),
+            "target_aspect": "9:16"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_reframe_odd_crop_errors(self):
+        p = self._video_base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(windows=[
+                {"t": 0.0, "x": 0, "y": 0, "w": 201, "h": 360},
+                {"t": 4.0, "x": 0, "y": 0, "w": 201, "h": 360}]),
+            "target_aspect": "9:16"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_reframe_aspect_mismatch_errors(self):
+        p = self._video_base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(), "target_aspect": "16:9"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_reframe_camera_conflict_errors(self):
+        p = self._video_base()
+        p["clips"][0]["camera"] = [{"t": 0, "x": 0.5, "y": 0.5,
+                                    "scale": 1.0},
+                                   {"t": 4, "x": 0.5, "y": 0.5,
+                                    "scale": 1.1}]
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(), "target_aspect": "9:16"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_reframe_image_clip_errors(self):
+        p = self._base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(), "target_aspect": "9:16"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    # ---- adjustments
+    def test_144_adjustments_validate(self):
+        p = self._base(duration=4.0)
+        p["adjustments"] = [{"start": 1, "end": 3, "grade": "noir"}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["adjustments"],
+                         [{"start": 1.0, "end": 3.0, "grade": "noir",
+                           "effects": {}}])
+
+    def test_144_adjustments_errors(self):
+        p = self._base(duration=4.0)
+        p["adjustments"] = [{"start": 1, "end": 3, "grade": "nope"}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base(duration=4.0)
+        p["adjustments"] = [{"start": 1, "end": 3}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base(duration=4.0)
+        p["adjustments"] = [{"start": 3, "end": 9, "grade": "noir"}]
+        errors, _ = validate_project(p)
+        self.assertIn("CLIP_OUT_OF_RANGE", self._err_codes(errors))
+
+    # ---- typography profile
+    def test_144_typography_validates(self):
+        p = self._base()
+        p["typography"] = {"default_style": "display"}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["typography"],
+                         {"default_style": "display"})
+        p = self._base()
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["typography"], {})
+
+    def test_144_typography_bad_style_errors(self):
+        p = self._base()
+        p["typography"] = {"default_style": "fancy"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    # ---- presets
+    def test_144_preset_validates(self):
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "مرحبا بالعالم", "start": 0, "end": 2,
+                       "preset": "typewriter"}]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+
+    def test_144_preset_errors(self):
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "x", "start": 0, "end": 2,
+                       "preset": "spin"}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "x", "start": 0, "end": 2,
+                       "preset": "typewriter",
+                       "word_timings": [{"word": "x", "start": 0,
+                                         "end": 1}]}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "x", "start": 0, "end": 2,
+                       "preset": "fade_up", "animation": "pop"}]
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_animation_pop_in_validates(self):
+        p = self._base(duration=4.0)
+        p["texts"] = [{"text": "x", "start": 0, "end": 2,
+                       "animation": "pop_in", "animation_duration": 0.5}]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+
+    # ---- motion style passthrough
+    def test_144_motion_label_style(self):
+        p = self._base(duration=4.0)
+        p["motion"] = [{"id": "bars1", "kind": "bars", "x": 60, "y": 120,
+                        "w": 600, "h": 300, "values": [20, 45, 30, 60],
+                        "labels": ["A", "B", "C", "D"],
+                        "colors": ["#facc15", "#22d3ee", "#4ade80",
+                                   "#f97316"],
+                        "start": 0, "end": 4, "label_style": "display"}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["motion"][0]["label_style"], "display")
+        p["motion"][0]["label_style"] = "fancy"
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_motion_lower_third_style(self):
+        p = self._base(duration=4.0)
+        p["motion"] = [{"id": "lt1", "kind": "lower_third", "start": 0.5,
+                        "end": 4.0, "x": 60, "y": 1000, "w": 500, "h": 90,
+                        "text": "السباق نحو الذكاء الاصطناعي",
+                        "card_color": "#c0392b", "style": "quote"}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["motion"][0]["style"], "quote")
+
+    def test_144_basic_project_still_validates(self):
+        with open(os.path.join(BASE, "examples", "basic.json"),
+                  encoding="utf-8") as fh:
+            project = json.load(fh)
+        errors, info = validate_project(project)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["beat_cuts"], [])
+        self.assertEqual(info["adjustments"], [])
+        self.assertEqual(info["typography"], {})
+        self.assertEqual(info["data_files"], {})
+
+
+
+    # ---- Round 2: beat_cut render ----
+    def test_144_beat_cut_render_cut_times(self):
+        # A beat cut is an edit point in the timeline, not a
+        # visual change in a continuous shot — so the cut is
+        # made measurable with an explicit ken_burns zoom_in on
+        # the clip: every segment restarts its sweep, so the
+        # scale jumps 1.12 -> 1.0 exactly at each beat. The
+        # frame difference across each beat must spike while the
+        # frames just inside the segment (smoothstep tails) stay
+        # flat. Scene detection cannot see this: a zoom restart
+        # scores ~0.02 on ffmpeg's scene metric, far below any
+        # cut threshold — frame difference is the honest tool.
+        p = self._base(duration=4.0)
+        p["clips"][0]["ken_burns"] = "zoom_in"
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0, 3.0])}
+        out = os.path.join(self.tmp, "beat.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        video = [s for s in probe["streams"]
+                 if s["codec_type"] == "video"][0]
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        self.assertAlmostEqual(float(probe["format"]["duration"]),
+                               4.0, places=2)
+        for beat in (1.0, 2.0, 3.0):
+            across = _crop_diff(out, beat - 0.05, beat + 0.05,
+                                0, 0, 720, 1280)
+            inside = _crop_diff(out, beat - 0.35, beat - 0.15,
+                                0, 0, 720, 1280)
+            self.assertGreater(across, 3.0, beat)
+            self.assertGreater(across, 2.0 * max(inside, 0.1), beat)
+
+    def test_144_beat_cut_render_video_seamless(self):
+        # Splitting a continuous video shot must not break the
+        # join: same duration, valid output, no error.
+        p = self._video_base()
+        p["beat_cut"] = {"file": self._beats([1.0, 2.0, 3.0])}
+        out = os.path.join(self.tmp, "beat-video.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]),
+                               4.0, places=2)
+        errors, vinfo = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(vinfo["clips"]), 4)
+
+
+    # ---- Round 3: follow_track render ----
+    def _red_png(self):
+        path = os.path.join(self.tmp, "red.png")
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=red:s=40x40",
+                        "-frames:v", "1", path],
+                       check=True)
+        return path
+
+    def _track_at(self, pts, t):
+        for a, b in zip(pts, pts[1:]):
+            if a["t"] <= t <= b["t"]:
+                u = (t - a["t"]) / (b["t"] - a["t"])
+                return (a["x"] + (b["x"] - a["x"]) * u,
+                        a["y"] + (b["y"] - a["y"]) * u)
+        return (pts[-1]["x"], pts[-1]["y"])
+
+    def _yellow_count(self, path, t, x, y, w, h):
+        cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+               "-vf", f"crop={w}:{h}:{x}:{y}", "-frames:v", "1",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        d = subprocess.run(cmd, capture_output=True).stdout
+        return sum(1 for i in range(0, len(d) - 2, 3)
+                   if d[i] > 150 and d[i + 1] > 120 and d[i + 2] < 100)
+
+    def test_144_track_render_follows_square(self):
+        # Real AgentMedia fixture (read-only): track_clip.mp4 +
+        # track_result.json. A red box overlay and a yellow label
+        # follow the white square; positions are computed from
+        # the track file itself, not hardcoded.
+        fix = os.path.join(os.path.expanduser("~"), "workspace",
+                           "agentmedia-analysis-logs", "proof")
+        if not os.path.isdir(fix):
+            self.skipTest("AgentMedia proof fixture absent: " + fix)
+        track_path = os.path.join(fix, "track_result.json")
+        with open(track_path, encoding="utf-8") as fh:
+            track = json.load(fh)
+        pts = track["track"]
+        fw = float(track["frame_size"]["width"])
+        fh = float(track["frame_size"]["height"])
+        p = {"id": "loop144track", "version": 1,
+             "output": {"width": 640, "height": 480, "fps": 30},
+             "clips": [{"id": "base", "kind": "video",
+                        "src": os.path.join(fix, "track_clip.mp4"),
+                        "trim_in": 0, "trim_out": 4}],
+             "overlays": [{"id": "box1", "kind": "image",
+                           "src": self._red_png(),
+                           "start": 0, "duration": 4, "size": 0.125,
+                           "track": {"file": track_path}}],
+             "texts": [{"text": "مربع", "start": 0, "end": 4,
+                        "size": 24, "color": "yellow",
+                        "track": {"file": track_path,
+                                  "offset_y": -60}}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "track.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        probe = ffprobe(out)
+        self.assertAlmostEqual(float(probe["format"]["duration"]),
+                               4.0, places=2)
+        sx, sy = 640.0 / fw, 480.0 / fh
+        for t in (0.5, 2.0, 3.5):
+            tx, ty = self._track_at(pts, t)
+            cx = int((tx + 20) * sx)
+            cy = int((ty + 20) * sy)
+            r, g, b = _crop_mean(out, t, cx - 10, cy - 10, 20, 20)
+            self.assertGreater(r, 200, (t, r, g, b))
+            self.assertGreater(r - g, 100, (t, r, g, b))
+        # Control: the box has moved away from its t=0.5 spot.
+        r, g, b = _crop_mean(out, 3.5, 104 - 10, 96 - 10, 20, 20)
+        self.assertLess(r - g, 30, (r, g, b))
+        # Label: yellow text sits above the box at t=2.0 and is
+        # nowhere near that spot at t=0.5.
+        tx, ty = self._track_at(pts, 2.0)
+        lx = int((tx + 20) * sx)
+        ly = int((ty + 20) * sy) - 60
+        self.assertGreater(self._yellow_count(out, 2.0, lx - 60,
+                                              ly - 45, 120, 90), 20)
+        self.assertLess(self._yellow_count(out, 0.5, lx - 60,
+                                           ly - 45, 120, 90), 5)
+
+    def test_144_track_render_hold_last(self):
+        # The track ends at 2s but the overlay runs 4s: past the
+        # end the LAST point is held (documented rule).
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": self._red_png(),
+                          "start": 0, "duration": 4, "size": 0.125,
+                          "track": {"file": self._track()}}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        codes = [w["code"] for w in info["warnings"]]
+        self.assertIn("track_partial_coverage", codes)
+        out = os.path.join(self.tmp, "hold.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        # Track frame 320x240 -> output 720x1280: sx 2.25, sy 5.33.
+        # Last point (t=2): (120, 70) -> output (270, 373).
+        r, g, b = _crop_mean(out, 3.5, 315 - 10, 418 - 10, 20, 20)
+        self.assertGreater(r, 200, (r, g, b))
+        self.assertGreater(r - g, 100, (r, g, b))
+        # And at t=1 the box is at the t=1 point, not the hold spot.
+        r, g, b = _crop_mean(out, 1.0, 202 - 10, 285 - 10, 20, 20)
+        self.assertGreater(r - g, 100, (r, g, b))
+        r, g, b = _crop_mean(out, 1.0, 315 - 10, 418 - 10, 20, 20)
+        self.assertLess(r - g, 30, (r, g, b))
+
+    def test_144_track_shared_file_offsets(self):
+        # Regression (R3): two elements sharing one track file
+        # with different offsets must each keep their own — the
+        # shared data_files entry holds pure file data only.
+        path = self._track()
+        p = self._base(duration=4.0)
+        p["overlays"] = [{"id": "box1", "kind": "image",
+                          "src": os.path.join(BASE, "data", "test_media",
+                                              "pattern.png"),
+                          "start": 0, "duration": 2, "size": 0.2,
+                          "position": "top_left",
+                          "track": {"file": path}}]
+        p["texts"] = [{"text": "x", "start": 0, "end": 2,
+                       "track": {"file": path, "offset_y": -60}}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["overlays"][0]["track_offset"],
+                         {"x": 0.0, "y": 0.0})
+        data = info["data_files"][os.path.realpath(path)]["data"] \
+            if os.path.realpath(path) in info["data_files"] \
+            else info["data_files"][path]["data"]
+        self.assertNotIn("offset_x", data)
+        self.assertNotIn("offset_y", data)
+
+
+    # ---- Round 4: reframe render ----
+    def _white_cx(self, path, t, width=360, height=640):
+        cmd = ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        d = subprocess.run(cmd, capture_output=True).stdout
+        xs = []
+        for y in range(height):
+            for x in range(width):
+                i = (y * width + x) * 3
+                if d[i] > 200 and d[i + 1] > 200 and d[i + 2] > 200:
+                    xs.append(x)
+        if not xs:
+            return None
+        return (min(xs) + max(xs)) / 2
+
+    def test_144_reframe_render_916(self):
+        # Real AgentMedia fixture (read-only): track_clip.mp4 +
+        # reframe_result.json, 9:16. The white square must stay
+        # framed: near the frame centre once it is far enough
+        # from the source edge to be centred (t>=2), inside the
+        # middle half even at the edge-clamped start (t=0.5 the
+        # crop cannot move left past x=0), and drifting far less
+        # than the no-reframe control.
+        fix = os.path.join(os.path.expanduser("~"), "workspace",
+                           "agentmedia-analysis-logs", "proof")
+        if not os.path.isdir(fix):
+            self.skipTest("AgentMedia proof fixture absent: " + fix)
+        p = {"id": "loop144reframe", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "base", "kind": "video",
+                        "src": os.path.join(fix, "track_clip.mp4"),
+                        "trim_in": 0, "trim_out": 4,
+                        "reframe": {
+                            "windows_file": os.path.join(
+                                fix, "reframe_result.json"),
+                            "target_aspect": "9:16"}}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "reframe.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        probe = ffprobe(out)
+        video = [s for s in probe["streams"]
+                 if s["codec_type"] == "video"][0]
+        self.assertEqual((video["width"], video["height"]), (360, 640))
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        self.assertAlmostEqual(float(probe["format"]["duration"]),
+                               4.0, places=2)
+        cxs = [self._white_cx(out, t) for t in (0.5, 2.0, 3.5)]
+        self.assertTrue(all(c is not None for c in cxs), cxs)
+        for cx in cxs:
+            self.assertGreaterEqual(cx, 90, cxs)
+            self.assertLessEqual(cx, 270, cxs)
+        for cx in cxs[1:]:
+            self.assertAlmostEqual(cx, 180, delta=10)
+        self.assertLess(max(cxs) - min(cxs), 50, cxs)
+        # Control: the same project without reframe drifts the
+        # square from the left edge rightwards across the frame.
+        p["clips"][0] = dict(p["clips"][0])
+        del p["clips"][0]["reframe"]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out2 = os.path.join(self.tmp, "noreframe.mp4")
+        ok, _ = render_project(p, out2)
+        self.assertTrue(ok)
+        cxs2 = [self._white_cx(out2, t) for t in (0.5, 2.0, 3.5)]
+        self.assertTrue(all(c is not None for c in cxs2), cxs2)
+        self.assertLess(cxs2[0], 90, cxs2)
+        self.assertGreater(max(cxs2) - min(cxs2), 70, cxs2)
+
+    def test_144_reframe_varying_crop_errors(self):
+        p = self._video_base()
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(windows=[
+                {"t": 0.0, "x": 0, "y": 0, "w": 202, "h": 360},
+                {"t": 4.0, "x": 0, "y": 0, "w": 180, "h": 320}]),
+            "target_aspect": "9:16"}
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    def test_144_reframe_output_aspect_warns(self):
+        p = self._video_base()
+        p["output"] = {"width": 1280, "height": 720, "fps": 30}
+        p["clips"][0]["reframe"] = {
+            "windows_file": self._reframe(), "target_aspect": "9:16"}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        codes = [w["code"] for w in info["warnings"]]
+        self.assertIn("reframe_output_aspect_mismatch", codes)
+
+    # ---- advanced transitions (F5 render)
+    def _panel(self, name, color, size="640x360"):
+        p = os.path.join(self.tmp, name)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", f"color=c={color}:s={size}:d=0.1",
+                        "-frames:v", "1", p], check=True)
+        return p
+
+    def _bars(self, name="bars.png"):
+        p = os.path.join(self.tmp, name)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "smptebars=s=640x360:d=0.1",
+                        "-frames:v", "1", p], check=True)
+        return p
+
+    def _two_clip(self, kind, td=0.5, src_a=None, src_b=None):
+        if src_a is None:
+            src_a = self._panel("red.png", "red")
+        if src_b is None:
+            src_b = self._panel("blue.png", "blue")
+        return {"id": "loop144", "version": 1,
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": src_a,
+                           "duration": 2.0},
+                          {"id": "b", "kind": "image", "src": src_b,
+                           "duration": 2.0, "transition": kind,
+                           "transition_duration": td}]}
+
+    def _assert_duration_pixfmt(self, out, duration=4.0):
+        probe = ffprobe(out)
+        video = [s for s in probe["streams"]
+                 if s["codec_type"] == "video"][0]
+        self.assertEqual(video["pix_fmt"], "yuv420p")
+        self.assertAlmostEqual(float(probe["format"]["duration"]),
+                               duration, places=2)
+
+    def test_144_transition_zoom_out_render(self):
+        # zoom_out: the picture shrinks to 0.75x on black at the
+        # cut (sine bump over [1.75, 2.25]) and is full-bleed
+        # outside the window; the join is concat, so the total
+        # duration is unchanged (4.0, unlike xfade). Portrait
+        # panels (no letterbox) so the corner pixels prove the
+        # shrink directly.
+        p = self._two_clip("zoom_out",
+                           src_a=self._panel("redp.png", "red",
+                                             size="720x1280"),
+                           src_b=self._panel("bluep.png", "blue",
+                                             size="720x1280"))
+        out = os.path.join(self.tmp, "zoom_out.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        r, g, b = _crop_mean(out, 1.0, 0, 0, 40, 40)
+        self.assertGreater(r, 150)  # full-bleed red before window
+        r, g, b = _crop_mean(out, 2.0, 0, 0, 40, 40)
+        self.assertLess(r + g + b, 90)  # black corners at the cut
+        r, g, b = _crop_mean(out, 2.05, 340, 620, 40, 40)
+        self.assertGreater(b, 150)  # centre is clip B (blue)
+        r, g, b = _crop_mean(out, 3.0, 0, 0, 40, 40)
+        self.assertGreater(b, 150)  # full-bleed blue after window
+
+    def test_144_transition_whip_pan_render(self):
+        # whip_pan: the frame slides sideways -- clip A exits
+        # left (centre still red at 1.8), black at the cut
+        # midpoint (crop window fully past the picture at 2.0),
+        # clip B enters from the right (centre blue at 2.2).
+        out = os.path.join(self.tmp, "whip_pan.mp4")
+        ok, info = render_project(self._two_clip("whip_pan"), out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        r, g, b = _crop_mean(out, 1.8, 340, 620, 40, 40)
+        self.assertGreater(r, 150)
+        r, g, b = _crop_mean(out, 2.0, 340, 620, 40, 40)
+        self.assertLess(r + g + b, 90)
+        r, g, b = _crop_mean(out, 2.2, 340, 620, 40, 40)
+        self.assertGreater(b, 150)
+
+    def test_144_transition_glitch_render(self):
+        # glitch: rgbashift slices + temporal noise inside the
+        # window only. smptebars has sharp edges so a channel
+        # shift is measurable; the static panels give a ~0
+        # baseline outside the window.
+        out = os.path.join(self.tmp, "glitch.mp4")
+        p = self._two_clip("glitch", src_a=self._bars())
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        baseline = _frame_mean_diff(out, 1.0, 1.5)
+        self.assertLess(baseline, 0.5)
+        glitched = _frame_mean_diff(out, 1.0, 1.85)
+        self.assertGreater(glitched, 3.0)
+
+    def test_144_transition_light_leak_render(self):
+        # light_leak: a warm radial blob drifts across the frame
+        # in the window. On the red panel the green channel is
+        # ~0; inside the window the orange wash lifts it well
+        # above 40 (standalone probe: centre (123, 69, 133)).
+        out = os.path.join(self.tmp, "light_leak.mp4")
+        ok, info = render_project(self._two_clip("light_leak"), out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        r, g, b = _crop_mean(out, 1.0, 340, 620, 40, 40)
+        self.assertGreater(r, 150)
+        self.assertLess(g, 15)
+        r, g, b = _crop_mean(out, 2.1, 340, 620, 40, 40)
+        self.assertGreater(g, 40)
+
+    def test_144_custom_transitions_info(self):
+        p = self._two_clip("zoom_out")
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["custom_transitions"],
+                         [{"time": 2.0, "kind": "zoom_out",
+                           "duration": 0.5, "clip_id": "b"}])
+        from agentcut.render import timeline_summary
+        ok, summ = timeline_summary(p)
+        self.assertTrue(ok, summ)
+        self.assertEqual(summ["custom_transitions"],
+                         info["custom_transitions"])
+        # Mixed join: an xfade before the custom cut shifts the
+        # cut time by the overlap (2 + 2 - 0.5 = 3.5), and the
+        # total loses only the xfade overlap (6 - 0.5 = 5.5).
+        red = self._panel("red.png", "red")
+        blue = self._panel("blue.png", "blue")
+        p2 = {"id": "loop144", "version": 1,
+              "output": {"width": 720, "height": 1280, "fps": 30},
+              "clips": [{"id": "a", "kind": "image", "src": red,
+                         "duration": 2.0},
+                        {"id": "b", "kind": "image", "src": blue,
+                         "duration": 2.0, "transition": "crossfade",
+                         "transition_duration": 0.5},
+                        {"id": "c", "kind": "image", "src": red,
+                         "duration": 2.0, "transition": "glitch",
+                         "transition_duration": 0.5}]}
+        errors, info = validate_project(p2)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["custom_transitions"],
+                         [{"time": 3.5, "kind": "glitch",
+                           "duration": 0.5, "clip_id": "c"}])
+        self.assertAlmostEqual(info["total_duration"], 5.5)
+
+    def test_144_custom_transition_too_long_errors(self):
+        p = self._two_clip("whip_pan", td=2.0)
+        errors, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+
+    # ---- multi-track + adjustment layers (F6)
+    def _track1_project(self, t1_start=1.0, t1_dur=2.0, **t1kw):
+        # Base timeline: red 2s + blue 2s (total 4.0). Track 1:
+        # a lime panel, composited over [t1_start, +t1_dur).
+        red = self._panel("red.png", "red")
+        blue = self._panel("blue.png", "blue")
+        lime = self._panel("lime.png", "lime")
+        t1 = {"id": "c", "kind": "image", "src": lime,
+              "duration": t1_dur, "track": 1, "start": t1_start}
+        t1.update(t1kw)
+        return {"id": "loop144", "version": 1,
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "clips": [{"id": "a", "kind": "image", "src": red,
+                           "duration": 2.0},
+                          {"id": "b", "kind": "image", "src": blue,
+                           "duration": 2.0},
+                          t1]}
+
+    def test_144_track1_validates(self):
+        # Valid: no errors; the track 1 clip never extends the
+        # total (4.0, not 6.0); clip_starts keeps the absolute
+        # track 1 start; fit defaults to cover.
+        errors, info = validate_project(self._track1_project())
+        self.assertEqual(errors, [], errors)
+        self.assertAlmostEqual(info["total_duration"], 4.0)
+        self.assertEqual(info["clip_starts"], [0.0, 2.0, 1.0])
+        self.assertEqual(info["clips"][2].get("fit"), "cover")
+
+        def _bad(**kw):
+            p = self._track1_project()
+            p["clips"][2].update(kw)
+            errs, _ = validate_project(p)
+            return self._err_codes(errs)
+
+        self.assertIn("INVALID_SCHEMA", _bad(track=2))
+        self.assertIn("INVALID_SCHEMA", _bad(track=True))
+        self.assertIn("INVALID_SCHEMA", _bad(start=None))
+        self.assertIn("INVALID_SCHEMA",
+                      _bad(transition="crossfade"))
+        self.assertIn("CLIP_OUT_OF_RANGE", _bad(start=3.0))
+        self.assertIn("INVALID_SCHEMA", _bad(volume=3.0))
+        # No base timeline at all: every clip on track 1.
+        p = self._track1_project()
+        for c in p["clips"]:
+            c["track"] = 1
+            c["start"] = 0.0
+        p["clips"][0]["duration"] = 2.0
+        errs, _ = validate_project(p)
+        self.assertIn("EMPTY_TIMELINE", self._err_codes(errs))
+        # Track 1 without a start.
+        p = self._track1_project()
+        del p["clips"][2]["start"]
+        errs, _ = validate_project(p)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errs))
+
+    def test_144_track1_render_composite(self):
+        # Two-track composite: the lime panel covers the whole
+        # frame while it is up ([1, 3)), the base timeline shows
+        # through before and after, and the total stays 4.0.
+        out = os.path.join(self.tmp, "track1.mp4")
+        p = self._track1_project()
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        r, g, b = _crop_mean(out, 0.5, 340, 620, 40, 40)
+        self.assertGreater(r, 150)  # base red
+        for t in (1.5, 2.5):
+            r, g, b = _crop_mean(out, t, 340, 620, 40, 40)
+            self.assertGreater(g, 150)  # track 1 lime covers
+            self.assertLess(r, 80)
+        r, g, b = _crop_mean(out, 3.5, 340, 620, 40, 40)
+        self.assertGreater(b, 150)  # base blue again
+        from agentcut.render import timeline_summary
+        ok, summ = timeline_summary(p)
+        self.assertTrue(ok, summ)
+        self.assertEqual([s["track"] for s in summ["segments"]],
+                         [0, 0, 1])
+
+    def test_144_track1_audio(self):
+        # Track 1 audio mixes at its start at volume 1.0: the
+        # base timeline is silent image clips, so the track 1
+        # window must be audible and the rest silence.
+        clip1 = os.path.join(BASE, "data", "test_media", "clip1.mp4")
+        red = self._panel("red.png", "red")
+        blue = self._panel("blue.png", "blue")
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image", "src": red,
+                        "duration": 2.0},
+                       {"id": "b", "kind": "image", "src": blue,
+                        "duration": 2.0},
+                       {"id": "c", "kind": "video", "src": clip1,
+                        "trim_in": 0, "trim_out": 2.0,
+                        "track": 1, "start": 1.0}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "track1a.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        self.assertGreater(_vol_window(out, 1.2, 2.8), -40.0)
+        self.assertLess(_vol_window(out, 0.1, 0.9), -80.0)
+
+    def test_144_adjustment_noir_render(self):
+        # noir over [1, 3): red/blue desaturate to grey inside
+        # the window, stay saturated outside it.
+        red = self._panel("red.png", "red")
+        blue = self._panel("blue.png", "blue")
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image", "src": red,
+                        "duration": 2.0},
+                       {"id": "b", "kind": "image", "src": blue,
+                        "duration": 2.0}],
+             "adjustments": [{"start": 1.0, "end": 3.0,
+                              "grade": "noir"}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["adjustments"],
+                         [{"start": 1.0, "end": 3.0, "grade": "noir",
+                           "effects": {}}])
+        out = os.path.join(self.tmp, "noir.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        r, g, b = _crop_mean(out, 0.5, 340, 620, 40, 40)
+        self.assertGreater(r - g, 100)  # saturated red outside
+        for t in (1.5, 2.0):
+            r, g, b = _crop_mean(out, t, 340, 620, 40, 40)
+            self.assertLess(max(r, g, b) - min(r, g, b), 20)  # grey
+        r, g, b = _crop_mean(out, 3.5, 340, 620, 40, 40)
+        self.assertGreater(b - r, 100)  # saturated blue outside
+
+    def test_144_adjustment_blur_render(self):
+        # blur over [1, 3) on a static bars clip: frames inside
+        # the window differ strongly from clean frames, while
+        # two clean frames are identical.
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": self._bars(), "duration": 4.0}],
+             "adjustments": [{"start": 1.0, "end": 3.0,
+                              "effects": {"blur": 8}}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "blur.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        self._assert_duration_pixfmt(out)
+        self.assertLess(_frame_mean_diff(out, 0.5, 0.8), 0.5)
+        self.assertGreater(_frame_mean_diff(out, 0.5, 2.0), 2.0)
+
+    # ---- Round 7: typography system (F4) ----
+    def _ink_bbox(self, path, t, y0, y1, x0=0, x1=720):
+        ink = _ink_mask(path, t, y0, y1, x0, x1)
+        if not ink:
+            return None
+        xs = [x for x, _ in ink]
+        ys = [y for _, y in ink]
+        return (min(xs), max(xs), min(ys), max(ys), len(ink))
+
+    def _yellow_bbox(self, path, t, y0, y1, x0=0, x1=720):
+        # Loose yellow: the sweep bars are yellow@0.5/0.9 over a
+        # dark panel (r ~127-233), below _yellow_count's r>150
+        # cut for the 0.5-alpha bar. White text (b high) and the
+        # dark panel (r low) are both excluded.
+        frame = os.path.join(self.tmp, "r7_frame.png")
+        _w, _h, px = _frame_png(path, t, frame)
+        pts = [(x, y) for y in range(y0, y1) for x in range(x0, x1)
+               if px(x, y)[0] > 100 and px(x, y)[1] > 80
+               and px(x, y)[2] < 80 and px(x, y)[0] - px(x, y)[2] > 50]
+        if not pts:
+            return None
+        xs = [x for x, _ in pts]
+        return (min(xs), max(xs), len(pts))
+
+    def _text_project(self, texts, duration=4.0, **kw):
+        p = {"id": "loop144", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "c1", "kind": "image",
+                        "src": self._panel("black.png", "black"),
+                        "duration": duration}],
+             "texts": texts}
+        p.update(kw)
+        return p
+
+    def test_144_preset_typewriter_arabic(self):
+        # HARD RULE: typewriter reveals WHOLE WORDS only -- never
+        # a mid-word split, which breaks Arabic joining. Four
+        # words, window 3s: word starts 0 / 0.78 / 1.89 / 2.33
+        # (weights by length 7/10/4/6). Ink width grows at each
+        # step, and the final frame matches a plain render of
+        # the same text (same shaping, joining intact).
+        text = "الذكاء الاصطناعي يغير العالم"
+        p = self._text_project(
+            [{"text": text, "start": 0, "end": 3, "size": 48,
+              "preset": "typewriter"}], duration=3.0)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "typewriter.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        self._assert_duration_pixfmt(out, duration=3.0)
+        widths = []
+        for t in (0.5, 1.2, 2.1, 2.8):
+            bb = self._ink_bbox(out, t, 80, 200)
+            self.assertIsNotNone(bb, t)
+            widths.append(bb[1] - bb[0])
+        self.assertLess(widths[0], widths[1])
+        self.assertLess(widths[1], widths[2])
+        self.assertLess(widths[2], widths[3])
+        # Final frame == plain control (same text, no preset).
+        ctrl = self._text_project(
+            [{"text": text, "start": 0, "end": 3, "size": 48}],
+            duration=3.0)
+        cout = os.path.join(self.tmp, "typewriter_ctrl.mp4")
+        ok, _ = render_project(ctrl, cout)
+        self.assertTrue(ok)
+        bb_t = self._ink_bbox(out, 2.9, 80, 200)
+        bb_c = self._ink_bbox(cout, 2.9, 80, 200)
+        self.assertIsNotNone(bb_t)
+        self.assertIsNotNone(bb_c)
+        self.assertLessEqual(abs((bb_t[1] - bb_t[0])
+                                 - (bb_c[1] - bb_c[0])), 4)
+        self.assertLess(abs(bb_t[4] - bb_c[4]) / max(bb_c[4], 1),
+                        0.10)
+
+    def test_144_preset_kinetic_words_arabic(self):
+        # Same whole-word reveal as typewriter, plus each word
+        # rises + fades at its own staggered start (fade_up on
+        # the shared easing system). Width grows monotonically;
+        # the final frame matches the plain control; the graph
+        # carries the fade_up y-rise signature (pow(1-) on the
+        # kinetic sub-items.
+        text = "الذكاء الاصطناعي يغير العالم"
+        p = self._text_project(
+            [{"text": text, "start": 0, "end": 3, "size": 48,
+              "preset": "kinetic_words"}], duration=3.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        from agentcut.render import build_ffmpeg_args
+        import shutil
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        self.assertIn("pow(1-", " ".join(argv))
+        out = os.path.join(self.tmp, "kinetic.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        widths = []
+        for t in (0.5, 1.2, 2.1, 2.8):
+            bb = self._ink_bbox(out, t, 80, 200)
+            self.assertIsNotNone(bb, t)
+            widths.append(bb[1] - bb[0])
+        self.assertLess(widths[0], widths[1])
+        self.assertLess(widths[1], widths[2])
+        self.assertLess(widths[2], widths[3])
+        ctrl = self._text_project(
+            [{"text": text, "start": 0, "end": 3, "size": 48}],
+            duration=3.0)
+        cout = os.path.join(self.tmp, "kinetic_ctrl.mp4")
+        ok, _ = render_project(ctrl, cout)
+        self.assertTrue(ok)
+        bb_t = self._ink_bbox(out, 2.9, 80, 200)
+        bb_c = self._ink_bbox(cout, 2.9, 80, 200)
+        self.assertLessEqual(abs((bb_t[1] - bb_t[0])
+                                 - (bb_c[1] - bb_c[0])), 4)
+
+    def test_144_preset_slide_in_render(self):
+        # slide_in: the text slides from off-screen left and
+        # fades in over 0.5s. At t=0.4 (u=0.8) it is still ~85px
+        # left of rest; at t=1.0 it is at rest.
+        p = self._text_project(
+            [{"text": "Hello", "start": 0, "end": 2, "size": 48,
+              "preset": "slide_in"}], duration=2.0)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "slide_in.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        bb_early = self._ink_bbox(out, 0.4, 80, 200)
+        bb_rest = self._ink_bbox(out, 1.0, 80, 200)
+        self.assertIsNotNone(bb_early)
+        self.assertIsNotNone(bb_rest)
+        self.assertLess(bb_early[0], bb_rest[0] - 40)
+
+    def test_144_preset_pop_in_render(self):
+        # pop_in: fontsize pops with ease_out_back overshoot
+        # (0.3x -> ~1.06x -> 1.0x over 0.5s). At t=0.05 the text
+        # is small; at t=1.0 it is at full size. The graph pins
+        # the overshoot constant.
+        p = self._text_project(
+            [{"text": "POP", "start": 0, "end": 2, "size": 48,
+              "preset": "pop_in"}], duration=2.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        from agentcut.render import build_ffmpeg_args
+        import shutil
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        self.assertIn("2.70158", " ".join(argv))
+        out = os.path.join(self.tmp, "pop_in.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        bb_small = self._ink_bbox(out, 0.05, 80, 200)
+        bb_full = self._ink_bbox(out, 1.0, 80, 200)
+        self.assertIsNotNone(bb_small)
+        self.assertIsNotNone(bb_full)
+        h_small = bb_small[3] - bb_small[2]
+        h_full = bb_full[3] - bb_full[2]
+        self.assertLess(h_small, 0.75 * h_full)
+        self.assertLess(bb_small[1] - bb_small[0],
+                        bb_full[1] - bb_full[0])
+
+    def test_144_preset_fade_up_render(self):
+        # fade_up: the text rises 40px (ease_out) and fades in
+        # over 0.5s. At t=0.2 (u=0.4) it is still ~14px below
+        # rest; at t=1.0 it is at rest. The graph pins the
+        # y-rise expression.
+        p = self._text_project(
+            [{"text": "RISE", "start": 0, "end": 2, "size": 48,
+              "preset": "fade_up"}], duration=2.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        from agentcut.render import build_ffmpeg_args
+        import shutil
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        self.assertIn("pow(1-", " ".join(argv))
+        out = os.path.join(self.tmp, "fade_up.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        bb_early = self._ink_bbox(out, 0.2, 60, 220)
+        bb_rest = self._ink_bbox(out, 1.0, 60, 220)
+        self.assertIsNotNone(bb_early)
+        self.assertIsNotNone(bb_rest)
+        self.assertGreater(bb_early[2], bb_rest[2] + 8)
+
+    def test_144_preset_highlight_sweep_render(self):
+        # highlight_sweep (Arabic, RTL): a yellow bar sweeps in
+        # right-to-left behind the whole line over 0.6s, then
+        # holds. At t=0.2 the bar is a short sliver at the RIGHT
+        # end; at t=1.0 it spans the full line; the white text
+        # draws over it.
+        p = self._text_project(
+            [{"text": "الذكاء الاصطناعي", "start": 0, "end": 3,
+              "size": 48, "preset": "highlight_sweep"}],
+            duration=3.0)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "sweep.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        yb_early = self._yellow_bbox(out, 0.2, 90, 180)
+        yb_full = self._yellow_bbox(out, 1.0, 90, 180)
+        self.assertIsNotNone(yb_early)
+        self.assertIsNotNone(yb_full)
+        w_early = yb_early[1] - yb_early[0]
+        w_full = yb_full[1] - yb_full[0]
+        self.assertLess(w_early, 0.5 * w_full)
+        self.assertLessEqual(abs(yb_early[1] - yb_full[1]), 15)
+        self.assertGreater(yb_early[0], yb_full[0] + 40)
+        # The text is visible over the bar (white ink in the band).
+        bb = self._ink_bbox(out, 1.0, 90, 180)
+        self.assertIsNotNone(bb)
+        self.assertGreater(bb[4], 100)
+
+    def test_144_preset_underline_swipe_render(self):
+        # underline_swipe (Latin, LTR): a thin yellow bar sweeps
+        # in left-to-right under the line over 0.6s, then holds.
+        p = self._text_project(
+            [{"text": "Hello World", "start": 0, "end": 3, "size": 48,
+              "preset": "underline_swipe"}], duration=3.0)
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "underline.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        yb_early = self._yellow_bbox(out, 0.2, 150, 165)
+        yb_full = self._yellow_bbox(out, 1.0, 150, 165)
+        self.assertIsNotNone(yb_early)
+        self.assertIsNotNone(yb_full)
+        w_early = yb_early[1] - yb_early[0]
+        w_full = yb_full[1] - yb_full[0]
+        self.assertLess(w_early, 0.5 * w_full)
+        self.assertLessEqual(abs(yb_early[0] - yb_full[0]), 15)
+        # The text itself is unaffected above the bar.
+        bb = self._ink_bbox(out, 1.0, 80, 150)
+        self.assertIsNotNone(bb)
+        self.assertGreater(bb[4], 100)
+
+    def test_144_typography_default_style(self):
+        # Project typography profile: default_style applies to
+        # items without an explicit style; an explicit style
+        # wins; absent typography is the old default (48px).
+        # Before/after: the plain control is the old look, the
+        # display title is the new system.
+        from agentcut.render import _resolve_text_style
+        out = _resolve_text_style({"text": "x"}, 1280, "display")
+        self.assertEqual(out["size"], 96)
+        out = _resolve_text_style({"text": "x", "style": "subtitle"},
+                                  1280, "display")
+        self.assertEqual(out["size"], 49)
+        out = _resolve_text_style({"text": "x"}, 1280, None)
+        self.assertNotIn("size", out)
+        p = self._text_project(
+            [{"text": "العلم نور", "start": 0, "end": 4, "y": 100},
+             {"text": "العلم نور", "start": 0, "end": 4, "y": 500,
+              "style": "subtitle"}],
+            duration=4.0,
+            typography={"default_style": "display"})
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["typography"],
+                         {"default_style": "display"})
+        outp = os.path.join(self.tmp, "typo_default.mp4")
+        ok, _ = render_project(p, outp)
+        self.assertTrue(ok)
+        bb_display = self._ink_bbox(outp, 2.0, 90, 220)
+        bb_sub = self._ink_bbox(outp, 2.0, 480, 570)
+        self.assertIsNotNone(bb_display)
+        self.assertIsNotNone(bb_sub)
+        h_display = bb_display[3] - bb_display[2]
+        h_sub = bb_sub[3] - bb_sub[2]
+        self.assertGreater(h_display, 1.5 * h_sub)
+        # Before: the same title without typography is 48px.
+        ctrl = self._text_project(
+            [{"text": "العلم نور", "start": 0, "end": 4, "y": 100}],
+            duration=4.0)
+        cout = os.path.join(self.tmp, "typo_before.mp4")
+        ok, _ = render_project(ctrl, cout)
+        self.assertTrue(ok)
+        bb_before = self._ink_bbox(cout, 2.0, 90, 220)
+        self.assertIsNotNone(bb_before)
+        self.assertLess(bb_before[3] - bb_before[2],
+                        0.75 * h_display)
+
+    def test_144_motion_label_style_renders(self):
+        # Render side of the R1 label_style/style validation:
+        # derived motion labels resolve through the SAME shared
+        # _resolve_text_style as titles/captions. A bars chart
+        # with label_style="display" renders 96px labels; the
+        # same chart without it renders 28px labels.
+        from agentcut.render import _motion_derived_texts
+        bars = {"id": "bars1", "kind": "bars", "x": 60, "y": 120,
+                "w": 600, "h": 300, "values": [20, 45, 30, 60],
+                "labels": ["A", "B", "C", "D"],
+                "colors": ["#facc15", "#22d3ee", "#4ade80", "#f97316"],
+                "start": 0, "end": 4, "label_style": "display"}
+        items = _motion_derived_texts({"motion": [bars]}, 720, 1280)
+        self.assertTrue(all(it.get("style") == "display"
+                            for it in items), items)
+        self.assertTrue(all("size" not in it for it in items), items)
+        plain = dict(bars)
+        del plain["label_style"]
+        items = _motion_derived_texts({"motion": [plain]}, 720, 1280)
+        self.assertTrue(all(it.get("size") == 28 for it in items),
+                        items)
+        self.assertTrue(all("style" not in it for it in items), items)
+        # Lower third: style drives the card geometry size.
+        lt = {"id": "lt1", "kind": "lower_third", "start": 0.5,
+              "end": 4.0, "x": 60, "y": 1000, "w": 500, "h": 90,
+              "text": "hello", "style": "quote"}
+        items = _motion_derived_texts({"motion": [lt]}, 720, 1280)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].get("style"), "quote")
+        self.assertNotIn("size", items[0])
+        # quote is 0.042*1280 = 54px; text centred in the 90px
+        # card: y = 1000 + (90-54)/2 = 1018.
+        self.assertEqual(items[0]["y"], 1018)
+        # Render: display labels are visibly taller than default.
+        p = self._base(duration=4.0)
+        p["motion"] = [dict(bars)]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "labels_display.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        bb = self._ink_bbox(out, 3.5, 425, 530, 40, 680)
+        self.assertIsNotNone(bb)
+        self.assertGreater(bb[3] - bb[2], 50)
+        p2 = self._base(duration=4.0)
+        p2["motion"] = [dict(plain)]
+        out2 = os.path.join(self.tmp, "labels_default.mp4")
+        ok, _ = render_project(p2, out2)
+        self.assertTrue(ok)
+        bb2 = self._ink_bbox(out2, 3.5, 425, 530, 40, 680)
+        self.assertIsNotNone(bb2)
+        self.assertLess(bb2[3] - bb2[2], 40)
+
+    def test_144_preset_reveal_mask_rejected(self):
+        # reveal_mask was DROPPED in R7 (animated crop is not
+        # feasible on this FFmpeg build; see LOOP_LOG R7):
+        # validation rejects it with the valid preset list.
+        p = self._text_project(
+            [{"text": "x", "start": 0, "end": 2, "size": 48,
+              "preset": "reveal_mask"}], duration=2.0)
+        errors, _ = validate_project(p)
+        self.assertTrue(errors, errors)
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        self.assertIn("typewriter", errors[0]["message"])
 
 
 if __name__ == "__main__":

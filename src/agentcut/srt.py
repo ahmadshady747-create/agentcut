@@ -15,6 +15,8 @@ import re
 _TIME_RE = re.compile(
     r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
 
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+
 # ASS colour: &HAABBGGRR (alpha, blue, green, red). Opaque white
 # text, opaque black outline — the same look as caption drawtext.
 # Karaoke highlight is opaque yellow over the same white base.
@@ -28,6 +30,42 @@ def _to_seconds(h, m, s, frac):
     return int(h) * 3600 + int(m) * 60 + int(s) + int(frac) / 1000.0
 
 
+# Relative-width weight table (v1.41.0, Fix 2): fractions of the
+# font size per character, replacing the flat 0.6 estimate. R1's
+# true ink measurements (Arabic words at size 60: ~0.35-0.55 x
+# size per char) showed flat 0.6 overestimates every Arabic word
+# and breaks lines far too early; narrow letters are far narrower
+# than wide ones, and diacritics add no width at all (they sit on
+# their base letter). Latin/digits keep ~0.55. Wrap is an
+# estimate, not rendering — libass/drawtext lay out the line.
+_ARABIC_WIDE = set("موشصضطظك")
+_ARABIC_NARROW = set("الإألرزد")
+_ARABIC_DIACRITICS = set(chr(c) for c in range(0x064B, 0x0653)) | {"\u0670"}
+
+
+def _char_weight(ch):
+    """Relative width of one character as a fraction of font size."""
+    if ch in _ARABIC_DIACRITICS:
+        return 0.0
+    if ch == " ":
+        return 0.30
+    if ch in _ARABIC_WIDE:
+        return 0.60
+    if ch in _ARABIC_NARROW:
+        return 0.25
+    if ("\u0600" <= ch <= "\u06FF" or "\u0750" <= ch <= "\u077F"
+            or "\u08A0" <= ch <= "\u08FF"
+            or "\uFB50" <= ch <= "\uFDFF"
+            or "\uFE70" <= ch <= "\uFEFF"):
+        return 0.45
+    return 0.55
+
+
+def _word_width(word, size):
+    """Estimated pixel width of a word at font `size`."""
+    return max(10.0, sum(_char_weight(ch) for ch in word) * float(size))
+
+
 def wrap_lines(text, size, max_width_px):
     """Greedy word-wrap of LOGICAL text into lines fitting
     max_width_px. Words are never split, so Arabic words stay
@@ -35,18 +73,18 @@ def wrap_lines(text, size, max_width_px):
     time — wrapping the logical text first is what keeps word
     order correct). A single word wider than max_width_px stays
     on its own line (it will still clip; the overflow warning
-    still fires for it). Width uses the 0.6 x size per character
-    estimate, the same estimator the renderer uses, so the
-    estimator and the renderer agree. Returns at least one line.
-    This is the single source of truth for wrapping; see
-    wrap_subtitle_text for the video-width-based wrapper."""
+    still fires for it). Width uses the relative-weight table
+    above (v1.41.0, Fix 2), so the estimator and the renderer
+    agree. Returns at least one line. This is the single source
+    of truth for wrapping; see wrap_subtitle_text for the
+    video-width-based wrapper."""
     words = str(text).split()
     if not words:
         return [str(text)]
     lines, cur, cur_w = [], "", 0.0
-    space_w = float(size) * 0.6
+    space_w = float(size) * 0.30
     for word in words:
-        word_w = max(10.0, len(word) * float(size) * 0.6)
+        word_w = _word_width(word, size)
         new_w = word_w if not cur else cur_w + space_w + word_w
         if cur and new_w > max_width_px:
             lines.append(cur)
@@ -59,17 +97,17 @@ def wrap_lines(text, size, max_width_px):
     return lines
 
 
-def wrap_subtitle_text(text, width, font_size, max_width_frac=0.9):
+def wrap_subtitle_text(text, width, font_size, max_width_frac=0.8):
     """Wrap subtitle/caption text for a video of `width` pixels.
 
     The text block spans at most max_width_frac of the video
-    width (default 0.9, the 1.36.0 caption rule); font_size is the
-    caption font size in pixels. Arabic and English words are
-    measured the same way (0.6 x font_size per character) and
-    never split, so a long Arabic sentence wraps at word
-    boundaries and a long English word stays whole. Returns a
-    list of logical lines (BiDi is applied per line at render
-    time, never here)."""
+    width (default 0.8, the v1.41.0 Fix 2 cap — text never crowds
+    the edges; the old 0.9 cap is still available explicitly).
+    font_size is the caption font size in pixels. Words are
+    measured with the relative-weight table and never split, so
+    a long Arabic sentence wraps at word boundaries and a long
+    English word stays whole. Returns a list of logical lines
+    (BiDi is applied per line at render time, never here)."""
     return wrap_lines(text, font_size, float(width) * float(max_width_frac))
 
 
@@ -306,6 +344,297 @@ def export_ass(cues, path, width=1280, height=720, font_name="Noto Naskh Arabic"
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
+
+
+# AgentCut color names to ASS &H00BBGGRR& (alpha 00 = opaque).
+# Drawtext accepts any FFmpeg color name; ASS needs hex, so the
+# render path maps through this table. Unknown names raise
+# ValueError loudly (a silent white fallback would hide a
+# misspelled colour in the finished video).
+_ASS_NAMED_COLORS = {
+    "white": (255, 255, 255), "black": (0, 0, 0),
+    "yellow": (255, 255, 0), "red": (255, 0, 0),
+    "green": (0, 128, 0), "lime": (0, 255, 0),
+    "blue": (0, 0, 255), "navy": (0, 0, 128),
+    "cyan": (0, 255, 255), "aqua": (0, 255, 255),
+    "magenta": (255, 0, 255), "fuchsia": (255, 0, 255),
+    "orange": (255, 165, 0), "pink": (255, 192, 203),
+    "purple": (128, 0, 128), "brown": (165, 42, 42),
+    "gray": (128, 128, 128), "grey": (128, 128, 128),
+    "silver": (192, 192, 192), "gold": (255, 215, 0),
+    "teal": (0, 128, 128), "olive": (128, 128, 0),
+    "maroon": (128, 0, 0), "coral": (255, 127, 80),
+    "khaki": (240, 230, 140), "salmon": (250, 128, 114),
+    "skyblue": (135, 206, 235), "beige": (245, 245, 220),
+}
+
+
+def _ass_hex(color):
+    """AgentCut colour (name or #RRGGBB) to ASS &H00BBGGRR&."""
+    if isinstance(color, str) and color.startswith("#") and len(color) == 7:
+        try:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+        except ValueError:
+            raise ValueError(f"invalid hex colour: {color!r}")
+        return f"&H00{b:02X}{g:02X}{r:02X}"
+    rgb = _ASS_NAMED_COLORS.get(str(color).lower())
+    if rgb is None:
+        raise ValueError(
+            f"unknown colour for ASS rendering: {color!r} "
+            f"(use a named colour or #RRGGBB)")
+    r, g, b = rgb
+    return f"&H00{b:02X}{g:02X}{r:02X}"
+
+
+def build_karaoke_ass(events, width, height):
+    """Build one unified ASS document for render-path word_timings.
+
+    v1.41.0, Fix 2: this REPLACES per-word drawtext karaoke.
+    Every Dialogue is one connected line (never one drawtext
+    filter per word); libass + HarfBuzz + FriBidi shape the
+    Arabic line as a single connected sentence, and the active
+    word is highlighted INSIDE that line with a static colour tag. One Dialogue per word window (full line, word i
+    in the highlight colour, the rest in the base colour), plus
+    a plain base-colour Dialogue for any gap between word
+    windows, so the line is covered for the whole chunk exactly
+    as the drawtext base words covered it. NOT the t-transform: measured
+    (ass-test 7, distinct colour per word) a t-transform highlight
+    STICKS past its window — at t=2.5 all three words kept
+    their \t colours — so \t gives cumulative karaoke, not
+    current-word-only, and a reset tag placed before the next
+    word cannot turn an earlier word white (tags affect only
+    following text). NOT a scale tag either: a scaled word
+    reflows its neighbours in libass (the line jumps at every
+    word switch), while the drawtext pop grew in place; colour
+    alone keeps the line layout identical across events, so
+    only the colour changes. Emphasis/scale inputs are
+    therefore accepted but have no visual effect in ASS.
+    Event dicts: kind "karaoke" (words: [{word, start, end}],
+    hi_color) or "plain" (text, base_color); both carry
+    start, end, font (family, bold), size, base_color, align
+    (7 top-left, 8 top-centre, 9 top-right), x, y. pos anchors
+    the line: alignment 8 + pos(width/2, y) centres it exactly
+    like drawtext x=center; alignment 7 + pos(x, y) puts its left
+    edge at a numeric x. Styles are keyed by (family, bold, size,
+    base colour, alignment), so one file serves mixed fonts.
+    Outline 2 + shadow 1 match the exporter's caption look.
+    RTL word order (v1.42.0, Fix 2 — the 1.41.0 model was WRONG,
+    proven by v2 frames AND by a reproduction render):
+    libass places tag-delimited runs LEFT-TO-RIGHT in emission
+    order, while shaping words right-to-left WITHIN each run
+    (a run reads in its string order). A single untagged line
+    is laid out as one RTL paragraph and reads correctly —
+    hold titles were correct in the v2 frames. But a tagged
+    line is NOT one paragraph: the colour tags split it into
+    runs, and the runs sit LTR. The 1.41.0 builder emitted
+    tagged lines in REVERSE word order, which put the
+    highlight in the right place (word1 rightmost, word4
+    leftmost — its ass-tests 5-6 measured only highlight
+    x-bboxes) while scrambling the word order at every index
+    (v2 t=362 "الوكلاء المقود يمسكون", t=427 "الهجوم الحافة
+    من المضاد"). A first 1.42.0 attempt — logical order +
+    RLM anchors at line start and after every closing tag —
+    did NOT fix it either: the reproduction render showed
+    the highlight flipped to the WRONG side (word1 leftmost)
+    with the word order still scrambled, while the plain hold
+    line with the same RLM rendered correctly. RLM pins the
+    paragraph direction; it does not reorder runs. The fix
+    that the frames prove is RUN-ORDER emission: emit the
+    runs in reverse reading order, each run's words in
+    logical order — for the window highlighting word i:
+    [words AFTER i, logical order] then the highlighted
+    word, then [words BEFORE i, logical order]. The runs
+    land LTR (last logical words leftmost), each run reads
+    in its string order, and the whole line reads in
+    logical order with the highlight on the right word.
+    RLM anchors are kept (line start + after every closing
+    colour tag) as paragraph-direction insurance: they are
+    proven harmless (the hold line renders correctly with
+    them) and protect lines whose first run starts with a
+    tag. WrapStyle: 2 in the header (single-line titles
+    must not wrap). Untagged lines (plain hold/gap/chunk
+    events) are emitted in LOGICAL order with an RLM at
+    line start (FriBidi reorders untagged runs itself;
+    reversing them would double-reverse the line — found
+    by v2 frame inspection in R11b). Latin-only lines are
+    emitted in order with no RLM, byte-identical to before
+    (LTR run placement + LTR words need no reordering).
+    Spacing (v1.42.0 R7b — found in the v3 frames): a space
+    emitted as the LEADING character of a run after a tag
+    boundary (closing colour tag + RLM) is DROPPED by
+    libass, so at every highlight index > 0 the highlighted
+    word joined the word before it in logical order (16/26
+    v3 kinetic frames: "الوكلاءيمسكون", "الهجومالمضاد").
+    A TRAILING space survives (the after-run's trailing
+    space rendered fine), so the gap between the highlighted
+    word and the before-run is emitted INSIDE the
+    highlighted run, before the closing colour tag. A space
+    has no ink, so its colour is invisible and shaping is
+    unchanged. The R1 tests could not catch this: the ASS
+    text is identical up to whitespace placement, and the
+    centroid/template checks tolerated the ~6px reflow.
+    Verification (TestLoop142 R7b): rendered group count —
+    4 word groups at min_gap=6 at every highlight index
+    and the hold, with spans matching the hold.
+    Raises ValueError on empty events or unknown colours.
+    Verification (TestLoop142): ASS-text assertions pin the
+    exact run-ordered emission for the scene-8 title at
+    every highlight index, plus a rendered frame check that
+    compares each kinetic window's ink mask against the
+    plain hold line (the known-correct reference) and
+    asserts the yellow highlight moves right-to-left.
+    A centroid check alone CANNOT prove word order — the
+    1.41.0 code passed one while scrambling the line."""
+
+    RLM = "\u200f"
+    events = list(events or [])
+    if not events:
+        raise ValueError("karaoke ASS needs at least one event")
+    styles = {}
+    order = []
+
+    def _style_key(ev):
+        key = (ev["font"][0], int(ev["font"][1]), int(ev["size"]),
+               _ass_hex(ev["base_color"]), int(ev["align"]))
+        if key not in styles:
+            styles[key] = f"S{len(styles)}"
+            order.append(key)
+        return styles[key]
+
+    dialogues = []
+    for ev in events:
+        style = _style_key(ev)
+        base_hex = _ass_hex(ev["base_color"])
+        pos = r"{\pos(%s,%s)}" % (int(round(float(ev["x"]))),
+                                  int(round(float(ev["y"]))))
+        if ev["kind"] == "plain":
+            # Untagged: FriBidi reorders the line itself, so the
+            # text stays in logical order. Reversing here would
+            # double-reverse it and the line displays backwards
+            # (found by v2 frame inspection in R11b). An RLM at
+            # line start pins the paragraph direction for
+            # Arabic lines; Latin lines are byte-identical.
+            body = pos + (RLM if _ARABIC_RE.search(ev["text"]) else "") \
+                + _ass_escape(ev["text"])
+        elif ev["kind"] == "karaoke":
+            hi_hex = _ass_hex(ev["hi_color"])
+            chron = list(ev["words"])
+            is_ar = any(_ARABIC_RE.search(w["word"]) for w in chron)
+            # One Dialogue per word window (chronological file
+            # order): the full line, with the window's word
+            # highlighted and the rest base. Gaps between
+            # windows get a plain base line, so coverage is
+            # continuous across the chunk. For Arabic lines the
+            # runs are emitted in reverse reading order (see
+            # docstring): words after the highlighted word,
+            # then the highlighted word, then the words before
+            # it — each run's words in logical order. Latin
+            # lines keep plain logical order.
+            for ci, w in enumerate(chron):
+                parts = [pos]
+                if is_ar:
+                    parts.append(RLM)
+                if is_ar:
+                    after = chron[ci + 1:]
+                    before = chron[:ci]
+                    for j, w2 in enumerate(after):
+                        if j > 0:
+                            parts.append(" ")
+                        parts.append(_ass_escape(w2["word"]))
+                    if after:
+                        parts.append(" ")
+                    parts.append(r"{\c&H%s&}" % hi_hex[2:])
+                    parts.append(_ass_escape(w["word"]))
+                    # R7b (Fix 2, kinetic-space loss): the gap
+                    # between the highlighted word and the word
+                    # before it in logical order must NOT be
+                    # emitted as the LEADING space of the
+                    # before-run — libass drops a space that is
+                    # the first visible character after a tag
+                    # boundary (closing colour tag + RLM), so the
+                    # highlighted word joined its neighbour at
+                    # every index > 0 in the v3 frames (16/26
+                    # kinetic frames). A TRAILING space survives
+                    # (the after-run's trailing space rendered
+                    # fine), so the gap is emitted here, inside
+                    # the highlighted run before the closing tag.
+                    # A space has no ink, so its colour is
+                    # invisible; the shaping is unchanged (the
+                    # hold line has the same word + space).
+                    if before:
+                        parts.append(" ")
+                    parts.append(r"{\c&H%s&}" % base_hex[2:])
+                    parts.append(RLM)
+                    for j, w2 in enumerate(before):
+                        if j > 0:
+                            parts.append(" ")
+                        parts.append(_ass_escape(w2["word"]))
+                else:
+                    for j, w2 in enumerate(chron):
+                        if j > 0:
+                            parts.append(" ")
+                        if j == ci:
+                            parts.append(r"{\c&H%s&}" % hi_hex[2:])
+                            parts.append(_ass_escape(w2["word"]))
+                            parts.append(r"{\c&H%s&}" % base_hex[2:])
+                        else:
+                            parts.append(_ass_escape(w2["word"]))
+                dialogues.append(
+                    f"Dialogue: 0,{_ass_timestamp(w['start'])},"
+                    f"{_ass_timestamp(w['end'])},{style},,0,0,0,,"
+                    f"{''.join(parts)}")
+            for ci in range(len(chron) - 1):
+                _we = float(chron[ci]["end"])
+                _ns = float(chron[ci + 1]["start"])
+                if _we < _ns:
+                    _gap = [pos]
+                    # Untagged gap line: logical order (chron),
+                    # NOT reversed — FriBidi reorders untagged
+                    # runs itself — with an RLM at line start
+                    # for Arabic lines.
+                    if is_ar:
+                        _gap.append(RLM)
+                    for j, w2 in enumerate(chron):
+                        if j > 0:
+                            _gap.append(" ")
+                        _gap.append(_ass_escape(w2["word"]))
+                    dialogues.append(
+                        f"Dialogue: 0,{_ass_timestamp(_we)},"
+                        f"{_ass_timestamp(_ns)},{style},,0,0,0,,"
+                        f"{''.join(_gap)}")
+            continue
+        else:
+            raise ValueError(f"unknown karaoke event kind: {ev['kind']!r}")
+        dialogues.append(
+            f"Dialogue: 0,{_ass_timestamp(ev['start'])},"
+            f"{_ass_timestamp(ev['end'])},{style},,0,0,0,,{body}")
+    lines = [
+        "[Script Info]",
+        "; AgentCut render-path karaoke ASS (v1.42.0 Fix 2)",
+        "ScriptType: v4.00+",
+        f"PlayResX: {int(width)}",
+        f"PlayResY: {int(height)}",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    ]
+    for key in order:
+        fam, bold, size, base_hex, align = key
+        lines.append(
+            f"Style: {styles[key]},{fam},{size},{base_hex},{base_hex},"
+            f"{_ASS_BLACK},{_ASS_BLACK},{bold},0,0,0,100,100,0,0,1,2,1,"
+            f"{align},0,0,0,1")
+    lines += [
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    lines += dialogues
+    return "\n".join(lines) + "\n"
 
 
 def parse_srt_text(text):
