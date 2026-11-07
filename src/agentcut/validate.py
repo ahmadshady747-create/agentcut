@@ -77,7 +77,13 @@ TEXT_COLORS = {"white", "black", "yellow", "red", "green", "blue", "cyan",
 # Keyframe easing values (pro pack). "linear" is the default and the
 # old behaviour; the others reshape the normalised segment time
 # before interpolation (see _interp_expr_eased in render.py).
-EASING_VALUES = {"linear", "ease_in", "ease_out", "ease_in_out", "ease_out_back"}
+# "spring" (v1.45.0, R6) is the underdamped response (k=180,
+# c=14, m=1; ~15% overshoot); "cubic_bezier" is the CSS-ease
+# curve (degree-4 polynomial fit, clamped). Both are in the
+# shared easing system (motion.apply_easing /
+# render._easing_factor).
+EASING_VALUES = {"linear", "ease_in", "ease_out", "ease_in_out",
+                 "ease_out_back", "spring", "cubic_bezier"}
 
 # Colour-grade presets (pro pack). These are honest, documented
 # filter combinations — eq/colorbalance/saturation settings, NOT
@@ -198,20 +204,33 @@ SFX_NAMES = ("pop", "whoosh", "cash", "chime", "click", "ding", "thud")
 
 # Font files by script (searched in every font directory, in order).
 # DejaVu has no Arabic glyphs, so Arabic texts previously rendered
-# as missing glyphs. Noto Naskh Arabic is the preferred Arabic font
-# when it exists; Noto Sans Arabic is the fallback.
+# as missing glyphs. Noto Sans Arabic (Bold first, then Regular) is
+# the default Arabic font everywhere — drawtext captions, ASS
+# subtitles, and motion labels. Noto Naskh Arabic is deliberately
+# NOT in this chain: this FFmpeg build's drawtext mis-shapes it,
+# forming a false lam-alef ligature from a logical alef+lam
+# sequence ("بالتجربة" renders as "بلا تجربة", "بالبايت" as
+# "بلا بايت" — reproduced 2026-11-07 with the exact sentence,
+# plain drawtext, no RLE/RLM, no wrapping; direct HarfBuzz
+# shaping of the same logical string is correct in both fonts,
+# and libass renders Naskh correctly, so the defect is specific
+# to drawtext + Naskh on this build). Naskh stays available only
+# as the explicit `font: "noto-naskh"` registry choice.
 LATIN_FONT_FILES = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
-ARABIC_FONT_FILES = ["NotoNaskhArabic-Regular.ttf",
-                     "NotoNaskhArabic-Medium.ttf",
+ARABIC_FONT_FILES = ["NotoSansArabic-Bold.ttf",
                      "NotoSansArabic-Regular.ttf"]
 
 # Bundled fonts selectable by name (v1.41.0): the `font`
 # option on texts/captions takes one of these keys, never a
 # path, so a project stays portable across machines. Files
 # are searched in the usual font dirs (bundled fonts/ first
-# among the repo paths); noto-sans-bold is the Arabic DISPLAY
-# face (Bold, modern, geometric) next to the Noto Naskh book
-# face. Licence files ship beside the fonts.
+# among the repo paths); noto-sans-bold is the Arabic DEFAULT
+# face (Bold, modern, geometric) and the only Arabic face the
+# default chain selects. noto-naskh is kept for explicit
+# opt-in only: it is NOT drawtext-safe on this FFmpeg build
+# (false lam-alef ligature, see ARABIC_FONT_FILES above), so
+# no default path ever resolves to it. Licence files ship
+# beside the fonts.
 BUNDLED_FONTS = {"noto-naskh": "NotoNaskhArabic-Regular.ttf",
                  "noto-sans-bold": "NotoSansArabic-Bold.ttf",
                  "dejavu": "DejaVuSans.ttf"}
@@ -229,8 +248,8 @@ def bundled_fonts_dir():
     """First font dir holding a bundled font file, or None.
 
     The render path passes this as the ass filter's fontsdir so
-    libass resolves bundled families (Noto Naskh / Noto Sans
-    Arabic / DejaVu) without depending on system fontconfig
+    libass resolves bundled families (Noto Sans Arabic / Noto
+    Naskh / DejaVu) without depending on system fontconfig
     alone; system dirs still apply on top of it."""
     for d in _font_dirs():
         for filename in BUNDLED_FONTS.values():
@@ -1952,13 +1971,9 @@ def _validate_stroke(st, cw, ch, errors, did):
                               fix="set weight to a positive number, or remove it"))
             return None
         out["weight"] = wt
-    if "seed" in st:
-        try:
-            out["seed"] = int(st["seed"])
-        except (TypeError, ValueError):
-            errors.append(err("INVALID_SCHEMA", "stroke seed must be an integer", field="diagrams.strokes.seed", clip_id=did,
-                              fix="set seed to a whole number, or remove it (defaults to the stroke index)"))
-            return None
+    # v1.45.0, R4a: a "seed" field, when present, is ignored
+    # (it used to drive the deleted wobble/grain) — it passes
+    # through in `out` for backward compatibility, unvalidated.
 
     def _num_pair(v, what):
         if not isinstance(v, (list, tuple)) or len(v) != 2:
@@ -2094,25 +2109,150 @@ def _validate_stroke(st, cw, ch, errors, did):
     return out
 
 
-def _validate_diagrams(project, total, overlay_ids, errors):
+def _adapt_template_diagram(tname, params, rdg, width, height):
+    """Build the motion element for a legacy template diagram
+    (v1.45.0, R4b-3).
+
+    Returns (motion_element, display_w, display_h). The display
+    rect is the diagram's: width = even(size * frame width),
+    height from the template canvas aspect, position = the preset
+    (20px margin, mirroring render.py OVERLAY_POS) or per-axis
+    x/y. The position is clamped into the frame — the motion
+    layer requires in-frame bboxes, the stroke layer did not, so
+    a diagram that hung off-frame is pulled fully inside (a
+    visual shift for that edge case, instead of a rejection).
+    The motion timing reproduces the diagram's: draw = the
+    diagram draw, and the hold+fade becomes fade_out 1.0s
+    starting at start+draw+hold when that fade starts before the
+    window ends (the diagram's own condition).
+    """
+    # Template canvas sizes — the geometry the legacy builders
+    # used; the aspect fixes the display height.
+    _CANVAS = {"chart": (900, 560), "basket": (700, 560),
+               "balance": (900, 560), "causes": (900, 460)}
+    cw, ch = _CANVAS[tname]
+    dw = int(float(rdg["size"]) * width)
+    dw = dw if dw % 2 == 0 else dw - 1
+    dw = max(2, dw)
+    dh = int(round(dw * ch / cw))
+    dh = dh if dh % 2 == 0 else dh - 1
+    dh = max(2, dh)
+    pos = rdg.get("position", "bottom_right")
+    if "x" in rdg:
+        px = int(rdg["x"])
+    elif pos in ("top_left", "bottom_left"):
+        px = 20
+    elif pos in ("top_center", "center", "bottom_center"):
+        px = (width - dw) // 2
+    else:  # top_right, bottom_right
+        px = width - dw - 20
+    if "y" in rdg:
+        py = int(rdg["y"])
+    elif pos in ("top_left", "top_center", "top_right"):
+        py = 20
+    elif pos == "center":
+        py = (height - dh) // 2
+    else:  # bottom_*
+        py = height - dh - 20
+    px = min(max(px, 0), max(0, width - dw))
+    py = min(max(py, 0), max(0, height - dh))
+    start = float(rdg["start"])
+    end = float(rdg["end"])
+    draw = float(rdg["draw"])
+    hold = float(rdg.get("hold_seconds", 8.0))
+    mel = {"id": rdg["id"], "start": start, "end": end}
+    fade_start = start + draw + hold
+    if fade_start < end:
+        mel["fade_out"] = 1.0
+        mel["fade_start"] = fade_start
+    # Chart kinds take the display rect + draw + stagger/grow;
+    # the single-coin shape below takes keyframes instead (a
+    # shape rejects draw and has no w/h).
+    if tname == "chart":
+        values = [float(v) for v in params["values"]]
+        n = len(values)
+        if max(values) <= 0:
+            # Degenerate all-zero chart: the motion line_chart
+            # rejects an all-zero series, the chalk chart drew a
+            # flat line. Keep the flat line (at the bottom) so
+            # the project still renders.
+            values = [1.0] * n
+        mel.update({"kind": "line_chart", "x": px, "y": py,
+                    "w": dw, "h": dh, "draw": draw,
+                    "values": values, "grid": True})
+    elif tname == "basket":
+        coins = int(params.get("coins", 3))
+        if coins == 1:
+            # A single coin is a circle, not a chart (motion
+            # bars needs >= 2 values, and a faked second bar
+            # would misrepresent the count). One static white
+            # circle centred in the diagram rect, at the coin's
+            # chalk radius (58px on the 700px canvas).
+            r = max(10.0, dw * 58.0 / 700.0)
+            cx = px + dw / 2.0
+            cy = py + dh / 2.0
+            mel.update({"kind": "shape", "shape": "circle",
+                        "radius": r, "fill": "white",
+                        "keyframes": [{"t": start, "x": cx, "y": cy},
+                                      {"t": end, "x": cx, "y": cy}]})
+            n = 1
+        else:
+            mel.update({"kind": "bars", "x": px, "y": py,
+                        "w": dw, "h": dh, "draw": draw,
+                        "values": [1.0] * coins,
+                        "labels": [str(i + 1) for i in range(coins)]})
+            n = coins
+    elif tname == "balance":
+        mel.update({"kind": "comparison_cards", "x": px, "y": py,
+                    "w": dw, "h": dh, "draw": draw,
+                    "cards": [{"label": "left",
+                               "value": float(params.get("left", 1))},
+                              {"label": "right",
+                               "value": float(params.get("right", 1))}]})
+        n = 2
+    else:  # causes
+        rows = int(params.get("rows", 3))
+        mel.update({"kind": "comparison_cards", "x": px, "y": py,
+                    "w": dw, "h": dh, "draw": draw,
+                    "cards": [{"label": str(i + 1), "value": None}
+                              for i in range(rows)]})
+        n = rows
+    # Stagger/grow: grow 0.5, stagger scaled so the last item
+    # finishes inside the draw ((n-1)*stagger + grow <= 1).
+    # Chart kinds only — the single-coin shape has no stagger.
+    if mel["kind"] in ("bars", "line_chart", "comparison_cards"):
+        mel["grow"] = 0.5
+        mel["stagger"] = min(0.12, 0.5 / (n - 1)) if n > 1 else 0.0
+    return mel, dw, dh
+
+
+def _validate_diagrams(project, total, width, height, overlay_ids,
+                       errors):
     """Validate the project-level `diagrams` list (v1.38.0).
 
-    Returns resolved diagram dicts for info["diagrams"]. A
-    diagram is custom strokes (with a canvas, default 900x560)
-    or one built-in template with parameters — never both, and
-    labels are never part of a diagram (templates take no text;
-    labels are AgentCut texts). Placement mirrors overlays:
-    size (fraction of output width), position preset, or x/y
-    pixel offsets winning per axis."""
-    from .diagrams import TEMPLATES, build_template
+    Returns (resolved diagram dicts for info["diagrams"],
+    adapted motion elements). A diagram is custom strokes (with
+    a canvas, default 900x560) or one built-in template with
+    parameters — never both, and labels are never part of a
+    diagram (templates take no text; labels are AgentCut texts).
+    Placement mirrors overlays: size (fraction of output width),
+    position preset, or x/y pixel offsets winning per axis.
+    The four legacy templates (chart, basket, balance, causes)
+    are motion adapters (v1.45.0, R4b-3): their diagram entry
+    stays (placement, sfx, card) but carries no strokes, and the
+    adapted motion element is returned for the motion validator.
+    Only `primitives` still builds strokes.
+    """
+    from .diagrams import ADAPTER_TEMPLATES, TEMPLATES, build_template
     resolved = []
+    adapted = []
     raw = project.get("diagrams")
     if raw is None:
-        return resolved
+        return resolved, adapted
     if not isinstance(raw, list):
         errors.append(err("INVALID_SCHEMA", "diagrams must be a list", field="diagrams",
                           fix="give diagrams as a list of diagram objects, or remove diagrams"))
-        return resolved
+        return resolved, adapted
     seen = set()
     for dg in raw:
         if not isinstance(dg, dict):
@@ -2357,8 +2497,6 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                     _rstrokes = []
                     for _si, _st in enumerate(_pstrokes):
                         _st2 = dict(_st) if isinstance(_st, dict) else _st
-                        if isinstance(_st2, dict) and "seed" not in _st2:
-                            _st2["seed"] = _si
                         _rs = _validate_stroke(_st2, _cw, _ch, errors, did)
                         if _rs is None:
                             _rstrokes = None
@@ -2370,15 +2508,35 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                         params = dict(params, strokes=_rstrokes)
             if not ok:
                 continue
-            try:
-                cw, ch, tstrokes = build_template(tname, params)
-            except ValueError as exc:
-                errors.append(err("INVALID_SCHEMA", f"template '{tname}' failed: {exc}", field="diagrams.template", clip_id=did,
-                                  fix="check the template parameters and retry"))
-                continue
-            rdg.update({"source": "template", "template": tname,
-                        "params": params, "canvas_w": cw, "canvas_h": ch,
-                        "strokes": tstrokes})
+            if tname in ADAPTER_TEMPLATES:
+                # v1.45.0, R4b-3: the legacy templates build no
+                # strokes. The diagram entry stays (source
+                # template, placement, sfx, card) so the SFX plan,
+                # the overlap checker and the timeline summary
+                # keep working; canvas_w/h are the DISPLAY size
+                # (the card PNG is generated at that size). The
+                # motion element renders the chart instead.
+                _mel, _dw, _dh = _adapt_template_diagram(
+                    tname, params, rdg, width, height)
+                rdg.update({"source": "template", "template": tname,
+                            "params": params, "canvas_w": _dw,
+                            "canvas_h": _dh, "adapted_to_motion": True})
+                adapted.append(_mel)
+                # Falls through to the SFX/card block below and
+                # resolved.append(rdg): the adapted entry keeps
+                # its sfx and card (the renderer composites the
+                # card under the motion element).
+            else:
+                # Only `primitives` still builds strokes.
+                try:
+                    cw, ch, tstrokes = build_template(tname, params)
+                except ValueError as exc:
+                    errors.append(err("INVALID_SCHEMA", f"template '{tname}' failed: {exc}", field="diagrams.template", clip_id=did,
+                                      fix="check the template parameters and retry"))
+                    continue
+                rdg.update({"source": "template", "template": tname,
+                            "params": params, "canvas_w": cw, "canvas_h": ch,
+                            "strokes": tstrokes})
         else:
             canvas = dg.get("canvas") or {}
             if not isinstance(canvas, dict):
@@ -2404,8 +2562,6 @@ def _validate_diagrams(project, total, overlay_ids, errors):
             rstrokes = []
             for si, st in enumerate(strokes):
                 st2 = dict(st) if isinstance(st, dict) else st
-                if isinstance(st2, dict) and "seed" not in st2:
-                    st2["seed"] = si
                 rs = _validate_stroke(st2, cw, ch, errors, did)
                 if rs is None:
                     rstrokes = None
@@ -2448,6 +2604,13 @@ def _validate_diagrams(project, total, overlay_ids, errors):
             if isinstance(_co, bool) or not isinstance(_co, (int, float)) or not 0.0 <= float(_co) <= 1.0:
                 errors.append(err("INVALID_SCHEMA", "diagram card_opacity must be a number 0..1", field="diagrams.card_opacity", clip_id=did,
                                   fix="set card_opacity between 0 and 1, e.g. 0.45"))
+        # Glassmorphism (v1.45.0, R7): a frosted backdrop-blur
+        # card behind the diagram's backdrop card, ON by
+        # default when a card is present. Set backdrop_blur:
+        # false for a plain (non-frosted) card.
+        if "backdrop_blur" in dg and not isinstance(dg["backdrop_blur"], bool):
+            errors.append(err("INVALID_SCHEMA", "diagram backdrop_blur must be true or false", field="diagrams.backdrop_blur", clip_id=did,
+                              fix="set backdrop_blur to true for a frosted card, or false for a plain card"))
         if len(errors) == _nerr:
             if "card" in dg:
                 rdg["card"] = dg["card"]
@@ -2455,19 +2618,98 @@ def _validate_diagrams(project, total, overlay_ids, errors):
                 rdg["card_color"] = dg["card_color"]
             if "card_opacity" in dg:
                 rdg["card_opacity"] = dg["card_opacity"]
+            if dg.get("card"):
+                rdg["backdrop_blur"] = bool(dg.get("backdrop_blur", True))
         resolved.append(rdg)
-    return resolved
+    return resolved, adapted
+
+
+def _validate_motion_timing(el, rel, kind, mid, start, end, errors):
+    """draw / fade_out / fade_start on a motion element (v1.45.0,
+    R4b-2).
+
+    draw (seconds) is chart kinds only: the staggered draw-on
+    runs over `draw` and then holds at full size for the rest of
+    the window. fade_out (seconds) + optional fade_start
+    (absolute timeline seconds) are raster kinds only: the
+    element fades out over fade_out seconds, starting at
+    fade_start when given, else at end - fade_out (so it
+    completes exactly at the window end). A fade that starts
+    before the window end but runs past it is cut at the end —
+    the diagram fade behaves the same way. Returns True when
+    clean (fields copied onto rel), False otherwise.
+    """
+    window = end - start
+    ok = True
+
+    def _num_sec(name):
+        nonlocal ok
+        v = el[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(float(v)):
+            errors.append(err("INVALID_SCHEMA", f"motion {name} must be a number of seconds", field=f"motion.{name}", clip_id=mid,
+                              fix=f"set {name} to a number of seconds, e.g. 1.0"))
+            ok = False
+            return None
+        return float(v)
+
+    if "draw" in el:
+        if kind not in ("bars", "donut", "pie", "line_chart",
+                        "comparison_cards"):
+            errors.append(err("INVALID_SCHEMA", f"motion draw applies to chart kinds only (bars, donut, pie, line_chart, comparison_cards), not {kind}", field="motion.draw", clip_id=mid,
+                              fix="remove draw, or use a chart kind"))
+            ok = False
+        else:
+            d = _num_sec("draw")
+            if d is not None:
+                if not 0 < d <= window:
+                    errors.append(err("INVALID_SCHEMA", f"motion draw must be > 0 and no longer than the {window}s window", field="motion.draw", clip_id=mid,
+                                      fix=f"set draw between 0 and {window} seconds"))
+                    ok = False
+                else:
+                    rel["draw"] = d
+    if "fade_start" in el and "fade_out" not in el:
+        errors.append(err("INVALID_SCHEMA", "motion fade_start needs fade_out (a fade start without a duration)", field="motion.fade_start", clip_id=mid,
+                          fix="set fade_out as well, e.g. fade_out 1.0"))
+        ok = False
+    if "fade_out" in el:
+        if kind == "counter":
+            errors.append(err("INVALID_SCHEMA", "motion counter does not take fade_out/fade_start (it is a live number, not a video)", field="motion.fade_out", clip_id=mid,
+                              fix="remove fade_out/fade_start, or use a raster kind"))
+            ok = False
+        else:
+            fo = _num_sec("fade_out")
+            if fo is not None:
+                if not 0 < fo <= window:
+                    errors.append(err("INVALID_SCHEMA", f"motion fade_out must be > 0 and no longer than the {window}s window", field="motion.fade_out", clip_id=mid,
+                                      fix="set fade_out between 0 and {window} seconds"))
+                    ok = False
+                else:
+                    rel["fade_out"] = fo
+    if "fade_start" in el and "fade_out" in el and kind != "counter":
+        fs = _num_sec("fade_start")
+        if fs is not None:
+            if not start < fs < end:
+                errors.append(err("INVALID_SCHEMA", f"motion fade_start must be inside the window ({start}..{end})", field="motion.fade_start", clip_id=mid,
+                                  fix=f"set fade_start between {start} and {end}"))
+                ok = False
+            else:
+                rel["fade_start"] = fs
+    return ok
 
 
 def _validate_motion_chart(el, kind, mid, start, end, width, height,
                            fps, errors):
-    """Validate one bars / donut / pie / line_chart element (R2).
+    """Validate one bars / donut / pie / line_chart /
+    comparison_cards element (R2; comparison_cards v1.45.0,
+    R4b-1).
 
     Returns the resolved dict, or None (errors appended). Charts
     use a TOP-LEFT anchor (x, y, w, h) — except donut/pie, which
     use a CENTER (x, y) + radius. The raster bbox must sit fully
     inside the frame (charts do not slide); derived labels are
-    clamped into the frame at render time.
+    clamped into the frame at render time. Comparison cards take
+    `cards` (2..4 {label, value}) instead of `values`/`labels`.
     """
     from .diagrams import resolve_color
     from .motion import _chart_bbox
@@ -2523,7 +2765,7 @@ def _validate_motion_chart(el, kind, mid, start, end, width, height,
         rel["x"] = x
     if y is not None:
         rel["y"] = y
-    if kind in ("bars", "line_chart"):
+    if kind in ("bars", "line_chart", "comparison_cards"):
         w = _num("w", lo=1, required=True)
         h = _num("h", lo=1, required=True)
         if w is not None:
@@ -2541,24 +2783,63 @@ def _validate_motion_chart(el, kind, mid, start, end, width, height,
             errors.append(err("INVALID_SCHEMA", "motion pie does not take donut_ratio (a pie has no hole)", field="motion.donut_ratio", clip_id=mid,
                               fix="remove donut_ratio, or use kind 'donut'"))
             ok = False
-    values = el.get("values")
-    if not isinstance(values, list) or not 2 <= len(values) <= 8:
-        errors.append(err("INVALID_SCHEMA", f"motion {kind} needs values: a list of 2..8 numbers", field="motion.values", clip_id=mid,
-                          fix="give values as e.g. [10, 25, 40]"))
-        return None
-    clean_values = []
-    for v in values:
-        if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                or not math.isfinite(float(v)) or float(v) < 0:
-            errors.append(err("INVALID_SCHEMA", "motion values must be numbers >= 0", field="motion.values", clip_id=mid,
-                              fix="give values as non-negative numbers, e.g. [10, 25, 40]"))
+    if kind == "comparison_cards":
+        # Cards carry their own labels (and an optional value
+        # each); `values` / `labels` are not chart fields here.
+        if "values" in el:
+            errors.append(err("INVALID_SCHEMA", "motion comparison_cards takes cards, not values", field="motion.values", clip_id=mid,
+                              fix="give cards as e.g. [{'label': 'A', 'value': 10}, {'label': 'B', 'value': 20}]"))
             return None
-        clean_values.append(float(v))
-    if max(clean_values) <= 0:
-        errors.append(err("INVALID_SCHEMA", "motion values need at least one value above 0", field="motion.values", clip_id=mid,
-                          fix="give at least one value above 0"))
-        return None
-    rel["values"] = clean_values
+        if "labels" in el:
+            errors.append(err("INVALID_SCHEMA", "motion comparison_cards takes labels inside cards, not a labels list", field="motion.labels", clip_id=mid,
+                              fix="put each label inside its card, e.g. {'label': 'A', 'value': 10}"))
+            return None
+        cards = el.get("cards")
+        if not isinstance(cards, list) or not 2 <= len(cards) <= 4:
+            errors.append(err("INVALID_SCHEMA", "motion comparison_cards needs cards: a list of 2..4 objects", field="motion.cards", clip_id=mid,
+                              fix="give cards as e.g. [{'label': 'A', 'value': 10}, {'label': 'B', 'value': 20}]"))
+            return None
+        clean_cards = []
+        for ci, c in enumerate(cards):
+            if not isinstance(c, dict) or not isinstance(c.get("label"), str) \
+                    or not c["label"].strip():
+                errors.append(err("INVALID_SCHEMA", f"motion card {ci} needs a non-empty string label", field="motion.cards", clip_id=mid,
+                                  fix="give each card a label, e.g. {'label': 'A', 'value': 10}"))
+                return None
+            v = c.get("value")
+            if v is not None and (isinstance(v, bool)
+                                  or not isinstance(v, (int, float, str))
+                                  or (isinstance(v, float) and not math.isfinite(v))):
+                errors.append(err("INVALID_SCHEMA", f"motion card {ci} value must be a number or a string", field="motion.cards", clip_id=mid,
+                                  fix="give value as a number or a short string, e.g. 10 or 'high'"))
+                return None
+            clean_cards.append({"label": c["label"], "value": v})
+        rel["cards"] = clean_cards
+        n_cards = len(clean_cards)
+        labels = None
+    else:
+        values = el.get("values")
+        if not isinstance(values, list) or not 2 <= len(values) <= 8:
+            errors.append(err("INVALID_SCHEMA", f"motion {kind} needs values: a list of 2..8 numbers", field="motion.values", clip_id=mid,
+                              fix="give values as e.g. [10, 25, 40]"))
+            return None
+        clean_values = []
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(float(v)) or float(v) < 0:
+                errors.append(err("INVALID_SCHEMA", "motion values must be numbers >= 0", field="motion.values", clip_id=mid,
+                                  fix="give values as non-negative numbers, e.g. [10, 25, 40]"))
+                return None
+            clean_values.append(float(v))
+        if max(clean_values) <= 0:
+            errors.append(err("INVALID_SCHEMA", "motion values need at least one value above 0", field="motion.values", clip_id=mid,
+                              fix="give at least one value above 0"))
+            return None
+        rel["values"] = clean_values
+        n_cards = None
+    # A comparison_cards element never reaches this block with
+    # a labels list (it is rejected above), so the chart labels
+    # validation below applies to bars/donut/pie/line_chart only.
     labels = el.get("labels")
     if labels is not None:
         if not isinstance(labels, list) or len(labels) != len(values) \
@@ -2596,11 +2877,40 @@ def _validate_motion_chart(el, kind, mid, start, end, width, height,
     rel["label_color"] = _color("label_color", "white")
     rel["stagger"] = _num("stagger", lo=0.0, hi=0.5, default=0.12)
     rel["grow"] = _num("grow", lo=0.1, hi=1.0, default=0.5)
-    if "grid" in el and not isinstance(el["grid"], bool):
-        errors.append(err("INVALID_SCHEMA", "motion grid must be true or false", field="motion.grid", clip_id=mid,
-                          fix="set grid to true for faint grid lines, or false to hide them"))
+    # Glassmorphism (v1.45.0, R7): a frosted backdrop-blur
+    # card behind the chart, ON by default. Set
+    # backdrop_blur: false for a bare chart with no card.
+    if "backdrop_blur" in el and not isinstance(el["backdrop_blur"], bool):
+        errors.append(err("INVALID_SCHEMA", "motion backdrop_blur must be true or false", field="motion.backdrop_blur", clip_id=mid,
+                          fix="set backdrop_blur to true for a frosted card, or false for a bare chart"))
         ok = False
-    rel["grid"] = bool(el.get("grid", True))
+    rel["backdrop_blur"] = bool(el.get("backdrop_blur", True))
+    # Growth easing (v1.45.0, R6): spring by default — the
+    # bars/donut segments grow with a spring overshoot
+    # instead of the old smoothstep. An explicit easing wins.
+    from .motion import EASINGS as _EASINGS
+    _ce = el.get("easing", "spring")
+    if _ce not in _EASINGS:
+        errors.append(err("INVALID_SCHEMA", f"unknown motion easing '{_ce}'; valid easings are: " + ", ".join(_EASINGS), field="motion.easing", clip_id=mid,
+                          fix="set easing to one of: " + ", ".join(_EASINGS)))
+        ok = False
+    else:
+        rel["easing"] = _ce
+    if kind == "comparison_cards":
+        # Cards have no grid: the body is a solid rounded rect.
+        if "grid" in el:
+            errors.append(err("INVALID_SCHEMA", "motion comparison_cards does not take grid (cards have no grid lines)", field="motion.grid", clip_id=mid,
+                              fix="remove grid, or use kind 'bars' or 'line_chart'"))
+            ok = False
+        rel["grid"] = False
+        rel["value_size"] = _num("value_size", lo=8, hi=160, default=44)
+        rel["card_gap"] = _num("card_gap", lo=0.0, hi=0.3, default=0.04)
+    else:
+        if "grid" in el and not isinstance(el["grid"], bool):
+            errors.append(err("INVALID_SCHEMA", "motion grid must be true or false", field="motion.grid", clip_id=mid,
+                              fix="set grid to true for faint grid lines, or false to hide them"))
+            ok = False
+        rel["grid"] = bool(el.get("grid", True))
     if kind == "bars":
         rel["bar_gap"] = _num("bar_gap", lo=0.0, hi=0.8, default=0.2)
     if kind == "line_chart":
@@ -2614,11 +2924,15 @@ def _validate_motion_chart(el, kind, mid, start, end, width, height,
         rel["show_points"] = bool(el.get("show_points", True))
     if not ok:
         return None
-    # Stagger must let every bar/segment finish inside the window.
-    n = len(clean_values)
+    # Stagger must let every bar/segment/card finish inside the
+    # window.
+    n = n_cards if kind == "comparison_cards" else len(clean_values)
     if (n - 1) * rel["stagger"] + rel["grow"] > 1.0 + 1e-9:
         errors.append(err("INVALID_SCHEMA", f"motion stagger/grow leaves the last item unfinished: {(n - 1) * rel['stagger'] + rel['grow']:.2f} > 1", field="motion.stagger", clip_id=mid,
                           fix="lower stagger or grow so (values-1)*stagger + grow <= 1, e.g. stagger 0.12 and grow 0.5"))
+        return None
+    if not _validate_motion_timing(el, rel, kind, mid, start, end,
+                                  errors):
         return None
     try:
         bx, by, bw, bh = _chart_bbox(rel)
@@ -2649,6 +2963,15 @@ def _validate_motion_counter(el, mid, start, end, width, height,
     "Stray %" inline AND in textfile), so use \u066a (\u066a,
     the Arabic percent sign).
     """
+    # A counter is a live number, not a video: draw/fade do not
+    # apply (see _validate_motion_timing, which rejects them for
+    # counters too — this early check keeps the message specific
+    # to the counter instead of the generic raster one).
+    for _f in ("draw", "fade_out", "fade_start"):
+        if _f in el:
+            errors.append(err("INVALID_SCHEMA", f"motion counter does not take {_f} (it is a live number, not a video)", field=f"motion.{_f}", clip_id=mid,
+                              fix=f"remove {_f}, or use a raster kind"))
+            return None
     from .motion import EASINGS
 
     rel = {"id": mid, "kind": "counter", "start": start, "end": end}
@@ -2704,7 +3027,10 @@ def _validate_motion_counter(el, mid, start, end, width, height,
                           fix="set decimals to 0 for whole numbers or 1 for one decimal place"))
         ok = False
     rel["decimals"] = int(decimals) if decimals is not None else 0
-    easing = el.get("easing", "linear")
+    # Counter easing (v1.45.0, R6): spring by default — the
+    # number counts up with a spring overshoot instead of the
+    # old linear ramp. An explicit easing wins.
+    easing = el.get("easing", "spring")
     if easing not in EASINGS:
         errors.append(err("INVALID_SCHEMA", f"unknown motion easing '{easing}'; valid easings are: " + ", ".join(EASINGS), field="motion.easing", clip_id=mid,
                           fix="set easing to one of: " + ", ".join(EASINGS)))
@@ -2793,7 +3119,12 @@ def _validate_motion_lower_third(el, mid, start, end, width, height,
 
     x = _num("x", required=True)
     y = _num("y", required=True)
-    w = _num("w", lo=1, required=True)
+    # w is optional since v1.45.0 (R4c-4, Defect 4): when it is
+    # omitted the card is sized to its text (see the auto-width
+    # block below), instead of the caller guessing a width and
+    # leaving a wide empty card for a short word. An explicit w
+    # is kept as-is (backward compatible).
+    w = _num("w", lo=1, required=False)
     h = _num("h", lo=1, required=True)
     if x is not None:
         rel["x"] = x
@@ -2829,6 +3160,52 @@ def _validate_motion_lower_third(el, mid, start, end, width, height,
             ok = False
         else:
             rel["font"] = font
+    # Auto card width (v1.45.0, R4c-4, Defect 4): when w is
+    # omitted, size the card to the text — card_w =
+    # clamp(text_w + 80, 220, 0.82 * W) — measured with the
+    # shaped (HarfBuzz) width at the size the text will
+    # render at (the style's size when a style is given, else
+    # the element's size). The 80px covers the 24px text
+    # padding on each side plus the accent bar; 220px is the
+    # minimum readable card; 0.82*W keeps it inside the
+    # frame. If the auto width would run past the frame's
+    # right edge, the card shifts left to fit (only in the
+    # auto case — an explicit w keeps its x and is checked
+    # by the frame test below). _measure_text_width lives in
+    # render (the HarfBuzz loader); the lazy import keeps
+    # validate free of a module-level render import (render
+    # imports validate), and it is safe here because both
+    # modules are fully loaded by validation time.
+    if w is None and ok and text is not None and size is not None:
+        _msize = size
+        _style = el.get("style")
+        if isinstance(_style, str) and _style in TEXT_STYLES:
+            _msize = TEXT_STYLES[_style]["size_frac"] * height
+        _font_file = None
+        if isinstance(font, str) and font in BUNDLED_FONTS:
+            _font_file = find_bundled_font(font)
+        if _font_file is None:
+            _font_file = find_font_for_text(text)
+        from .render import _measure_text_width
+        _tw = _measure_text_width(text, _font_file, _msize)
+        w = max(220.0, min(float(_tw) + 80.0, 0.82 * width))
+        if x is not None and x + w > width:
+            x = max(0.0, width - w)
+            rel["x"] = x
+        rel["w"] = w
+    # Accent bar colour (v1.45.0, R4c-4): an optional vertical
+    # accent bar on the card edge — left for Latin text, right
+    # for Arabic (the render side reads contains_arabic).
+    # Absent by default: the 1.44.0 lower third has no accent
+    # bar, so existing projects stay byte-identical.
+    if el.get("accent_color") is not None:
+        _accent = resolve_color(el.get("accent_color"))
+        if _accent is None:
+            errors.append(err("INVALID_SCHEMA", f"unknown motion accent_color colour '{el.get('accent_color')}'", field="motion.accent_color", clip_id=mid,
+                              fix="set accent_color to a colour name or #RRGGBB hex"))
+            ok = False
+        else:
+            rel["accent_color"] = _accent
     card_color = resolve_color(el.get("card_color", "black"))
     if card_color is None:
         errors.append(err("INVALID_SCHEMA", f"unknown motion card_color colour '{el.get('card_color')}'", field="motion.card_color", clip_id=mid,
@@ -2871,6 +3248,9 @@ def _validate_motion_lower_third(el, mid, start, end, width, height,
             or by + bh > height + bh):
         errors.append(err("INVALID_SCHEMA", f"motion lower_third '{mid}' bbox {bx},{by} {bw}x{bh} is outside the {width}x{height} frame", field="motion", clip_id=mid,
                           fix="move the card inside the frame"))
+        return None
+    if not _validate_motion_timing(el, rel, "lower_third", mid,
+                                  start, end, errors):
         return None
     rel["_bbox"] = (bx, by, bw, bh)
     rel["_frames"] = max(1, int(round((end - start) * fps)))
@@ -2948,7 +3328,8 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
             errors.append(err("CLIP_OUT_OF_RANGE", f"motion range {start}..{end} outside timeline {total:.2f}s", field="motion", clip_id=mid,
                               fix=f"keep the motion window inside 0..{total:.2f} with end after start"))
             continue
-        if kind in ("bars", "donut", "pie", "line_chart"):
+        if kind in ("bars", "donut", "pie", "line_chart",
+                    "comparison_cards"):
             rel = _validate_motion_chart(el, kind, mid, start, end,
                                          width, height, fps, errors)
             if rel is not None:
@@ -2975,7 +3356,7 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
             # the kind is known but unimplemented, so it fails
             # loudly instead of validating into a drop.
             errors.append(err("INVALID_SCHEMA", f"motion kind '{kind}' is not implemented yet", field="motion.kind", clip_id=mid,
-                              fix="use kind 'shape', 'bars', 'donut', 'pie', 'line_chart', 'counter' or 'lower_third' for now, or wait for the next motion round"))
+                              fix="use kind 'shape', 'bars', 'donut', 'pie', 'line_chart', 'comparison_cards', 'counter' or 'lower_third' for now, or wait for the next motion round"))
             continue
         rel = {"id": mid, "kind": "shape", "start": start, "end": end}
         shape = el.get("shape", "rect")
@@ -3024,7 +3405,10 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
             for gname in ("w", "h"):
                 try:
                     gv = float(el[gname])
-                except (TypeError, ValueError):
+                except (KeyError, TypeError, ValueError):
+                    # v1.45.0, R1: a missing w/h raised KeyError
+                    # and crashed the validator; it is a schema
+                    # error like a non-numeric one.
                     errors.append(err("INVALID_SCHEMA", f"motion {shape} needs a numeric {gname}", field=f"motion.{gname}", clip_id=mid,
                                       fix=f"set {gname} to a pixel size above 0, e.g. 200"))
                     ok = False
@@ -3050,7 +3434,10 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
         elif shape == "circle":
             try:
                 rv = float(el["radius"])
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
+                # v1.45.0, R1: a missing radius raised KeyError
+                # and crashed the validator instead of returning
+                # INVALID_SCHEMA with a fix hint.
                 errors.append(err("INVALID_SCHEMA", "motion circle needs a numeric radius", field="motion.radius", clip_id=mid,
                                   fix="set radius to a pixel size above 0, e.g. 60"))
                 ok = False
@@ -3178,7 +3565,10 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
                 break
             try:
                 kt = float(kf["t"])
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
+                # v1.45.0, R1: a keyframe without t raised
+                # KeyError and crashed the validator (same class
+                # as the circle-radius crash above).
                 errors.append(err("INVALID_SCHEMA", "motion keyframe t must be a number", field="motion.keyframes.t", clip_id=mid,
                                   fix="set t to an absolute timeline second inside the element window"))
                 ok = False
@@ -3239,6 +3629,9 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
         # frame, and may extend outside it by at most one bbox-size
         # per side (slide-in/out from off-screen). Anything further
         # out, or fully outside, is an authoring error, not a clip.
+        if not _validate_motion_timing(el, rel, "shape", mid,
+                                      start, end, errors):
+            continue
         try:
             bx, by, bw, bh = shape_bbox(rel)
         except Exception as exc:
@@ -4517,7 +4910,7 @@ def validate_project(project):
                     ev = kf.get("easing", "linear")
                     if not isinstance(ev, str) or ev not in EASING_VALUES:
                         errors.append(err("INVALID_SCHEMA", "keyframe easing must be one of: " + ", ".join(sorted(EASING_VALUES)), field="overlays.keyframes.easing", clip_id=oid,
-                                          fix="set easing to linear, ease_in, ease_out or ease_in_out, or remove it"))
+                                          fix="set easing to one of: " + ", ".join(sorted(EASING_VALUES)) + ", or remove it"))
                         bad_kf = True
                         break
                     raw_kfs.append((kt, vals, ev))
@@ -5061,9 +5454,9 @@ def validate_project(project):
             if find_font_for_text(_txt) is None:
                 errors.append(err("FONT_NOT_FOUND",
                                   f"no Arabic font found for text {_txt[:40]!r}; "
-                                  "Arabic text needs Noto Naskh Arabic (or Noto Sans Arabic)",
+                                  "Arabic text needs Noto Sans Arabic",
                                   field="texts",
-                                  fix="use the bundled fonts/ directory, or set AGENTCUT_FONT_DIR to a directory containing NotoNaskhArabic-Regular.ttf"))
+                                  fix="use the bundled fonts/ directory, or set AGENTCUT_FONT_DIR to a directory containing NotoSansArabic-Bold.ttf"))
                 break
         elif find_font() is None:
             errors.append(err("FONT_NOT_FOUND",
@@ -5458,14 +5851,26 @@ def validate_project(project):
     # Diagrams are resolved data (strokes/templates expanded),
     # never file references, so render packs carry them verbatim
     # in project.json and regenerate the animation at render.
-    resolved_diagrams = _validate_diagrams(
-        project, total, {ov["id"] for ov in resolved_overlays}, errors)
+    resolved_diagrams, _adapted_motion = _validate_diagrams(
+        project, total, width, height,
+        {ov["id"] for ov in resolved_overlays}, errors)
     # Motion graphics (v1.43.0): validated after the diagrams so
     # motion ids can be checked against overlay and diagram ids.
+    # The adapted template diagrams (v1.45.0, R4b-3) join the
+    # motion list for validation, and their ids are excluded
+    # from the diagram-ids set — the adapted motion element
+    # carries its diagram's id, so it would otherwise be
+    # rejected as a duplicate of itself. A user motion element
+    # colliding with an adapted diagram id is still caught by
+    # the motion list's own duplicate check.
+    _motion_project = dict(project)
+    _motion_project["motion"] = ((project.get("motion") or [])
+                                 + _adapted_motion)
     resolved_motion = _validate_motion(
-        project, total, width, height, fps,
+        _motion_project, total, width, height, fps,
         {ov["id"] for ov in resolved_overlays},
-        {dg["id"] for dg in resolved_diagrams}, errors)
+        {dg["id"] for dg in resolved_diagrams
+         if not dg.get("adapted_to_motion")}, errors)
     # Typography profile (v1.44.0, F4): project-level default
     # style, opt-in only — a project without `typography`
     # renders exactly as before.

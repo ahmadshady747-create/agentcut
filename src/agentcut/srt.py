@@ -239,7 +239,7 @@ def _karaoke_dialogue(cue, karaoke):
     return ("Karaoke", "est", " ".join(parts))
 
 
-def cues_to_ass_text(cues, width=1280, height=720, font_name="Noto Naskh Arabic",
+def cues_to_ass_text(cues, width=1280, height=720, font_name="Noto Sans Arabic",
                      font_size=48, margin_v=120, fade_ms=120, shadow=1,
                      outline=2, karaoke="auto"):
     """Render cues as one unified ASS (Advanced SubStation Alpha)
@@ -332,7 +332,7 @@ def cues_to_ass_text(cues, width=1280, height=720, font_name="Noto Naskh Arabic"
     return "\n".join(lines) + "\n"
 
 
-def export_ass(cues, path, width=1280, height=720, font_name="Noto Naskh Arabic",
+def export_ass(cues, path, width=1280, height=720, font_name="Noto Sans Arabic",
                font_size=48, margin_v=120, fade_ms=120, shadow=1,
                outline=2, karaoke="auto"):
     """Write cues to path as one unified ASS file. Returns path."""

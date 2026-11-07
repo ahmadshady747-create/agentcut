@@ -14,12 +14,11 @@ Rendering is stdlib + FFmpeg only, like the rest of AgentCut
 supersampled path — never required). The diagram is drawn into
 RGBA frames with a small stdlib rasterizer: strokes are
 continuous capsule SDF segments along a sampled path (v1.41.0,
-Fix 3 — clean vector lines; the stamped discs and their chalk
-grain are gone by design). The wobble is baked into the path
-ONCE (a static function of position along the stroke), so every
-frame of the animation shows the same stroke shape — there is
-deliberately NO animated jitter, which would read as vibration.
-Frames are piped as rawvideo into FFmpeg and encoded to a
+Fix 3 — clean vector lines; the stamped discs, their chalk
+grain and the wobble are gone by design (v1.45.0, R4a). Points
+are clean resampled vectors, so every frame of the animation
+shows the same stroke shape — there is deliberately NO animated
+jitter, which would read as vibration. Frames are piped as rawvideo into FFmpeg and encoded to a
 temporary transparent (PNG codec, RGBA) video; the main render
 composites that video with the normal overlay filter and loops
 its last frames for the hold after the draw window ends.
@@ -46,8 +45,9 @@ Common stroke fields: "color" ("white" default, "yellow", any
 named colour or #RRGGBB), "width" (2..20, default 7),
 "alpha" (0.2..1, default 0.95), "weight" (positive number;
 a stroke's share of the draw window defaults to its path
-length, so longer strokes naturally take longer to draw),
-"seed" (integer; defaults to the stroke's index).
+length, so longer strokes naturally take longer to draw).
+A "seed" field, when present on a stroke, is ignored (it used
+to drive the deleted wobble/grain; old projects still validate).
 
 Templates (see build_template): "chart" (rising chart with
 axes, faint grid and an arrowed curve), "basket" (basket with
@@ -97,28 +97,6 @@ def resolve_color(color):
     return None
 
 
-def _hash01(x, y, seed):
-    """Deterministic grain in [0, 1) from integer coords + seed."""
-    h = (x * 374761393 + y * 668265263 + seed * 974634211) & 0xFFFFFFFF
-    h = (h ^ (h >> 13)) * 1274126177 & 0xFFFFFFFF
-    return ((h ^ (h >> 16)) & 0xFFFF) / 0xFFFF
-
-
-def _wobble(u, seed, amplitude):
-    """Static edge irregularity at fraction u along a stroke.
-
-    Integer frequencies (3 and 7 cycles over the stroke) so a
-    closed shape joins seamlessly at u=0/1, and phases derived
-    from the seed so every stroke wobbles differently. This is
-    a function of position only — never of time — so the
-    stroke shape is identical in every animation frame.
-    """
-    ph1 = (seed * 0.731) % (2 * math.pi)
-    ph2 = (seed * 1.937 + 1.3) % (2 * math.pi)
-    return amplitude * (0.65 * math.sin(2 * math.pi * 3 * u + ph1)
-                        + 0.35 * math.sin(2 * math.pi * 7 * u + ph2))
-
-
 def _resample_walk(points, step):
     """Clean resample: points spaced ~step px along the polyline."""
     out = [points[0]]
@@ -151,38 +129,6 @@ def _resample_walk(points, step):
     return out
 
 
-def _apply_wobble(points, width, seed):
-    """Offset sampled points perpendicular to the path by the
-    static wobble, and return the wobbled point list."""
-    if len(points) < 2:
-        return list(points)
-    total = 0.0
-    seg_lens = []
-    for a, b in zip(points, points[1:]):
-        L = math.hypot(b[0] - a[0], b[1] - a[1])
-        seg_lens.append(L)
-        total += L
-    if total == 0:
-        return list(points)
-    amp = min(1.2, max(0.6, width * 0.10))
-    out = []
-    walked = 0.0
-    for i, pt in enumerate(points):
-        if i > 0:
-            walked += seg_lens[i - 1]
-        u = walked / total
-        # Perpendicular from the local direction.
-        if i < len(points) - 1:
-            dx, dy = points[i + 1][0] - pt[0], points[i + 1][1] - pt[1]
-        else:
-            dx, dy = pt[0] - points[i - 1][0], pt[1] - points[i - 1][1]
-        L = math.hypot(dx, dy) or 1.0
-        nx, ny = -dy / L, dx / L
-        off = _wobble(u, seed, amp)
-        out.append((pt[0] + nx * off, pt[1] + ny * off))
-    return out
-
-
 def _dense_line(a, b, step=1.0):
     """Dense points along a segment (for resampling)."""
     L = math.hypot(b[0] - a[0], b[1] - a[1])
@@ -194,21 +140,20 @@ def _dense_line(a, b, step=1.0):
 def stroke_to_points(stroke):
     """One stroke dict -> (points, color_rgb, width, alpha).
 
-    Points are sampled ~width/3 px apart with the static wobble
-    baked in. Arrowheads are part of the same stroke: the shaft
-    points followed by the two barb point-lists (stamping discs
-    only, so the jump back to the tip leaves no connecting
-    line — the barbs meet the shaft exactly at the tip).
+    Points are clean resampled vectors, sampled ~width/3 px
+    apart (v1.45.0, R4a: no wobble, no grain). Arrowheads are
+    part of the same stroke: the shaft points followed by the
+    two barb point-lists (the jump back to the tip leaves no
+    connecting line — the barbs meet the shaft exactly at the
+    tip, and the SDF engine breaks segments at jumps).
     """
     kind = stroke.get("kind")
     width = float(stroke.get("width", 7))
     step = max(1.0, width / 3.0)
-    seed = int(stroke.get("seed", 0))
     if kind in ("polyline", "arrow", "line"):
         # "line" is a straight 2-point segment (validation
         # enforces exactly 2 points); it renders through the
-        # same chalk path as a polyline, so it keeps the same
-        # weight, wobble and grain behaviour.
+        # same vector path as a polyline.
         raw = stroke["points"]
         dense = []
         for a, b in zip(raw, raw[1:]):
@@ -217,7 +162,6 @@ def stroke_to_points(stroke):
             dense.extend(seg[:-1] if dense else seg)
         dense.append((float(raw[-1][0]), float(raw[-1][1])))
         points = _resample_walk(dense, step)
-        points = _apply_wobble(points, width, seed)
         if kind == "arrow":
             # Head barbs: two short segments back from the tip,
             # at ~145 degrees to the shaft direction.
@@ -230,7 +174,6 @@ def stroke_to_points(stroke):
                                    (x1 + head * math.cos(ba),
                                     y1 + head * math.sin(ba)))
                 barb = _resample_walk(barb, step)
-                barb = _apply_wobble(barb, width, seed + 7)
                 points.extend(barb)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     if kind == "circle":
@@ -240,7 +183,6 @@ def stroke_to_points(stroke):
         dense = [(cx + r * math.cos(2 * math.pi * i / n),
                   cy + r * math.sin(2 * math.pi * i / n)) for i in range(n + 1)]
         points = _resample_walk(dense, step)
-        points = _apply_wobble(points, width, seed)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     if kind == "ellipse":
         cx, cy = float(stroke["center"][0]), float(stroke["center"][1])
@@ -250,7 +192,6 @@ def stroke_to_points(stroke):
         dense = [(cx + rx * math.cos(2 * math.pi * i / n),
                   cy + ry * math.sin(2 * math.pi * i / n)) for i in range(n + 1)]
         points = _resample_walk(dense, step)
-        points = _apply_wobble(points, width, seed)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     if kind == "rect":
         x, y = float(stroke["x"]), float(stroke["y"])
@@ -288,15 +229,14 @@ def stroke_to_points(stroke):
             # order top-right -> bottom-right -> bottom-left ->
             # top-left walks the perimeter clockwise.
         points = _resample_walk(dense, step)
-        points = _apply_wobble(points, width, seed)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     if kind == "arc":
         # Arc: centre + radius + start/end angles in degrees.
         # 0 degrees is east; positive angles run clockwise on
         # screen (y grows downward), so 0 -> 90 draws the
         # bottom-right quadrant. A zero sweep (start == end)
-        # means a full circle. Points follow the same chalk path
-        # (resample + wobble + grain) as every other stroke.
+        # means a full circle. Points follow the same clean
+        # vector path (resample only) as every other stroke.
         cx, cy = float(stroke["center"][0]), float(stroke["center"][1])
         r = float(stroke["radius"])
         a0 = math.radians(float(stroke["start_angle"]))
@@ -309,7 +249,6 @@ def stroke_to_points(stroke):
         dense = [(cx + r * math.cos(a0 + sweep * i / n),
                   cy + r * math.sin(a0 + sweep * i / n)) for i in range(n + 1)]
         points = _resample_walk(dense, step)
-        points = _apply_wobble(points, width, seed)
         return points, resolve_color(stroke.get("color", "white")), width, float(stroke.get("alpha", 0.95))
     raise ValueError(f"unknown stroke kind {kind!r}")
 
@@ -324,7 +263,7 @@ def stroke_weight(stroke, points):
 
 
 class Canvas:
-    """RGBA chalk canvas: stamped discs, max-alpha wins.
+    """RGBA vector canvas: capsule SDF segments, max-alpha wins.
 
     ss is the buffer's supersample factor relative to output
     coordinates (1 = direct; 2 = the internal buffer of
@@ -338,68 +277,19 @@ class Canvas:
         self.ss = int(ss)
         self.buf = bytearray(self.width * self.height * 4)
 
-    def stamp(self, x, y, radius, color, alpha, seed):
-        # Incremental-rasterization hot path: a stamp's pixel
-        # offsets and edge falloff depend ONLY on (radius,
-        # fractional center), never on the integer center, so
-        # they are cached per (radius, fx, fy) instead of
-        # recomputed with math.hypot per pixel per stamp. The
-        # cache is EXACT, not approximate: xx - x equals
-        # (xx - ix) - fx bit-for-bit (a single rounding of the
-        # same real value), so edge values are identical to the
-        # uncached computation, and the grain still uses absolute
-        # pixel coordinates, so output bytes are unchanged.
-        # A second exact shortcut: a stamp's value v satisfies
-        # v <= alpha, so when the pixel's current alpha already
-        # reaches alpha the stamp cannot win there and the grain
-        # need not be computed at all.
-        ix = int(math.floor(x))
-        iy = int(math.floor(y))
-        fx = x - ix
-        fy = y - iy
-        mask = _stamp_mask(radius, fx, fy)
-        buf = self.buf
-        w = self.width
-        h = self.height
-        for dx, dy, edge in mask:
-            xx = ix + dx
-            yy = iy + dy
-            if xx < 0 or xx >= w or yy < 0 or yy >= h:
-                continue
-            idx = (yy * w + xx) * 4
-            old_a = buf[idx + 3] / 255.0
-            if old_a >= alpha:
-                continue
-            grain = 0.80 + 0.20 * _hash01(xx, yy, seed)
-            v = alpha * edge * grain
-            if v > old_a:
-                buf[idx] = color[0]
-                buf[idx + 1] = color[1]
-                buf[idx + 2] = color[2]
-                buf[idx + 3] = int(round(v * 255))
-
-    def draw_points(self, points, color, width, alpha, seed):
-        radius = width / 2.0
-        for (x, y) in points:
-            self.stamp(x, y, radius, color, alpha, seed)
-
-    def draw_segments(self, points, color, width, alpha, seed=None):
+    def draw_segments(self, points, color, width, alpha):
         """Draw consecutive point pairs as capsule SDF segments
-        (v1.41.0, Fix 3) — the diagram path's line engine,
-        replacing stamped discs. For a segment P1-P2, per-pixel
+        (v1.41.0, Fix 3; the only line engine since v1.45.0, R4a
+        — the stamped discs, their chalk grain and the wobble
+        are deleted). For a segment P1-P2, per-pixel
         point-to-segment distance d gives coverage
         alpha * clamp(0.5 + (r - d) / ss, 0, 1): continuous
-        lines with no bead gaps and no staircasing, unlike disc
-        stamps whose edges scallop. Segments break at jumps
-        over 15 output pixels (arrow-barb jumps of head_size
-        30-40px), so barbs never draw connecting lines; the
-        wobble baked into the points is preserved (capsules
-        between wobbled points keep the hand-drawn path). No
-        chalk grain: clean vector lines (documented aesthetic
-        change — the grain went with the discs). Max-alpha wins,
-        same compositing as stamp, so re-drawing a segment is
-        idempotent. seed is accepted for call-site
-        compatibility and ignored (grain is gone)."""
+        lines with no bead gaps and no staircasing. Segments
+        break at jumps over 15 output pixels (arrow-barb jumps
+        of head_size 30-40px), so barbs never draw connecting
+        lines. Points are clean resampled vectors — no wobble,
+        no grain. Max-alpha wins, so re-drawing a segment is
+        idempotent."""
         pts = [(float(x), float(y)) for x, y in points]
         if len(pts) < 2:
             return
@@ -435,8 +325,7 @@ class Canvas:
                                        py - (y1 + t * dy))
                     # Clamp the COVERAGE first, then scale by
                     # the stroke alpha (interior pixels land at
-                    # exactly alpha, matching the stamped path's
-                    # alpha * edge with edge <= 1).
+                    # exactly alpha).
                     cov = 0.5 + (r - d) / ss
                     if cov <= 0.0:
                         continue
@@ -455,7 +344,7 @@ class Canvas:
         return bytes(self.buf)
 
     def opaque_pixel_count(self):
-        """Pixels with any chalk on them (alpha > 0)."""
+        """Pixels with any ink on them (alpha > 0)."""
         return sum(1 for i in range(3, len(self.buf), 4) if self.buf[i] > 0)
 
 
@@ -474,10 +363,10 @@ class _ScaledCanvas:
         self.height = int(height)
         self._inner = Canvas(2 * self.width, 2 * self.height, ss=2)
 
-    def draw_segments(self, points, color, width, alpha, seed=None):
+    def draw_segments(self, points, color, width, alpha):
         pts = [(float(x) * 2.0, float(y) * 2.0) for x, y in points]
         self._inner.draw_segments(pts, color, float(width) * 2.0,
-                                  alpha, seed)
+                                  alpha)
 
     def bytes(self):
         raw = self._inner.bytes()
@@ -501,58 +390,15 @@ def _new_canvas(width, height):
     return Canvas(width, height)
 
 
-_STAMP_MASK_CACHE = {}
-_STAMP_MASK_CACHE_MAX = 1024
-
-
-def _stamp_mask(radius, fx, fy):
-    """(dx, dy, edge) offsets for a disc of `radius` centred at
-    fractional offset (fx, fy) within its pixel.
-
-    Built once per (radius, fx, fy) and reused for every stamp
-    with the same radius and sub-pixel phase — straight strokes
-    sampled at regular steps cycle through only a few phases,
-    so the cache hits constantly. The mask is exact (see
-    Canvas.stamp): offsets are relative to the integer center
-    and edge values are computed from relative geometry only.
-    The cache is bounded: when full it is cleared, which only
-    costs recomputation, never correctness."""
-    key = (radius, fx, fy)
-    mask = _STAMP_MASK_CACHE.get(key)
-    if mask is not None:
-        return mask
-    mask = []
-    x0 = int(math.floor(fx - radius - 1))
-    x1 = int(math.ceil(fx + radius + 1))
-    y0 = int(math.floor(fy - radius - 1))
-    y1 = int(math.ceil(fy + radius + 1))
-    for yy in range(y0, y1 + 1):
-        for xx in range(x0, x1 + 1):
-            d = math.hypot(xx - fx, yy - fy)
-            if d > radius + 1:
-                continue
-            # Delta: distance-based alpha feathering — a smoothstep
-            # falloff over the same 2px band the old linear ramp
-            # used, so diagonal lines and circles lose their hard
-            # stair-step edge without changing the stamp's reach
-            # (u = 1 at the inner edge, 0 at the outer edge).
-            u = 1.0 if d <= radius - 1 else max(0.0, (radius + 1 - d) / 2)
-            edge = u * u * (3 - 2 * u)
-            mask.append((xx, yy, edge))
-    if len(_STAMP_MASK_CACHE) >= _STAMP_MASK_CACHE_MAX:
-        _STAMP_MASK_CACHE.clear()
-    _STAMP_MASK_CACHE[key] = mask
-    return mask
-
-
 def _prepare_strokes(strokes):
-    """Stroke dicts -> list of (points, color, width, alpha, seed, weight)."""
+    """Stroke dicts -> list of (points, color, width, alpha, weight).
+
+    v1.45.0, R4a: the seed is gone with the wobble/grain — the
+    tuple no longer carries one."""
     prepared = []
     for i, st in enumerate(strokes):
-        st = dict(st)
-        st.setdefault("seed", i)
         points, color, width, alpha = stroke_to_points(st)
-        prepared.append((points, color, width, alpha, int(st["seed"]),
+        prepared.append((points, color, width, alpha,
                          stroke_weight(st, points)))
     return prepared
 
@@ -568,16 +414,16 @@ def render_diagram_rgba(strokes, width, height, progress=1.0):
     segments, same order, same canvas path).
     """
     prepared = _prepare_strokes(strokes)
-    total = sum(p[5] for p in prepared)
+    total = sum(p[4] for p in prepared)
     target = max(0.0, min(1.0, float(progress))) * total
     canvas = _new_canvas(width, height)
     acc = 0.0
-    for points, color, wdt, alpha, seed, weight in prepared:
+    for points, color, wdt, alpha, weight in prepared:
         if target <= acc:
             break
         take = target - acc
         n = len(points) if take >= weight else max(0, int(round(len(points) * take / weight))) if weight > 0 else 0
-        canvas.draw_segments(points[:n], color, wdt, alpha, seed)
+        canvas.draw_segments(points[:n], color, wdt, alpha)
         acc += weight
     return canvas.bytes()
 
@@ -680,7 +526,7 @@ class DiagramAnimator:
         self.width = int(width)
         self.height = int(height)
         self.prepared = _prepare_strokes(strokes)
-        self.total_weight = sum(p[5] for p in self.prepared)
+        self.total_weight = sum(p[4] for p in self.prepared)
         self.frames = max(1, int(round(float(draw_seconds) * float(fps))))
         self.canvas = _new_canvas(self.width, self.height)
         self._frame = 0
@@ -691,7 +537,7 @@ class DiagramAnimator:
         acc = 0.0
         for p in self.prepared:
             self._offsets.append(acc)
-            acc += p[5]
+            acc += p[4]
 
     def next_frame(self):
         """Next frame bytes, or None when the animation is done."""
@@ -709,7 +555,7 @@ class DiagramAnimator:
             # byte-identical to a direct full render.
             u = self._frame / self.frames
             target = self.total_weight * u * u * (3 - 2 * u)
-        for i, (points, color, wdt, alpha, seed, weight) in enumerate(self.prepared):
+        for i, (points, color, wdt, alpha, weight) in enumerate(self.prepared):
             start = self._offsets[i]
             if target <= start:
                 continue
@@ -718,7 +564,7 @@ class DiagramAnimator:
             if want > self._drawn[i]:
                 _lo = self._drawn[i] - 1 if self._drawn[i] > 0 else 0
                 self.canvas.draw_segments(points[_lo:want], color, wdt,
-                                          alpha, seed)
+                                          alpha)
                 self._drawn[i] = want
         return self.canvas.bytes()
 
@@ -774,218 +620,15 @@ def encode_diagram_video(diagram, fps, out_path):
 
 
 # ------------------------------------------------------------------
-# Built-in templates. Each returns (canvas_width, canvas_height,
-# strokes). Geometry is fixed and proportional; parameters only
-# change values/counts. No text is ever baked in — labels are
-# AgentCut texts supplied by the calling project.
+# Built-in templates (v1.45.0, R4b-3). Only `primitives` still
+# builds strokes: it is the custom-stroke escape hatch (clean
+# vectors, no chalk). The four legacy templates (chart, basket,
+# balance, causes) are MOTION ADAPTERS now — they never build
+# strokes. Their names stay in TEMPLATES so old projects still
+# validate, but build_template raises for them and validate.py
+# builds a motion element (line_chart / bars / comparison_cards)
+# at the diagram's display rect instead. See _validate_diagrams.
 # ------------------------------------------------------------------
-
-def _line(points, **kw):
-    d = {"kind": "polyline", "points": points}
-    d.update(kw)
-    return d
-
-
-def _arrow(points, **kw):
-    d = {"kind": "arrow", "points": points}
-    d.update(kw)
-    return d
-
-
-def _circle(center, radius, **kw):
-    d = {"kind": "circle", "center": center, "radius": radius}
-    d.update(kw)
-    return d
-
-
-def chart_grid_points(params):
-    """Single source of truth for the chart template geometry
-    (v1.41.0): the caller places drawtext labels from these
-    numbers, and template_chart draws from them, so labels and
-    art can never disagree.
-
-    Returns {"grid_ys", "curve_points", "plot", "value_range"}:
-    plot is {x0: 140, x1: 830, y0: 60, y1: 470, baseline: 500}
-    (the axes meet at (90, 500); the curve lives in y 60..470);
-    value_range is (lo, hi) after the 10% padding the template
-    applies. grid_ys maps each y_grid_values entry through the
-    same normalization as the curve (y = 470 - 410*(v-lo)/span);
-    without y_grid_values it is the legacy [160, 260, 360].
-    curve_points are [[x, y], ...] in canvas coordinates.
-    Labels are NEVER baked into the art — the caller draws
-    them as AgentCut texts from grid_ys / curve_points.
-    """
-    values = [float(v) for v in params["values"]]
-    lo, hi = min(values), max(values)
-    span = (hi - lo) or 1.0
-    lo -= span * 0.10
-    hi += span * 0.10
-    span = hi - lo
-    n = len(values)
-    xs = [140 + (830 - 140) * (i / (n - 1) if n > 1 else 0.5)
-          for i in range(n)]
-    ys = [470 - (470 - 60) * (v - lo) / span for v in values]
-    grid_values = params.get("y_grid_values")
-    if grid_values is not None:
-        grid_ys = [470 - (470 - 60) * (float(v) - lo) / span
-                   for v in grid_values]
-    else:
-        grid_ys = [160, 260, 360]
-    return {"grid_ys": grid_ys,
-            "curve_points": [[round(x), round(y)]
-                             for x, y in zip(xs, ys)],
-            "plot": {"x0": 140, "x1": 830, "y0": 60, "y1": 470,
-                     "baseline": 500},
-            "value_range": (lo, hi)}
-
-
-def template_chart(params):
-    """Rising chart: axes with arrowheads, faint grid, and an
-    arrowed curve through `values` (2..8 numbers). Canvas
-    900x560; plot area x 140..830, y 60..470.
-
-    v1.41.0: `y_grid_values` (list of numbers) replaces the
-    fixed gridlines with lines at the caller's values, mapped
-    through the same normalization as the curve — so a grid
-    line MEANS a value the caller can label. `fill: true`
-    adds a translucent yellow area under the curve: a comb of
-    vertical strokes from the curve down to the baseline,
-    sampled every ~14px along the interpolated curve, drawn
-    BEFORE the curve (so the curve stays crisp on top) at
-    small explicit weights (5 each, ~10% of the draw window),
-    so the fill never eats the curve's draw time.
-    """
-    geo = chart_grid_points(params)
-    pts = geo["curve_points"]
-    strokes = []
-    # Hand order: axes first, then the faint grid, then the
-    # fill, then the curve. Grid lines are long, so without an
-    # explicit small weight they would eat most of the draw
-    # window by length-weighting (verified: grid-first took
-    # ~70% of the window and the curve only appeared at the
-    # very end).
-    strokes.append(_arrow([(90, 500), (90, 40)], color="white", width=7, head_size=30))
-    strokes.append(_arrow([(90, 500), (850, 500)], color="white", width=7, head_size=30))
-    for gy in geo["grid_ys"]:
-        strokes.append(_line([(140, int(round(gy))), (830, int(round(gy)))], color="white", width=3, alpha=0.35, weight=50))
-    if params.get("fill"):
-        # Interpolated curve samples, every ~14px in x, each
-        # dropping a vertical to the baseline.
-        raw = [(float(p[0]), float(p[1])) for p in pts]
-        x = raw[0][0]
-        seg = 0
-        while x <= raw[-1][0]:
-            while seg + 1 < len(raw) and raw[seg + 1][0] < x:
-                seg += 1
-            (x0, y0), (x1, y1) = raw[seg], raw[min(seg + 1, len(raw) - 1)]
-            t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
-            y = y0 + (y1 - y0) * t
-            strokes.append(_line([(int(round(x)), int(round(y))),
-                                  (int(round(x)), 500)],
-                                 color="yellow", width=3, alpha=0.25,
-                                 weight=5))
-            x += 14
-    # The curve itself (white), with its tip re-drawn in
-    # yellow as a short arrow stroke over the last segment:
-    # yellow is emphasis only, and the tip is the emphasis.
-    strokes.append(_line(pts, color="white", width=9))
-    if len(pts) >= 2:
-        strokes.append(_arrow(pts[-2:], color="yellow", width=9, head_size=40))
-    return 900, 560, strokes
-
-
-def template_basket(params):
-    """Basket with `coins` (1..5) coins above the rim. Canvas
-    700x560. Basket first, coins last, stacked in a pyramid."""
-    coins = params.get("coins", 3)
-    strokes = [
-        _line([(140, 300), (560, 300)], color="white", width=8),
-        _line([(140, 300), (235, 480)], color="white", width=8),
-        _line([(560, 300), (465, 480)], color="white", width=8),
-        _line([(235, 480), (465, 480)], color="white", width=8),
-        _line([(250, 300), (290, 480)], color="white", width=5, alpha=0.85),
-        _line([(450, 300), (410, 480)], color="white", width=5, alpha=0.85),
-    ]
-    # Pyramid slots: bottom row of up to 3, then a top row.
-    slots = []
-    if coins <= 3:
-        slots = [(350 + (i - (coins - 1) / 2) * 140, 235) for i in range(coins)]
-    else:
-        slots = [(280, 235), (420, 235), (350, 235)]
-        extra = coins - 3
-        slots += [(350 + (i - (extra - 1) / 2) * 140, 150) for i in range(extra)]
-    for (cx, cy) in slots:
-        strokes.append(_circle([cx, cy], 58, color="white", width=8))
-        strokes.append(_circle([cx, cy], 30, color="white", width=5, alpha=0.85))
-    return 700, 560, strokes
-
-
-def template_balance(params):
-    """Beam scale. `left`/`right` values tilt the beam (heavier
-    side lower, max ~14 degrees); equal values give a level
-    beam. Canvas 900x560."""
-    left = float(params.get("left", 1))
-    right = float(params.get("right", 1))
-    mx = max(left, right, 1e-9)
-    tilt_deg = max(-14.0, min(14.0, (right - left) / mx * 14.0))
-    tilt = math.radians(tilt_deg)
-    cx, pivot_y = 450, 210
-    half = 300
-    dx, dy = half * math.cos(tilt), half * math.sin(tilt)
-    # Note: positive tilt (right heavier) lowers the right end,
-    # so the beam's right endpoint uses +dy in canvas coords
-    # (y grows downward) when right > left; the formula above
-    # gives tilt > 0 for right > left, and sin(tilt) > 0 moves
-    # the right end down. Correct as drawn.
-    lx, ly = cx - dx, pivot_y - dy
-    rx, ry = cx + dx, pivot_y + dy
-    strokes = [
-        _line([(450, 60), (450, 210)], color="white", width=8),   # post
-        _line([(330, 500), (570, 500)], color="white", width=8),  # base
-        _line([(390, 500), (450, 210)], color="white", width=5, alpha=0.85),
-        _line([(510, 500), (450, 210)], color="white", width=5, alpha=0.85),
-        _line([(round(lx), round(ly)), (round(rx), round(ry))], color="white", width=8),  # beam
-        _line([(cx - 40, pivot_y + 30), (cx + 40, pivot_y + 30)], color="white", width=6),
-        _line([(cx - 40, pivot_y + 30), (cx, pivot_y)], color="white", width=6),
-        _line([(cx + 40, pivot_y + 30), (cx, pivot_y)], color="white", width=6),
-    ]
-    for (ex, ey) in ((lx, ly), (rx, ry)):
-        # Hangers + pan arc (shallow curve under the beam end).
-        strokes.append(_line([(round(ex - 45), round(ey + 20)), (round(ex - 45), round(ey + 110))], color="white", width=5))
-        strokes.append(_line([(round(ex + 45), round(ey + 20)), (round(ex + 45), round(ey + 110))], color="white", width=5))
-        arc = []
-        for i in range(25):
-            t = i / 24
-            ax = ex - 55 + 110 * t
-            ay = ey + 110 + 42 * math.sin(math.pi * t)
-            arc.append([round(ax), round(ay)])
-        strokes.append(_line(arc, color="white", width=7))
-    return 900, 560, strokes
-
-
-def template_causes(params):
-    """Causes panel: `rows` (1..4) rows, each a badge circle
-    with a small inner mark plus a right-pointing arrow.
-    Canvas 900x460; rows are evenly spaced and identical in
-    size, so the panel reads as one clean unit."""
-    rows = params.get("rows", 3)
-    strokes = []
-    top, gap = 70, 110
-    for i in range(rows):
-        y = top + i * gap
-        strokes.append(_circle([90, y], 34, color="white", width=7))
-        if i % 3 == 0:
-            # Rising tick inside the badge.
-            strokes.append(_line([(72, y + 8), (86, y - 4), (108, y - 14)], color="yellow", width=6))
-        elif i % 3 == 1:
-            # Level bar inside the badge.
-            strokes.append(_line([(68, y), (112, y)], color="yellow", width=6))
-        else:
-            # Three dots inside the badge.
-            for (dx, dy) in ((-14, 0), (0, -10), (0, 10)):
-                strokes.append(_circle([90 + dx, y + dy], 7, color="yellow", width=5))
-        strokes.append(_arrow([(160, y), (800, y)], color="white", width=8, head_size=36))
-    return 900, 460, strokes
 
 
 def template_primitives(params):
@@ -1020,11 +663,18 @@ def template_primitives(params):
     return cw, ch, list(strokes)
 
 
+# Legacy templates that are motion adapters now (v1.45.0,
+# R4b-3): their names stay in TEMPLATES so old projects still
+# validate, but they build no strokes — validate.py adapts them
+# to motion elements (see _validate_diagrams). Only `primitives`
+# still maps to a stroke builder.
+ADAPTER_TEMPLATES = {"chart", "basket", "balance", "causes"}
+
 TEMPLATES = {
-    "chart": template_chart,
-    "basket": template_basket,
-    "balance": template_balance,
-    "causes": template_causes,
+    "chart": None,
+    "basket": None,
+    "balance": None,
+    "causes": None,
     "primitives": template_primitives,
 }
 
@@ -1034,7 +684,17 @@ def build_template(name, params):
 
     Raises ValueError naming the problem for unknown templates
     or bad parameters; validation in validate.py turns these
-    into structured errors with fix hints."""
+    into structured errors with fix hints. The four legacy
+    templates (chart, basket, balance, causes) are motion
+    adapters and raise here — they render as motion elements,
+    never as strokes (see ADAPTER_TEMPLATES).
+    """
+    if name in ADAPTER_TEMPLATES:
+        raise ValueError(
+            f"template '{name}' is a motion adapter in 1.45.0: it "
+            "renders as a motion element (line_chart / bars / "
+            "comparison_cards), not as strokes — the diagram "
+            "validator builds it")
     fn = TEMPLATES.get(name)
     if fn is None:
         raise ValueError(f"unknown diagram template '{name}'")

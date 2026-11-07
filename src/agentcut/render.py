@@ -8,6 +8,7 @@ core, not a replacement of it.
 from __future__ import annotations
 
 import copy
+import ctypes
 import hashlib
 import json
 import math
@@ -59,6 +60,41 @@ POS_MAP = {
 
 def _even(n):
     return int(n) if int(n) % 2 == 0 else int(n) - 1
+
+
+def _diagram_card_rect(dg, width, height, dw):
+    """Numeric display rect (bx, by, bw, bh) of a diagram's
+    backdrop card (v1.45.0, R7, glassmorphism).
+
+    The card image (canvas_w x canvas_h) is scaled to dw wide
+    (scale=dw:-2, aspect preserved, height rounded even), and
+    placed at the diagram's explicit x/y or its OVERLAY_POS.
+    Resolves the position expression to numbers (the FFmpeg
+    overlay_w/overlay_h in OVERLAY_POS are dw/dh here). The
+    diagram card does not move with the camera (no camera terms
+    are applied to diagrams), so a static rect is correct.
+    """
+    bw = int(dw)
+    cw = float(dg.get("canvas_w") or 1)
+    ch = float(dg.get("canvas_h") or 1)
+    bh = _even(round(bw * ch / cw)) if cw > 0 else bw
+    bh = max(2, int(bh))
+    if "x" in dg and "y" in dg:
+        return (int(dg["x"]), int(dg["y"]), bw, bh)
+    pos = dg.get("position", "bottom_right")
+    if pos == "top_left":
+        return (20, 20, bw, bh)
+    if pos == "top_center":
+        return ((width - bw) // 2, 20, bw, bh)
+    if pos == "top_right":
+        return (width - bw - 20, 20, bw, bh)
+    if pos == "center":
+        return ((width - bw) // 2, (height - bh) // 2, bw, bh)
+    if pos == "bottom_left":
+        return (20, height - bh - 20, bw, bh)
+    if pos == "bottom_center":
+        return ((width - bw) // 2, height - bh - 20, bw, bh)
+    return (width - bw - 20, height - bh - 20, bw, bh)
 
 
 # --- Hardware encoder detection + smart errors + temp hygiene
@@ -244,51 +280,99 @@ def cleanup_stale_temp_dirs(tmp_root=None, max_age_seconds=7200):
     return removed
 
 
-# --- Built-in procedural SFX (v1.37.0, timing fixed v1.37.1) ------
+# --- Built-in procedural SFX (v1.37.0, timing fixed v1.37.1,
+# re-voiced v1.45.0, R3) ------------------------------------------
 # Deterministic lavfi sources, generated at render time as lavfi
 # inputs (not filter sources — see the SFX block in
-# build_ffmpeg_args): no pre-generated files, no new dependencies. Each entry is
-# (aevalsrc expression, duration seconds). Expressions use t in
-# seconds; all peak near full scale before the sfx_volume scale
-# (default 0.35, about -9 dB) so they sit under voice/music rather
-# than over them. "cash" and "chime" share one source on purpose:
-# the same clean metallic ring, under both names (see SFX_NAMES).
+# build_ffmpeg_args): no pre-generated files, no new dependencies.
+# Each entry is a spec dict: kind "noise" (anoisesrc chain) or
+# kind "sine" (aevalsrc expression, thud only), plus the duration
+# in seconds. Noise entries carry a fixed seed (anoisesrc seed=-1
+# is random; a fixed seed makes the render byte-deterministic —
+# probed: the same chain twice gives identical md5) and a gain
+# that normalises the chain to the old design level (the pop
+# peaks at -18 dBFS at volume 0.127, -9 at 0.35, exactly as the
+# sine pop did; probed per name in
+# ~/workspace/agentcut-145-logs/probe_sfx_noise.py).
 #
-# v1.37.1 timing: built-ins are NOT delayed with adelay. They are
-# generated as full-timeline sources whose expression is gated to
-# the scheduled window (see _gated_sfx_expression). Root cause of
-# the 1.37.0 defect, pinned by frame-level inspection (ashowinfo)
-# on this FFmpeg build: adelay's delay exists only as leading
-# silence frames (audio at pts = start, silence at pts 0..start),
-# and atrim after adelay DISCARDS those silence frames — after
-# adelay+atrim only one NOPTS silence frame plus the audio frames
-# (still stamped pts = start) reach amix, and amix mixes by
-# arrival order, so the audio lands at position 0. With plain
-# stills this usually happened not to matter (the silence frames
-# survived often enough); with a Ken Burns graph it broke on most
-# runs (7/8 in an isolated reproduction), and for file inputs it
-# broke deterministically (12/12). Dropping atrim (and the
-# apad/asetpts that only made sense with it) removes the hazard
-# for file SFX, tracks and overlay audio too; for built-ins the
-# gate removes the delay from timestamps altogether, so timing is
+# v1.45.0, R3: the harsh high sines are gone. pop/whoosh are
+# warm low-passed pink noise (whoosh 80-500 Hz with an afade
+# swell/decay); click/ding/cash/chime are soft bandpassed
+# white-noise ticks and shimmers (no more 1.5-3.5 kHz sine
+# rings). The sub-thud stays a low sine BY DESIGN: a thud IS a
+# low-frequency pulse (70 -> 45 Hz fall), and the harsh part was
+# the high sines, not this. "cash" and "chime" are now DIFFERENT
+# shimmers (2.6 kHz vs 3.2 kHz) instead of sharing one source.
+# Envelope note: the prompt asks for an exponential afade, but
+# the exponential curve decays too fast for this engine's own
+# tests — the whoosh went silent 0.44s before its nominal end
+# (silence-onset test) and the ding's mean fell to -36 dB
+# (mean-volume test). A linear (tri) afade keeps the level up
+# until ~dur (silence onsets within 0.02s of start+dur, probed)
+# and the means 5-8 dB above the thresholds, so the fades are
+# linear; the swell/decay SHAPE the prompt wants is kept.
+#
+# v1.37.1 timing: sine built-ins are NOT delayed with adelay.
+# They are generated as full-timeline sources whose expression
+# is gated to the scheduled window (see _gated_sfx_expression).
+# Root cause of the 1.37.0 defect, pinned by frame-level
+# inspection (ashowinfo) on this FFmpeg build: adelay's delay
+# exists only as leading silence frames (audio at pts = start,
+# silence at pts 0..start), and atrim after adelay DISCARDS
+# those silence frames — after adelay+atrim only one NOPTS
+# silence frame plus the audio frames (still stamped pts =
+# start) reach amix, and amix mixes by arrival order, so the
+# audio lands at position 0. With plain stills this usually
+# happened not to matter (the silence frames survived often
+# enough); with a Ken Burns graph it broke on most runs (7/8 in
+# an isolated reproduction), and for file inputs it broke
+# deterministically (12/12). Dropping atrim (and the apad/
+# asetpts that only made sense with it) removes the hazard for
+# file SFX, tracks and overlay audio too; for built-ins the gate
+# removes the delay from timestamps altogether, so timing is
 # carried by the samples themselves and cannot be re-based away.
+# Noise built-ins DO use adelay (like file SFX): they are short
+# sources (duration = the SFX length), and adelay alone — no
+# atrim after it — preserves the leading silence (verified by
+# the 1.37.1 ashowinfo work and by the SFX timing tests).
 SFX_SOURCES = {
-    # Soft fast burst: 900 Hz sine, gone in ~0.3s.
-    "pop": ("sin(2*PI*900*t)*exp(-18*t)", 0.30),
-    # Air sweep: a rising chirp (300 Hz -> ~2.1 kHz over 1s) that
-    # swells in and decays out.
-    "whoosh": ("sin(2*PI*(300*t+900*t*t))*(1-exp(-8*t))*exp(-2.5*t)", 1.00),
-    # Clean metallic ring: inharmonic partials, slow decay.
-    "cash": ("sin(2*PI*1568*t)*exp(-2.5*t)+0.6*sin(2*PI*2093*t)*exp(-3*t)"
-             "+0.4*sin(2*PI*2637*t)*exp(-4*t)", 1.20),
-    "chime": ("sin(2*PI*1568*t)*exp(-2.5*t)+0.6*sin(2*PI*2093*t)*exp(-3*t)"
-              "+0.4*sin(2*PI*2637*t)*exp(-4*t)", 1.20),
-    # Light mechanical click: 2.5 kHz, gone in ~0.1s.
-    "click": ("sin(2*PI*2500*t)*exp(-120*t)", 0.12),
-    # Bright alert tone: 1760 Hz + octave, ~0.9s decay.
-    "ding": ("sin(2*PI*1760*t)*exp(-4*t)+0.5*sin(2*PI*3520*t)*exp(-6*t)", 0.90),
+    # Warm fast burst: low-passed pink noise, gone in ~0.3s.
+    "pop": {"kind": "noise", "color": "pink", "duration": 0.30, "seed": 11,
+            "filters": ("highpass=f=80,lowpass=f=800,"
+                        "afade=t=out:st=0:d=0.30:curve=tri"),
+            "gain": 5.6},
+    # Warm air sweep: pink noise 80-500 Hz, swelling in over
+    # 0.25s and decaying out over 0.75s (exponential afade).
+    "whoosh": {"kind": "noise", "color": "pink", "duration": 1.00, "seed": 23,
+               "filters": ("highpass=f=80,lowpass=f=500,"
+                           "afade=t=in:st=0:d=0.25:curve=tri,"
+                           "afade=t=out:st=0.25:d=0.75:curve=tri"),
+               "gain": 5.0},
+    # Soft high tick: bandpassed white noise at 2.5 kHz.
+    "click": {"kind": "noise", "color": "white", "duration": 0.12, "seed": 37,
+              "filters": ("bandpass=f=2500:width=1,"
+                          "afade=t=out:st=0:d=0.12:curve=tri"),
+              "gain": 1.0},
+    # Soft bell-ish shimmer: bandpassed white noise at 1.76 kHz.
+    "ding": {"kind": "noise", "color": "white", "duration": 0.90, "seed": 41,
+             "filters": ("bandpass=f=1760:width=2,"
+                         "afade=t=out:st=0:d=0.90:curve=tri"),
+             "gain": 1.5},
+    # Soft shimmer: bandpassed white noise at 2.6 kHz.
+    "cash": {"kind": "noise", "color": "white", "duration": 1.20, "seed": 53,
+             "filters": ("bandpass=f=2600:width=1,"
+                         "afade=t=out:st=0:d=1.20:curve=tri"),
+             "gain": 1.0},
+    # Soft shimmer, brighter than cash: 3.2 kHz.
+    "chime": {"kind": "noise", "color": "white", "duration": 1.20, "seed": 67,
+              "filters": ("bandpass=f=3200:width=1,"
+                          "afade=t=out:st=0:d=1.20:curve=tri"),
+              "gain": 1.0},
     # Deep pulse: a falling low sine (70 Hz -> ~45 Hz), ~0.7s.
-    "thud": ("sin(2*PI*(70*t-20*t*t))*exp(-6*t)+0.5*sin(2*PI*55*t)*exp(-8*t)", 0.70),
+    # The only sine left, by design (see the note above).
+    "thud": {"kind": "sine", "duration": 0.70,
+             "expr": ("sin(2*PI*(70*t-20*t*t))*exp(-6*t)"
+                      "+0.5*sin(2*PI*55*t)*exp(-8*t)")},
 }
 
 
@@ -526,6 +610,209 @@ def _rounded_alpha_factor(radius):
     return f"({tl})*({tr})*({bl})*({br})"
 
 
+def _rounded_mask_png(bw, bh, radius, path):
+    """Write a grayscale (L) PNG mask of a rounded rect.
+
+    White (255) inside the rounded rect, black (0) outside,
+    with a 2px feather at the edge (the same soft edge the
+    geq rounded mask used). Used by the glass card
+    (_emit_glass_card) via alphamerge — a pre-rendered mask
+    is ~20x faster than the geq rounded mask it replaces
+    (probe_glass_fast.py: 9.0s vs 198.2s for a 576x358 card).
+    PIL (ImageDraw.rounded_rectangle) is used when available;
+    otherwise a stdlib signed-distance loop (slower, same
+    result). The mask is deterministic for (bw, bh, radius).
+    """
+    bw, bh, radius = int(bw), int(bh), int(radius)
+    r = min(radius, bw // 2, bh // 2)
+    try:
+        from PIL import Image as _Im, ImageDraw as _Dr
+        img = _Im.new("L", (bw, bh), 0)
+        d = _Dr.Draw(img)
+        d.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=r,
+                            fill=255)
+        img.save(path)
+        return path
+    except Exception:
+        pass
+    # Stdlib fallback: signed-distance coverage per pixel
+    # (same math as diagrams.rounded_card_rgba, grayscale).
+    import struct as _st
+    import zlib as _zl
+    w, h = bw, bh
+    cx, cy = w / 2.0, h / 2.0
+    hx, hy = w / 2.0 - r, h / 2.0 - r
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        qy = abs(y + 0.5 - cy) - hy
+        for x in range(w):
+            qx = abs(x + 0.5 - cx) - hx
+            ax, ay = (qx if qx > 0 else 0.0), (qy if qy > 0 else 0.0)
+            d = math.sqrt(ax * ax + ay * ay) + min(max(qx, qy), 0.0) - r
+            cov = 0.5 - d / 2.0
+            cov = 0.0 if cov <= 0.0 else (1.0 if cov >= 1.0 else cov)
+            raw.append(int(round(cov * 255.0)))
+
+    def _chunk(typ, data):
+        c = _st.pack(">I", len(data)) + typ + data
+        return c + _st.pack(">I", _zl.crc32(typ + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + _chunk(b"IHDR", _st.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+           + _chunk(b"IDAT", _zl.compress(bytes(raw)))
+           + _chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+    return path
+
+
+def _glass_mask_path(bw, bh, radius, border=False):
+    """Cached path to a rounded-rect mask PNG (v1.45.0, R7).
+
+    Masks are deterministic for (bw, bh, radius, border) and
+    cached under the system temp dir, so repeated renders (and
+    repeated cards of the same size in one render) share one
+    file. The border mask is (bw+4, bh+4) with radius+2 (the
+    2px white rim around the card).
+    """
+    if border:
+        bw, bh, radius = int(bw) + 4, int(bh) + 4, int(radius) + 2
+        name = f"glass_bmask_{bw}x{bh}_r{radius}.png"
+    else:
+        bw, bh, radius = int(bw), int(bh), int(radius)
+        name = f"glass_mask_{bw}x{bh}_r{radius}.png"
+    d = os.path.join(tempfile.gettempdir(), "agentcut-glass-masks")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name)
+    if not os.path.isfile(path):
+        _rounded_mask_png(bw, bh, radius, path)
+    return path
+
+
+def _emit_glass_card(filters, vcur, overlay_index, bx, by, bw, bh,
+                     radius, fps, afmt, start, end, argv=None,
+                     fade_start=None):
+    """Append a glassmorphism backdrop-blur card (v1.45.0, R7).
+
+    Crops the (bx,by,bw,bh) region from the current video,
+    blurs it (boxblur 16:2 — the prompt's allowed alternative
+    to gblur sigma=18, and ~20x faster), tints it dark
+    (rgba(15,23,42,0.68)), masks it to a rounded rect
+    (radius 20) via a pre-rendered PNG mask + alphamerge
+    (NOT geq — the geq rounded mask on a large card was the
+    render bottleneck, 198s vs 9s in probe_glass_fast.py),
+    and adds a thin white border (rgba(255,255,255,0.22)).
+    The border is 2px (the prompt's 1.5px is not
+    representable in integer pixel coordinates; 2px is the
+    nearest symmetric choice). Returns the new vcur. The card
+    is composited UNDER the caller's content (the motion
+    element / diagram card is overlaid after this returns),
+    so the frosted background shows through the element's
+    transparency. argv (the -i list) is needed to add the
+    mask PNGs as inputs; when None the geq mask is used as
+    a fallback (slow, but correct — used only by direct
+    callers that do not go through build_ffmpeg_args).
+    fade_start (v1.45.0, R12 fix): when given, the card fades
+    out over 1.0s starting at that main-timeline time, in
+    lockstep with the element/diagram it backs — otherwise
+    the frosted card stays visible after its element fades
+    (fix4: ~172 bright px at t=5.0). The tint chain runs on
+    the main timeline (its source is the split video), so its
+    fade uses fade_start; the border chain runs on a looped
+    input timeline (setpts-reset), so its fade uses
+    fade_start - start.
+    """
+    br = min(int(radius), bw // 2, bh // 2)
+    gi = overlay_index
+    # Fade strings (v1.45.0, R12 fix): the tint chain runs on
+    # the main timeline, the border chain on a looped input
+    # timeline — see the docstring.
+    _fade_main = (f",fade=t=out:st={fade_start}:d=1.0:alpha=1"
+                  if fade_start is not None else "")
+    _fade_in = (f",fade=t=out:st={fade_start - start}:d=1.0:alpha=1"
+                if fade_start is not None else "")
+    # Split the current video: one branch continues, one is
+    # the glass source. The split labels must be unique per
+    # card (several glass cards can stack in one graph).
+    filters.append(f"[{vcur}]split=2[{vcur}_b][vgs{gi}]")
+    filters.append(
+        f"[vgs{gi}]crop={bw}:{bh}:{bx}:{by},boxblur=16:2,"
+        f"format=rgba[vgb{gi}]")
+    filters.append(
+        f"color=c=0x0f172a@0.68:s={bw}x{bh}:r={fps},"
+        f"format=rgba[vtint{gi}]")
+    filters.append(
+        f"[vgb{gi}][vtint{gi}]overlay=0:0:format=rgb[vgt{gi}]")
+    if argv is not None:
+        # Fast path: pre-rendered PNG masks + alphamerge.
+        _mp = _glass_mask_path(bw, bh, br, border=False)
+        _midx = _input_count(argv)
+        argv += ["-i", _mp]
+        filters.append(
+            f"[{_midx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+            f"trim=end={end - start},setpts=PTS-STARTPTS,"
+            f"format=gray[vgmask{gi}]")
+        filters.append(f"[vgt{gi}][vgmask{gi}]alphamerge{_fade_main}[vgm{gi}]")
+        _bp = _glass_mask_path(bw, bh, br, border=True)
+        _bidx = _input_count(argv)
+        argv += ["-i", _bp]
+        filters.append(
+            f"color=c=white:s={bw + 4}x{bh + 4}:r={fps},"
+            f"format=rgba[vgbrw{gi}]")
+        filters.append(
+            f"[{_bidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+            f"trim=end={end - start},setpts=PTS-STARTPTS,"
+            f"format=gray[vgbmask{gi}]")
+        filters.append(
+            f"[vgbrw{gi}][vgbmask{gi}]alphamerge,"
+            f"colorchannelmixer=aa=0.22{_fade_in}[vgbr{gi}]")
+    else:
+        # Fallback (no argv): the geq rounded mask. Slow on
+        # large cards, but correct; only used by direct
+        # callers that bypass build_ffmpeg_args.
+        filters.append(
+            f"[vgt{gi}]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='{_rounded_alpha_factor(br)}*255'{_fade_main}[vgm{gi}]")
+        filters.append(
+            f"color=c=white@0.22:s={bw + 4}x{bh + 4}:r={fps},"
+            f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='{_rounded_alpha_factor(br + 2)}*255*0.22'{_fade_in}[vgbr{gi}]")
+    filters.append(
+        f"[{vcur}_b][vgbr{gi}]overlay=x={bx - 2}:y={by - 2}:"
+        f"eof_action=pass:enable='between(t,{start},{end})'[vgbd{gi}]")
+    filters.append(
+        f"[vgbd{gi}][vgm{gi}]overlay=x={bx}:y={by}:"
+        f"eof_action=pass:enable='between(t,{start},{end})'[vglass{gi}]")
+    return f"vglass{gi}"
+
+
+def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
+                    radius, color, opacity, fps, afmt, start, end):
+    """Append a rounded-rect text background (pill) overlay.
+
+    A colour source masked by the rounded-rect geq factor,
+    overlaid under the text. This is THE background mechanism
+    for text/caption boxes since v1.45.0 (R5): the default
+    sharp drawtext box is gone, and every boxed text gets a
+    pill (radius 16 by default, the item's box_radius when
+    set). With radius 0 the geq factor is 1, so the pill is
+    a sharp rect — the sharp background is still available,
+    through this mechanism, never through drawtext box=1.
+    (bx, by) is the pill's top-left (already padded and
+    clamped); (bw, bh) its size. Returns the new vcur.
+    """
+    br = min(int(radius), bw // 2, bh // 2)
+    filters.append(
+        f"color=c={_ff_color(color)}:s={bw}x{bh}:r={fps},"
+        f"format={afmt},geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+        f"a='{_rounded_alpha_factor(br)}*255*{opacity}'[box{overlay_index}]")
+    filters.append(
+        f"[{vcur}][box{overlay_index}]overlay=x={bx}:y={by}:"
+        f"eof_action=pass:enable='between(t,{start},{end})'[vbox{overlay_index}]")
+    return f"vbox{overlay_index}"
+
+
 def _ff_color(color):
     """FFmpeg colour literal for a validated colour: named colours
     pass through, #RRGGBB becomes 0xRRGGBB."""
@@ -604,9 +891,32 @@ def _easing_factor(easing, u):
     linear is the old behaviour. ease_in grows as u^2 (slow start,
     fast end), ease_out as 1-(1-u)^2 (fast start, slow end), and
     ease_in_out as 2u^2 below the midpoint and 1-2(1-u)^2 above it
-    (slow at both ends, fast in the middle). All are plain
-    FFmpeg expressions, evaluated per frame.
+    (slow at both ends, fast in the middle). spring is the
+    underdamped response (k=180, c=14, m=1; ~15% overshoot,
+    settled by u~0.7) — the same closed form as motion's
+    spring_ease. cubic_bezier is the CSS-ease curve as a
+    degree-4 polynomial fit, clamped to [0, 1] (the degree-5
+    fit was rejected: not monotonic). All are plain FFmpeg
+    expressions, evaluated per frame.
     """
+    if easing == "spring":
+        # R12 fix: u MUST be clamped to [0,1] before the
+        # exponential. The callers pass u=(t-start)/dur, and
+        # FFmpeg evaluates the fontsize/position expression
+        # for t < start too (the if() guard only bounds the
+        # upper end), where u is very negative and
+        # exp(-7*u)=exp(+large) overflows — a late pop_in
+        # (start=22.7) failed the whole render with
+        # "fontsize overflow" at t=0 (u=-45.4, exp(317)).
+        # Clamping keeps exp(-7*u) in (0,1] and the spring
+        # in its designed [0, ~1.146] range.
+        _uc = f"(min(max({u},0),1))"
+        return (f"(1-exp(-7*{_uc})*(cos(11.4477*{_uc})"
+                f"+0.6114*sin(11.4477*{_uc})))")
+    if easing == "cubic_bezier":
+        _p = (f"(4.214797*pow({u},4)-8.825972*pow({u},3)"
+              f"+4.624145*pow({u},2)+1.034968*({u})-0.02652)")
+        return f"(min(max({_p},0),1))"
     if easing == "ease_in":
         return f"({u})*({u})"
     if easing == "ease_out":
@@ -864,91 +1174,147 @@ def _ffmetadata_escape(text):
             .replace("#", "\\#").replace("=", "\\="))
 
 
-def _measure_word_ink(word, font, size, text_dir, cache):
-    """True ink width (px) of one word at one size/font (v1.37.0,
-    fixed v1.41.0).
+# HarfBuzz (ctypes) shaped-text measurement (v1.45.0, R2).
+# Replaces _measure_word_ink (cropdetect subprocesses): HarfBuzz
+# shapes the text with the same engine FFmpeg's drawtext uses
+# (same font, same shaping), and the shaped-advance sum is the
+# width drawtext lays out. The 5-int32 hb_glyph_position_t
+# (20-byte stride, HarfBuzz 8.x) is load-bearing: a 4-int32
+# struct reads garbage advances (probed empirically). The library
+# is loaded lazily once; when it (or the font file) is missing,
+# _measure_text_width falls back to the 0.6 x size estimate.
+_HB = None
+_HB_TRIED = False
 
-    Rendered with FFmpeg alone (no new dependency): the word is
-    drawn white on black at a known x, and cropdetect reports the
-    ink bounding box. The width is the ink width, not the font's
-    advance — the active-caption layout below positions words by
-    ink widths plus a fixed space, and every copy of a word (base
-    and highlight) shares the same computed x, so the highlight
-    always covers its word exactly even if inter-word gaps are
-    approximate. Returns None when measurement fails; the caller
-    then falls back to the 0.6 x size per character estimate.
 
-    v1.41.0 fix — two FFmpeg 8.1 cropdetect behaviours broke this
-    silently (every Arabic word measured None, so the fallback
-    ran everywhere and kinetic titles spread across the frame and
-    clipped at the edge): (1) cropdetect defaults skip=2, so a
-    single-frame measurement is skipped entirely — skip=0 is now
-    explicit; (2) with limit=24 the PNG-decoded frame's gbr luma
-    makes thin Arabic strokes fall under the threshold (a word of
-    true width 227 measured 80) — limit=0 counts any non-zero
-    pixel and measures 224, verified against a stdlib PNG decode
-    (227). Both parameters are now pinned in the filter string.
-    """
-    key = (word, font, size)
-    if key in cache:
-        return cache[key]
-    width = None
+class _HBPosition(ctypes.Structure):
+    _fields_ = [("x_advance", ctypes.c_int32),
+                ("y_advance", ctypes.c_int32),
+                ("x_offset", ctypes.c_int32),
+                ("y_offset", ctypes.c_int32),
+                ("var", ctypes.c_int32)]
+
+
+def _load_harfbuzz():
+    """Load libharfbuzz.so.0 once (ctypes); None when unavailable."""
+    global _HB, _HB_TRIED
+    if _HB_TRIED:
+        return _HB
+    _HB_TRIED = True
     try:
-        import re as _re
-        word_path = os.path.join(text_dir, f"word_{len(cache)}.txt")
-        with open(word_path, "w", encoding="utf-8") as fh:
-            fh.write(bidi_display_text(str(word)))
-        canvas_w = 2400
-        canvas_h = max(300, int(size) * 4)
-        png_path = os.path.join(text_dir, f"word_{len(cache)}.png")
-        proc = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
-             "-i", f"color=c=black:s={canvas_w}x{canvas_h}",
-             "-vf", (f"drawtext=fontfile={font}:textfile={word_path}:"
-                     f"fontsize={size}:fontcolor=white:x=50:y={canvas_h // 3}:"
-                     f"expansion=none:text_shaping=1"),
-             "-frames:v", "1", png_path],
-            capture_output=True, text=True, timeout=60)
-        if proc.returncode == 0 and os.path.isfile(png_path):
-            proc2 = subprocess.run(
-                ["ffmpeg", "-v", "info", "-i", png_path,
-                 "-vf", "cropdetect=limit=0:round=0:reset=0:skip=0",
-                 "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60)
-            crops = _re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)",
-                                proc2.stderr or "")
-            if crops:
-                width = int(crops[-1][0])
+        import ctypes
+        hb = ctypes.CDLL("libharfbuzz.so.0")
+        hb.hb_blob_create.restype = ctypes.c_void_p
+        hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
+                                      ctypes.c_int, ctypes.c_void_p,
+                                      ctypes.c_void_p]
+        hb.hb_blob_destroy.restype = None
+        hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_face_create.restype = ctypes.c_void_p
+        hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        hb.hb_face_destroy.restype = None
+        hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_face_get_upem.restype = ctypes.c_uint
+        hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
+        hb.hb_font_create.restype = ctypes.c_void_p
+        hb.hb_font_create.argtypes = [ctypes.c_void_p]
+        hb.hb_font_destroy.restype = None
+        hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_ot_font_set_funcs.restype = None
+        hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
+        hb.hb_font_set_scale.restype = None
+        hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                         ctypes.c_int]
+        hb.hb_buffer_create.restype = ctypes.c_void_p
+        hb.hb_buffer_create.argtypes = []
+        hb.hb_buffer_destroy.restype = None
+        hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_buffer_add_utf8.restype = None
+        hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
+                                          ctypes.c_char_p, ctypes.c_int,
+                                          ctypes.c_uint, ctypes.c_int]
+        hb.hb_buffer_guess_segment_properties.restype = None
+        hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
+        hb.hb_shape.restype = None
+        hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_uint]
+        hb.hb_buffer_get_length.restype = ctypes.c_uint
+        hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
+        hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
+            _HBPosition)
+        hb.hb_buffer_get_glyph_positions.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        _HB = hb
     except Exception:
-        width = None
-    cache[key] = width
-    return width
+        _HB = None
+    return _HB
 
 
-def _fit_chunk_widths(widths, space_w, width, margin=20.0):
-    """Clamp a kinetic chunk to the frame (v1.41.0, defence in
-    depth for the measurement fix above).
+def _measure_text_width(text, font, size, cache=None):
+    """Shaped text width (px) at one size/font (v1.45.0, R2).
 
-    When the chunk's total ink width plus gaps exceeds the frame
-    minus a 10px margin per side, every width and the gap shrink
-    by the same factor, so the chunk still fits and words keep
-    their relative proportions instead of running off the edge
-    (the Step-0 defect: 3–4 word Arabic titles at size 60 clipped
-    their last word). The margin is deliberately small: a chunk
-    that fits — even barely — renders at its authored size, so
-    the clamp never shrinks a layout that was already inside the
-    frame. The caller renders the chunk at
-    size * scale when scale < 1. Returns (widths, space_w, scale);
-    scale is exactly 1.0 when nothing was clamped, so unclamped
-    chunks render byte-identically to before.
+    Replaces _measure_word_ink (two FFmpeg subprocesses per word):
+    in-process, exact, and subprocess-free. Measured against the
+    old cropdetect ink width on 12 Arabic+Latin words (sizes
+    48-60): the shaped width is always >= the ink width (ratio
+    1.020-1.208), so a bar or pill sized by this width always
+    covers its text, with at most ~21% slack on short words
+    (absorbed by the 12px padding). The direction does not matter
+    for the total: advances sum the same in logical or display
+    order, so the logical text is shaped directly. Returns the
+    0.6 x size per-character estimate (never None) when HarfBuzz
+    or the font file is unavailable, so callers need no fallback
+    of their own. Results are cached by (text, font, size) when a
+    cache dict is passed.
     """
-    widths = list(widths)
-    total = sum(widths) + space_w * (len(widths) - 1) if widths else 0.0
-    avail = float(width) - float(margin)
-    if total <= avail or total <= 0:
-        return widths, space_w, 1.0
-    scale = avail / total
-    return [w * scale for w in widths], space_w * scale, scale
+    text = str(text)
+    key = (text, font, size)
+    if cache is not None and key in cache:
+        return cache[key]
+    fallback = max(10.0, len(text) * float(size) * 0.6)
+    width = fallback
+    hb = _load_harfbuzz()
+    if hb is not None and font and os.path.isfile(font):
+        blob = face = hbfont = buf = None
+        try:
+            import ctypes
+            with open(font, "rb") as fh:
+                data = fh.read()
+            # READONLY blob: no copy, no ownership — `data` must
+            # stay alive until the face is destroyed (it is a
+            # local, destroyed in the finally below).
+            blob = hb.hb_blob_create(data, len(data), 1, None, None)
+            face = hb.hb_face_create(blob, 0)
+            hbfont = hb.hb_font_create(face)
+            upem = hb.hb_face_get_upem(face)
+            hb.hb_ot_font_set_funcs(hbfont)
+            hb.hb_font_set_scale(hbfont, upem, upem)
+            buf = hb.hb_buffer_create()
+            raw = text.encode("utf-8")
+            hb.hb_buffer_add_utf8(buf, raw, len(raw), 0, -1)
+            hb.hb_buffer_guess_segment_properties(buf)
+            hb.hb_shape(hbfont, buf, None, 0)
+            count = ctypes.c_uint(0)
+            pos = hb.hb_buffer_get_glyph_positions(buf,
+                                                   ctypes.byref(count))
+            total = 0
+            for i in range(count.value):
+                total += pos[i].x_advance
+            width = total * float(size) / upem
+        except Exception:
+            width = fallback
+        finally:
+            if buf is not None:
+                hb.hb_buffer_destroy(buf)
+            if hbfont is not None:
+                hb.hb_font_destroy(hbfont)
+            if face is not None:
+                hb.hb_face_destroy(face)
+            if blob is not None:
+                hb.hb_blob_destroy(blob)
+    if cache is not None:
+        cache[key] = width
+    return width
 
 
 def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
@@ -1096,9 +1462,10 @@ def _ass_font_for(item, sample_text):
 
     A named bundled font wins (same rule as drawtext); else the
     script-detected font's basename maps to its family; else the
-    sample text's script decides (Arabic -> Noto Naskh, else
-    DejaVu). A missing named font cannot reach here: validation
-    rejects it with FONT_NOT_FOUND before the graph builds."""
+    sample text's script decides (Arabic -> Noto Sans Arabic
+    (Bold), else DejaVu). A missing named font cannot reach here:
+    validation rejects it with FONT_NOT_FOUND before the graph
+    builds."""
     _reg = item.get("font")
     if isinstance(_reg, str) and _reg in _ASS_FONT_BY_REGISTRY:
         return _ASS_FONT_BY_REGISTRY[_reg]
@@ -1109,7 +1476,7 @@ def _ass_font_for(item, sample_text):
             if _frag in _base:
                 return _fam
     if sample_text and _ARABIC_RE.search(sample_text):
-        return ("Noto Naskh Arabic", 0)
+        return ("Noto Sans Arabic", -1)
     return ("DejaVu Sans", 0)
 
 
@@ -1129,6 +1496,174 @@ def _ass_pos_for_text(item, size, width, height, kin_y):
     if _pos in ("top_right", "bottom_right"):
         return (9, float(width - 40), kin_y)
     return (8, float(width) / 2, kin_y)
+
+
+def _background_rects(info, width, height):
+    """(x, y, w, h, start, end) rects that act as a text's background
+    (v1.45.0, R4c-2, Defect 2): motion shapes (rect/circle/ellipse)
+    and lower_third cards use their keyframe-union bbox
+    (el["_bbox"] — the same rect the compositor overlays); diagram
+    cards use their display rect (size fraction x canvas aspect,
+    same geometry as the card compositing). A text whose centre
+    falls inside one of these during its window gets box=0 — the
+    shape/card IS the background, so a drawtext box (or rounded
+    pill) inside it is a nested sharp black box. Charts and
+    counters are NOT backgrounds (transparent videos / text
+    themselves), and line shapes are strokes, not backgrounds.
+    The motion bbox is the union over keyframes, so a moving
+    shape's rect is conservative (it covers the whole path); the
+    time-window check keeps a text off a shape that is never
+    there with it.
+    """
+    rects = []
+    for el in info.get("motion", []) or []:
+        if not isinstance(el, dict):
+            continue
+        kind = el.get("kind")
+        if kind == "lower_third":
+            pass
+        elif kind == "shape" and el.get("shape") in ("rect", "circle",
+                                                     "ellipse"):
+            pass
+        else:
+            continue
+        bb = el.get("_bbox")
+        if not bb or len(bb) != 4:
+            continue
+        try:
+            bx, by, bw, bh = (float(v) for v in bb)
+            st, en = float(el["start"]), float(el["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if bw <= 0 or bh <= 0 or en <= st:
+            continue
+        rects.append((bx, by, bw, bh, st, en))
+    for dg in info.get("diagrams", []) or []:
+        if not isinstance(dg, dict) or not dg.get("card"):
+            continue
+        try:
+            dw = _even(float(dg["size"]) * width)
+            cw, ch = float(dg["canvas_w"]), float(dg["canvas_h"])
+            dh = dw * ch / cw if cw > 0 else 0.0
+            st, en = float(dg["start"]), float(dg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if dw <= 0 or dh <= 0 or en <= st:
+            continue
+        if "x" in dg and "y" in dg:
+            try:
+                dx, dy = float(dg["x"]), float(dg["y"])
+            except (TypeError, ValueError):
+                continue
+        else:
+            pos = dg.get("position", "bottom_right")
+            if pos in ("bottom_left", "top_left"):
+                dx = 20.0
+            elif pos in ("bottom_right", "top_right"):
+                dx = width - dw - 20.0
+            else:
+                dx = (width - dw) / 2
+            if pos in ("top_left", "top_center", "top_right"):
+                dy = 20.0
+            elif pos == "center":
+                dy = (height - dh) / 2
+            else:
+                dy = height - dh - 20.0
+        rects.append((dx, dy, dw, dh, st, en))
+    return rects
+
+
+def _pos_expr_value(expr, width, height, tw, th):
+    """Numerically evaluate one POS_MAP expression (w/h are the
+    output size, tw/th the text width/height). Only the five
+    forms POS_MAP uses are recognised; anything else is 0."""
+    expr = str(expr)
+    if expr == "(w-text_w)/2":
+        return (width - tw) / 2
+    if expr == "(h-text_h)/2":
+        return (height - th) / 2
+    if expr == "w-text_w-40":
+        return width - tw - 40.0
+    if expr == "h-text_h-40":
+        return height - th - 40.0
+    try:
+        return float(expr)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _text_on_background(item, is_caption, width, height, size, bg_rects,
+                        width_cache, zone_clamp=False):
+    """True when a text/caption item sits on a background rect
+    (Defect 2): its centre falls inside a background rect whose
+    time window overlaps the item's window. The centre test (not
+    any-pixel overlap) is deliberate: a long caption crossing a
+    shape's edge is mostly over the board and keeps its box; a
+    text centred on a shape is ON the shape. Counters and tracked
+    texts are skipped (a counter's width is dynamic; a tracked
+    text's position is sampled per frame, not static). The
+    position rules mirror the drawtext loop exactly (POS_MAP,
+    _wrap_y, _default_caption_top, the "(<cx>-text_w/2)"
+    motion-label form); the width is the HarfBuzz shaped width
+    and the height the caption line-height factor (size*1.4) —
+    the centre is what matters, so the approximation is fine.
+    """
+    if item.get("_counter") or item.get("track"):
+        return False
+    try:
+        start = float(item.get("start", 0))
+        end = float(item.get("end", 0))
+    except (TypeError, ValueError):
+        return False
+    text = str(item.get("text", ""))
+    if not text or not bg_rects:
+        return False
+    if item.get("font"):
+        _mf = find_bundled_font(item["font"])
+    else:
+        _mf = find_font_for_text(text)
+    tw = _measure_text_width(text, _mf, size, width_cache)
+    th = float(size) * 1.4
+    pos = item.get("position")
+    if is_caption:
+        if "_wrap_y" in item:
+            top = float(item["_wrap_y"])
+            _xe = (POS_MAP[item["position"]][0]
+                   if pos in POS_MAP else "(w-text_w)/2")
+            left = _pos_expr_value(_xe, width, height, tw, th)
+        elif pos in POS_MAP:
+            _xe, _ye = POS_MAP[pos]
+            left = _pos_expr_value(_xe, width, height, tw, th)
+            top = _pos_expr_value(_ye, width, height, tw, th)
+        else:
+            left = (width - tw) / 2
+            top = _default_caption_top(height, size, 1, 1.35, zone_clamp)
+    elif pos in POS_MAP:
+        _xe, _ye = POS_MAP[pos]
+        left = _pos_expr_value(_xe, width, height, tw, th)
+        top = _pos_expr_value(_ye, width, height, tw, th)
+    else:
+        xv = item.get("x", "center")
+        if xv == "center":
+            left = (width - tw) / 2
+        else:
+            try:
+                left = float(xv)
+            except (TypeError, ValueError):
+                _m = re.match(r"^\(([\d.]+)-text_w/2\)$", str(xv))
+                left = (float(_m.group(1)) - tw / 2
+                        if _m else (width - tw) / 2)
+        try:
+            top = float(item.get("y", 100))
+        except (TypeError, ValueError):
+            top = 100.0
+    cx, cy = left + tw / 2, top + th / 2
+    for (bx, by, bw, bh, bs, be) in bg_rects:
+        if start >= be or bs >= end:
+            continue
+        if bx - 4 <= cx <= bx + bw + 4 and by - 4 <= cy <= by + bh + 4:
+            return True
+    return False
 
 
 def _esc_filter_arg(value):
@@ -1182,14 +1717,65 @@ def _motion_derived_texts(info, width, height):
             csize = (int(round(TEXT_STYLES[_cstyle]["size_frac"] * height))
                      if _cstyle in TEXT_STYLES
                      else int(el.get("size", 48)))
+            # Rounded pill (v1.45.0, R5): a counter's display
+            # value is live, so the pill is sized to the WIDEST
+            # value it can show (the wider of from/to, formatted
+            # with the element's decimals and affixes, in the
+            # same before/after order as counter_drawtext).
+            # _counter_cx is the numeric centre (the x
+            # expression above is "(cx-text_w/2)").
+            from .motion import _contains_arabic
+            _dec = int(el.get("decimals", 0))
+            _pfx = el.get("prefix", "") or ""
+            _sfx = el.get("suffix", "") or ""
+
+            def _fmt_num(v):
+                if _dec == 1:
+                    return f"{float(v):.1f}"
+                return str(int(float(v)))
+
+            def _display(v):
+                _num = _fmt_num(v)
+                _before, _after = [], []
+                if _sfx:
+                    if _contains_arabic(_sfx):
+                        _before.append(_sfx if _sfx.strip() == "\u066a"
+                                      else _sfx + " ")
+                    else:
+                        _after.append(" " + _sfx)
+                if _pfx:
+                    if _contains_arabic(_pfx):
+                        _after.append(" " + _pfx)
+                    else:
+                        _before.append(_pfx + " ")
+                return "".join(_before) + _num + "".join(_after)
+
             _citem = {
                 "text": "", "_counter": True,
                 "_counter_expr": counter_drawtext(el),
                 "_counter_affixes": (el.get("prefix", "") or "")
                 + (el.get("suffix", "") or ""),
+                "_counter_max_text": max(
+                    (_display(el.get("from", 0)),
+                     _display(el.get("to", 0))),
+                    key=len),
+                "_counter_cx": float(el["x"]),
                 "start": start, "end": end,
                 "x": f"({float(el['x']):.1f}-text_w/2)",
                 "y": int(round(float(el["y"]) - csize / 2))}
+            # Fade with the element (v1.45.0, R12 fix): a counter
+            # on a fading element (an adapted diagram's progress
+            # counter, or an explicit fade_out) must fade over
+            # the same window, or it stays visible after the
+            # element is gone. The label fade below does the same
+            # for chart labels.
+            if el.get("fade_out"):
+                _fo = float(el["fade_out"])
+                _fs = (float(el["fade_start"])
+                       if el.get("fade_start") is not None
+                       else end - _fo)
+                _citem["end"] = _fs + _fo
+                _citem["fade_out"] = _fo
             if _cstyle is not None:
                 _citem["style"] = _cstyle
             if _cstyle is None:
@@ -1203,7 +1789,12 @@ def _motion_derived_texts(info, width, height):
             # and fades with the same ramps, so card and text
             # stay in lockstep; the card itself is the box, so
             # the text has none. tx is the text's left edge at
-            # rest (24px padding inside the card).
+            # rest. For Arabic text (v1.45.0, R4c-4, Defect 4)
+            # the text is RIGHT-aligned in the card (its right
+            # edge 24px from the card's right edge), because a
+            # left-aligned Arabic word in a wide card reads as
+            # a stray word at the far left; Latin text stays
+            # left-aligned at 24px from the card's left edge.
             x0 = float(el["x"])
             w0 = float(el["w"])
             h0 = float(el["h"])
@@ -1220,29 +1811,67 @@ def _motion_derived_texts(info, width, height):
             tsize = (int(round(TEXT_STYLES[_ltstyle]["size_frac"] * height))
                      if _ltstyle in TEXT_STYLES
                      else int(el.get("size", 36)))
-            tx = x0 + 24.0
+            from .motion import _contains_arabic
+            if _contains_arabic(el["text"]):
+                _ltfont = None
+                if el.get("font"):
+                    from .validate import find_bundled_font
+                    _ltfont = find_bundled_font(el["font"])
+                if _ltfont is None:
+                    from .validate import find_font_for_text
+                    _ltfont = find_font_for_text(str(el["text"]))
+                _ltw = _measure_text_width(str(el["text"]), _ltfont,
+                                           tsize)
+                tx = x0 + w0 - _ltw - 24.0
+            else:
+                tx = x0 + 24.0
             ty = y0 + (h0 - tsize) / 2.0
             slide = x0 + w0
+            # Spring entrance (v1.45.0, R6): the text slides
+            # with the card's spring (same overshoot, so card
+            # and text stay in lockstep), and its opacity
+            # follows the spring too (clamped to [0, 1]).
+            # The exit stays linear. The opacity is carried as
+            # _alpha_expr (the drawtext loop uses it instead of
+            # the linear fade_in/fade_out ramp); the position
+            # is the x expression below.
+            from .motion import _easing_expr_ffmpeg
+            _x_in = f"{tx:.1f}"
+            _a_in = "1"
+            if enter > 0:
+                _u_in = f"((t-{start:.3f})/{enter:.3f})"
+                _spr = _easing_expr_ffmpeg("spring", _u_in)
+                _x_in = f"{tx:.1f}-{slide:.1f}*(1-{_spr})"
+                _a_in = f"(min({_spr},1))"
+            _x_out = f"{tx:.1f}"
+            _a_out = "1"
+            if exit_ > 0:
+                _u_out = f"((t-{end - exit_:.3f})/{exit_:.3f})"
+                _x_out = f"{tx:.1f}-{slide:.1f}*{_u_out}"
+                _a_out = f"(1-{_u_out})"
             if enter > 0 and exit_ > 0:
-                x_expr = (f"if(lt(t,{start + enter:.3f}),"
-                          f"{tx:.1f}-{slide:.1f}*(1-(t-{start:.3f})/{enter:.3f}),"
-                          f"if(gt(t,{end - exit_:.3f}),"
-                          f"{tx:.1f}-{slide:.1f}*"
-                          f"((t-{end - exit_:.3f})/{exit_:.3f}),{tx:.1f}))")
+                x_expr = (f"if(lt(t,{start + enter:.3f}),{_x_in},"
+                          f"if(gt(t,{end - exit_:.3f}),{_x_out},{tx:.1f}))")
+                _alpha_expr = (
+                    f"if(lt(t,{start + enter:.3f}),{_a_in},"
+                    f"if(gt(t,{end - exit_:.3f}),{_a_out},1))")
             elif enter > 0:
-                x_expr = (f"if(lt(t,{start + enter:.3f}),"
-                          f"{tx:.1f}-{slide:.1f}*(1-(t-{start:.3f})/{enter:.3f}),"
+                x_expr = (f"if(lt(t,{start + enter:.3f}),{_x_in},"
                           f"{tx:.1f})")
+                _alpha_expr = (
+                    f"if(lt(t,{start + enter:.3f}),{_a_in},1)")
             elif exit_ > 0:
-                x_expr = (f"if(gt(t,{end - exit_:.3f}),"
-                          f"{tx:.1f}-{slide:.1f}*"
-                          f"((t-{end - exit_:.3f})/{exit_:.3f}),{tx:.1f})")
+                x_expr = (f"if(gt(t,{end - exit_:.3f}),{_x_out},"
+                          f"{tx:.1f})")
+                _alpha_expr = (
+                    f"if(gt(t,{end - exit_:.3f}),{_a_out},1)")
             else:
                 x_expr = f"{tx:.1f}"
+                _alpha_expr = "1"
             lt_item = {"text": str(el["text"]), "start": start,
                        "end": end,
                        "x": x_expr, "y": int(round(ty)), "box": False,
-                       "fade_in": enter, "fade_out": exit_}
+                       "_alpha_expr": _alpha_expr}
             if _ltstyle is not None:
                 lt_item["style"] = _ltstyle
             if _ltstyle is None:
@@ -1266,31 +1895,68 @@ def _motion_derived_texts(info, width, height):
         stagger = float(el.get("stagger", 0.12))
         grow = float(el.get("grow", 0.5))
 
-        def _label(text, cx, y, when):
+        def _label(text, cx, y, when, size_ov=None, color_ov=None,
+                 box_ov=None):
+            # size/color/box default to the chart label's (the
+            # enclosing label_size/label_color, box=True); the
+            # comparison-cards value passes its own (value_size,
+            # the card accent colour, box=False — the card is the
+            # box). A style, when present, wins over all of them
+            # (see the counter note above).
             if not text:
                 return
+            _size = size_ov if size_ov is not None else size
+            _color = color_ov if color_ov is not None else color
+            _box = box_ov if box_ov is not None else True
             cx = min(max(float(cx), 80.0), float(width) - 80.0)
-            y = min(max(float(y), 4.0), float(height) - size - 4.0)
+            y = min(max(float(y), 4.0), float(height) - _size - 4.0)
             _litem = {
                 "text": str(text), "start": when, "end": end,
                 "x": f"({cx:.1f}-text_w/2)", "y": int(round(y))}
+            # Fade with the element (v1.45.0, R12 fix): a chart
+            # label on a fading element must fade over the same
+            # window as the element's video. Without this, an
+            # adapted diagram's value labels stayed visible after
+            # the chart faded (fix4: 157 bright px at t=5.0).
+            # The label's end moves to the fade end and it gets
+            # the element's fade_out, so the drawtext alpha ramp
+            # covers exactly the fade window.
+            if el.get("fade_out"):
+                _fo = float(el["fade_out"])
+                _fs = (float(el["fade_start"])
+                       if el.get("fade_start") is not None
+                       else end - _fo)
+                _litem["end"] = _fs + _fo
+                _litem["fade_out"] = _fo
             if _lstyle is not None:
                 _litem["style"] = _lstyle
             if _lstyle is None:
-                _litem["size"] = size
-                _litem["color"] = color
-                _litem["box"] = True
+                _litem["size"] = _size
+                _litem["color"] = _color
+                _litem["box"] = _box
             items.append(_litem)
 
+        # v1.45.0, R4b-2: when a chart has a draw duration,
+        # its staggered progress runs over `draw`, not the whole
+        # window — so the labels appear on the draw clock, not
+        # the window clock.
+        eff_window = (float(el["draw"]) if el.get("draw")
+                      else window)
         if kind == "bars":
             baseline = float(el["y"]) + float(el["h"])
             for i, bar in enumerate(bars_layout(el)):
                 if bar["label"]:
                     _label(bar["label"], bar["cx"], baseline + 10,
-                           start + i * stagger * window)
+                           start + i * stagger * eff_window)
+                # Value label: NO background box (box_ov=False).
+                # The rounded pill (v1.45.0, R5) is size*1.4 +
+                # padding tall and would overlap the bar's top
+                # by ~13px, dimming it — the label is white text
+                # over the dark board and reads fine bare.
                 _label(_fmt_value(bar["value"]), bar["cx"],
                        baseline - bar["height"] - size - 10,
-                       start + (i * stagger + grow) * window)
+                       start + (i * stagger + grow) * eff_window,
+                       box_ov=False)
         elif kind in ("donut", "pie"):
             cx0, cy0 = float(el["x"]), float(el["y"])
             radius = float(el["radius"])
@@ -1302,7 +1968,7 @@ def _motion_derived_texts(info, width, height):
                 if seg["label"]:
                     text = f"{seg['label']}: {text}"
                 _label(text, lx, ly - size / 2.0,
-                       start + (i * stagger + grow) * window)
+                       start + (i * stagger + grow) * eff_window)
         elif kind == "line_chart":
             pts = line_chart_points(el)
             # Arc lengths along the polyline: the label for point
@@ -1313,10 +1979,42 @@ def _motion_derived_texts(info, width, height):
             total_len = sum(seg_lens) or 1.0
             acc = 0.0
             for i, (px, py) in enumerate(pts):
+                # No background box (box_ov=False): the pill
+                # would overlap the line below the label (same
+                # R5 overlap as the bars value label).
                 _label(_fmt_value(el["values"][i]), px, py - size - 12,
-                       start + (acc / total_len) * window)
+                       start + (acc / total_len) * eff_window,
+                       box_ov=False)
                 if i < len(seg_lens):
                     acc += seg_lens[i]
+        elif kind == "comparison_cards":
+            # v1.45.0, R4b-1: the label sits near the top of its
+            # card (below the accent bar) and the value below it,
+            # both centred on the card. Each pair appears when its
+            # card finishes growing (p == 1), so the drawn card is
+            # always at full size underneath. The value has no box
+            # (the card is the box) and takes the card's accent
+            # colour at value_size.
+            from .motion import cards_layout
+            value_size = int(el.get("value_size", 44))
+            for i, card in enumerate(cards_layout(el)):
+                when = start + (i * stagger + grow) * eff_window
+                # No box on the label either: the card body is
+                # the box (a drawtext box inside a card would be
+                # a nested sharp box — the thing this package
+                # removes).
+                _label(card["label"], card["cx"],
+                       card["y0"] + card["h"] * 0.16, when,
+                       box_ov=False)
+                if card["value"] is not None:
+                    vtext = (_fmt_value(card["value"])
+                             if isinstance(card["value"], (int, float))
+                             else str(card["value"]))
+                    _label(vtext, card["cx"],
+                           card["y0"] + card["h"] * 0.48, when,
+                           size_ov=value_size,
+                           color_ov=_rgb_hex(card["color"]),
+                           box_ov=False)
     return items
 
 
@@ -1482,7 +2180,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # input, so the chapters index still lands exactly on it.
     card_segments = []  # (diagram, image_index)
     for dg in info.get("diagrams", []) or []:
-        if not dg.get("_video") or not dg.get("_card"):
+        if not dg.get("_card"):
+            continue
+        # An adapted diagram has a card but no video (the motion
+        # element renders instead); a stroke diagram needs both.
+        if not dg.get("_video") and not dg.get("adapted_to_motion"):
             continue
         idx = _input_count(argv)
         argv += ["-i", dg["_card"]]
@@ -2407,8 +3109,22 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # the same place and size as its diagram (the card PNG
         # shares the diagram canvas, so dw:-2 matches exactly),
         # then the animated diagram draws on top of it.
+        # Glassmorphism (v1.45.0, R7): when the diagram has a
+        # card with backdrop_blur (the default), a frosted card
+        # goes down BEFORE the card image, so the blurred
+        # background shows through the card's 0.45 opacity.
         if id(dg) in _card_by_id:
             cidx = _card_by_id[id(dg)]
+            if dg.get("backdrop_blur", True):
+                _cbx, _cby, _cbw, _cbh = _diagram_card_rect(
+                    dg, width, height, dw)
+                vcur = _emit_glass_card(filters, vcur, 1000 + di,
+                                        _cbx, _cby, _cbw, _cbh,
+                                        20, fps, _afmt, dstart, dend,
+                                        argv,
+                                        fade_start=(_fade_start
+                                                    if _fade_start < dend
+                                                    else None))
             filters.append(
                 f"[{cidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
                 f"trim=end={disp_dur},setpts=PTS-STARTPTS,"
@@ -2421,6 +3137,50 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             f"[{vcur}][dg{di}]overlay=x='{x_expr}':y='{y_expr}':"
             f"eof_action=pass:enable='between(t,{dstart},{dend})'[vdg{di}]")
         vcur = f"vdg{di}"
+    # Adapted template diagrams (v1.45.0, R4b-3): no diagram
+    # video (the motion element renders instead), but the
+    # backdrop card still composites under the motion element
+    # at the diagram's place and size, with the same hold+fade.
+    # This runs BEFORE the motion compositing below, so the
+    # motion element lands on top of its card.
+    _acard = 0
+    for dg, cidx in card_segments:
+        if dg.get("_video"):
+            continue
+        dstart = float(dg["start"])
+        dend = float(dg["end"])
+        disp_dur = dend - dstart
+        dw = _even(float(dg["size"]) * width)
+        _fade_start = dstart + float(dg["draw"]) + float(
+            dg.get("hold_seconds", 8.0))
+        _fade = (f",fade=t=out:st={_fade_start}:d=1.0:alpha=1"
+                 if _fade_start < dend else "")
+        # Glassmorphism (v1.45.0, R7): a frosted card under
+        # the adapted diagram's backdrop card (same as the
+        # stroke-diagram card above; the adapted card's canvas
+        # IS the display size, so the rect matches exactly).
+        if dg.get("backdrop_blur", True):
+            _cbx, _cby, _cbw, _cbh = _diagram_card_rect(
+                dg, width, height, dw)
+            vcur = _emit_glass_card(filters, vcur, 2000 + _acard,
+                                    _cbx, _cby, _cbw, _cbh,
+                                    20, fps, _afmt, dstart, dend,
+                                    argv,
+                                    fade_start=(_fade_start
+                                                if _fade_start < dend
+                                                else None))
+        filters.append(
+            f"[{cidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+            f"trim=end={disp_dur},setpts=PTS-STARTPTS,"
+            f"scale={dw}:-2,format={_afmt},setpts=PTS+{dstart}/TB{_fade}[cdga{_acard}]")
+        px, py = OVERLAY_POS[dg.get("position", "bottom_right")]
+        x_expr = str(dg["x"]) if "x" in dg else px
+        y_expr = str(dg["y"]) if "y" in dg else py
+        filters.append(
+            f"[{vcur}][cdga{_acard}]overlay=x='{x_expr}':y='{y_expr}':"
+            f"eof_action=pass:enable='between(t,{dstart},{dend})'[vcdga{_acard}]")
+        vcur = f"vcdga{_acard}"
+        _acard += 1
     # Motion graphics (v1.43.0): each element video is its
     # keyframe-union bbox, rendered at full resolution and scaled
     # here to the (possibly preview-scaled) bbox, then overlaid
@@ -2437,9 +3197,49 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         sby = int(round(mby * scale_factor))
         sbw = max(1, int(round(mbw * scale_factor)))
         sbh = max(1, int(round(mbh * scale_factor)))
+        # Glassmorphism (v1.45.0, R7): a frosted backdrop-blur
+        # card behind the chart, ON by default (backdrop_blur).
+        # It is composited BEFORE the motion element, so the
+        # chart draws on top of the frosted card. The card uses
+        # the element's (scaled) bbox; the radius is 20.
+        # v1.45.0, R4b-2: fade_out fades the element's video over
+        # fade_out seconds, starting at fade_start when given,
+        # else at end - fade_out (so it completes exactly at the
+        # window end). The fade sits after setpts, so its start
+        # is in timeline seconds — the same pattern as the
+        # diagram fade. The derived labels fade over the same
+        # window (handled in _motion_derived_texts, v1.45.0 R12
+        # fix). The glass card fades with the element (same
+        # window) via fade_start below.
+        _mfade_start = None
+        if el.get("fade_out"):
+            _fo = float(el["fade_out"])
+            _mfade_start = (float(el["fade_start"])
+                            if el.get("fade_start") is not None
+                            else mend - _fo)
+        if el.get("backdrop_blur", True) and el.get("kind") in (
+                "bars", "donut", "pie", "line_chart",
+                "comparison_cards"):
+            vcur = _emit_glass_card(filters, vcur, mi, sbx, sby,
+                                    sbw, sbh, 20, fps, _afmt,
+                                    mstart, mend, argv,
+                                    fade_start=_mfade_start)
+        _mfade = ""
+        if el.get("fade_out"):
+            _fo = float(el["fade_out"])
+            _fs = _mfade_start
+            _mfade = f",fade=t=out:st={_fs}:d={_fo}:alpha=1"
+        # Performance (v1.45.0, R12 / Extension #2): the motion
+        # video is already rendered at the bbox size (mbw, mbh),
+        # so when the scaled size equals it (scale_factor == 1,
+        # the full-resolution render) the scale is a no-op and
+        # is skipped — it still costs a full-frame pass. The
+        # format conversion stays (it is needed for the alpha).
+        _mscale = (f"scale={sbw}:{sbh},"
+                   if (sbw != mbw or sbh != mbh) else "")
         filters.append(
             f"[{idx}:v]fps={fps},trim=end={mdur},setpts=PTS-STARTPTS,"
-            f"scale={sbw}:{sbh},format={_afmt},setpts=PTS+{mstart}/TB[mo{mi}]")
+            f"{_mscale}format={_afmt},setpts=PTS+{mstart}/TB{_mfade}[mo{mi}]")
         filters.append(
             f"[{vcur}][mo{mi}]overlay=x={sbx}:y={sby}:"
             f"eof_action=pass:enable='between(t,{mstart},{mend})'[vmo{mi}]")
@@ -2467,6 +3267,16 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # prefixes (the reveal itself is the entrance).
     render_items = []
     ass_events = []
+    # Caption wrap settings (v1.36.0), hoisted here so the
+    # reveal expansion (R4c-3b) can wrap the full text once
+    # before it splits into word prefixes; the wrapping stage
+    # below reuses them.
+    cap_maxw = float(project.get("caption_max_width", 0.8))
+    cap_spacing = float(project.get("caption_line_spacing", 1.35))
+    # Multi-line block ids (v1.45.0, R4c-3): a counter shared
+    # by the reveal expansion and the wrapping stage, so a
+    # reveal prefix block and a wrapped block never collide.
+    _block_seq = 0
     # Collision-proof layout (v1.41.0): validate computed
     # overlap_moves for keyword pops; apply them to a copy
     # of the project texts so the render matches the
@@ -2683,6 +3493,96 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 _weights = [len(w) for w in words]
                 _total_w = sum(_weights)
                 _acc = 0
+                # Multi-line caption reveal (v1.45.0, R4c-3b,
+                # Defect 3): wrap the FULL text ONCE, then each
+                # word prefix becomes one sub-item PER non-empty
+                # line, at the fixed y of that line in the full
+                # block. Without this the prefix is one item
+                # whose y jumps when it grows from 1 line to 2
+                # (the wrapping stage re-centres it on its
+                # current line count), and at the boundary frame
+                # both the 1-line and 2-line prefixes are enabled
+                # at overlapping y. The y_i here use the FULL
+                # line count, so line 0 never moves.
+                _full_lines = []
+                if _is_cap:
+                    _full_lines = wrap_caption_lines(
+                        str(_item["text"]), float(_item.get("size", 36)),
+                        width * cap_maxw)
+                if len(_full_lines) > 1:
+                    _rsize = float(_item.get("size", 36))
+                    _rlh = _rsize * cap_spacing
+                    _rpos = _item.get("position")
+                    _rn = len(_full_lines)
+                    _rys = []
+                    for _li in range(_rn):
+                        if _rpos in ("top_left", "top_center", "top_right"):
+                            _rys.append(40 + _li * _rlh)
+                        elif _rpos in ("bottom_left", "bottom_center", "bottom_right"):
+                            _rys.append((height - 40 - _rsize * 1.4)
+                                        - (_rn - 1 - _li) * _rlh)
+                        elif _rpos == "center":
+                            _rbh = (_rn - 1) * _rlh + _rsize * 1.4
+                            _rys.append((height - _rbh) / 2 + _li * _rlh)
+                        else:
+                            _rys.append(_default_caption_top(
+                                height, _rsize, _rn, cap_spacing,
+                                zone_clamp) + _li * _rlh)
+                    # Which full line each word belongs to.
+                    _words_in_line = [len(_ln.split())
+                                      for _ln in _full_lines]
+                    _word_line = []
+                    _li = 0
+                    for _wi in range(len(words)):
+                        while (_li + 1 < _rn and
+                               _wi >= sum(_words_in_line[:_li + 1])):
+                            _li += 1
+                        _word_line.append(_li)
+                    _block_seq += 1
+                    _rblk = _block_seq
+                    for _k, _w in enumerate(words):
+                        _sstart = _start + _window * (_acc / _total_w)
+                        _acc += _weights[_k]
+                        _send = _end if _k == len(words) - 1 else \
+                            _start + _window * (_acc / _total_w)
+                        # The prefix's lines: for each full line,
+                        # the words of that line up to word k.
+                        _prefix_lines = []
+                        for _li in range(_rn):
+                            _lw = [words[_wi] for _wi in range(len(words))
+                                   if _word_line[_wi] == _li and _wi <= _k]
+                            if _lw:
+                                _prefix_lines.append((_li, " ".join(_lw)))
+                        for _li, _ln in _prefix_lines:
+                            _sub = dict(_item)
+                            if "track" in _item:
+                                _sub["_track_base_start"] = _start
+                            _sub["text"] = _ln
+                            _sub["start"] = _sstart
+                            _sub["end"] = _send
+                            _sub.pop("reveal", None)
+                            _sub.pop("animation", None)
+                            _sub.pop("fade_in", None)
+                            _sub.pop("fade_out", None)
+                            if _item.get("_kinetic_words"):
+                                _sub["animation"] = "fade_up"
+                                _sub["animation_duration"] = 0.3
+                                _sub["fade_in"] = 0.3
+                            _sub["_wrap_y"] = _rys[_li]
+                            _sub["_block_id"] = _rblk
+                            # The block is the VISIBLE prefix:
+                            # its height/width hug the lines
+                            # shown in this step (the background
+                            # grows as the prefix grows).
+                            _sub["_block_n"] = len(_prefix_lines)
+                            _sub["_block_top"] = _rys[_prefix_lines[0][0]]
+                            _sub["_block_lh"] = _rlh
+                            _sub["_block_texts"] = [
+                                _ln for _, _ln in _prefix_lines]
+                            _sub["_block_first"] = (
+                                _li == _prefix_lines[0][0])
+                            render_items.append((_sub, _is_cap))
+                    continue
                 for _k, _w in enumerate(words):
                     _sub = dict(_item)
                     if "track" in _item:
@@ -2721,8 +3621,6 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # positions and the default), downward from the top (top
     # positions), or centred (center). Single-line captions get
     # no _wrap_y key and render exactly as before.
-    cap_maxw = float(project.get("caption_max_width", 0.8))
-    cap_spacing = float(project.get("caption_line_spacing", 1.35))
     wrapped_items = []
     for _item, _is_cap in render_items:
         if not _is_cap:
@@ -2735,6 +3633,17 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             continue
         _lh = _size * cap_spacing
         _pos = _item.get("position")
+        # Multi-line block (v1.45.0, R4c-3a, Defect 3): the lines
+        # share one unified background (see the drawtext loop),
+        # because per-line drawtext boxes overlap — the line
+        # spacing (size*1.35) is smaller than a box's height
+        # (text height + 2*12 border), so two per-line boxes
+        # merge into one stepped black block. The block id, the
+        # first line's y (block top), the line height and the
+        # line strings are carried on every line item; the first
+        # line emits the background, the rest only their text.
+        _block_seq += 1
+        _block_top = None
         for _li, _ln in enumerate(_lines):
             _sub = dict(_item)
             _sub["text"] = _ln
@@ -2749,6 +3658,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 _sub["_wrap_y"] = _default_caption_top(
                     height, _size, len(_lines), cap_spacing,
                     zone_clamp) + _li * _lh
+            if _block_top is None:
+                _block_top = float(_sub["_wrap_y"])
+            _sub["_block_id"] = _block_seq
+            _sub["_block_n"] = len(_lines)
+            _sub["_block_top"] = _block_top
+            _sub["_block_lh"] = _lh
+            _sub["_block_texts"] = list(_lines)
+            _sub["_block_first"] = (_li == 0)
             wrapped_items.append((_sub, _is_cap))
     render_items = wrapped_items
     # Native ASS karaoke stage (v1.41.0, Fix 2): all word_timings
@@ -2774,7 +3691,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # Ink-width cache for sweep bars (v1.44.0, F4): one
     # measurement per (text, font, size), shared by every
     # highlight/underline item in this render.
-    _ink_cache = {}
+    _width_cache = {}
+    # Background rects (v1.45.0, R4c-2, Defect 2): shapes/cards a
+    # text can sit on; computed once, shared by every item.
+    _bg_rects = _background_rects(info, width, height)
     for item, is_caption in render_items:
         size = item.get("size", 36 if is_caption else 48)
         if is_caption:
@@ -2808,10 +3728,53 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             color = "0x" + color[1:]
         box = 1 if item.get("box", True) else 0
         box_part = ":box=1:boxcolor=black@0.5:boxborderw=12" if box else ":box=0"
+        # Defect 2 (v1.45.0, R4c-2): a text centred on a shape or
+        # card gets no drawtext box and no pill — the shape/card
+        # IS the background. Forced even for an explicit box=true:
+        # a box inside a shape is always the reported defect
+        # ("اضغط" on the yellow circle, "project.json" in the
+        # blue card). The pill block below honours _on_bg too.
+        _on_bg = _text_on_background(item, is_caption, width, height,
+                                      size, _bg_rects, _width_cache,
+                                      zone_clamp)
+        if _on_bg:
+            box = 0
+            box_part = ":box=0"
+        # Multi-line block (R4c-3a): a line in a block never gets
+        # its own drawtext box — the block has one unified
+        # background (emitted below, on the first line).
+        _in_block = "_block_id" in item
+        if _in_block:
+            box = 0
+            box_part = ":box=0"
+        # Rounded pills (v1.45.0, R5): the default boxed text
+        # gets a rounded pill (the _emit_text_pill overlay
+        # below), NOT the sharp drawtext box. The drawtext box
+        # survives only where a static pill cannot follow the
+        # text: an animated text (its x/y move), a fading text
+        # (its alpha ramps — the pill is a separate overlay
+        # that would not fade), or a tracked text (its x/y are
+        # sampled from the track every frame). Those keep the
+        # sharp box, which is part of the drawtext filter and
+        # moves/fades with the text. Counters are pills too
+        # (their branch below emits one sized to the max
+        # display value); the _counter flag is excluded here
+        # only because its pill is emitted in its own branch.
         fi = float(item.get("fade_in", 0) or 0)
         fo = float(item.get("fade_out", 0) or 0)
+        _use_pill = (bool(box) and not _on_bg and not _in_block
+                     and not item.get("animation") and not fi
+                     and not fo and not item.get("track"))
+        if _use_pill:
+            box_part = ":box=0"
         alpha_part = ""
-        if fi > 0 and fo > 0:
+        if item.get("_alpha_expr"):
+            # Custom alpha expression (v1.45.0, R6): the
+            # lower-third text's opacity follows its card's
+            # spring entrance, not a linear fade ramp. It
+            # replaces the fade_in/fade_out alpha entirely.
+            alpha_part = f":alpha='{item['_alpha_expr']}'"
+        elif fi > 0 and fo > 0:
             alpha_part = (f":alpha='if(lt(t,{start}+{fi}),(t-{start})/{fi},"
                           f"if(gt(t,{end}-{fo}),({end}-t)/{fo},1))'")
         elif fi > 0:
@@ -2826,7 +3789,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         x_out = x_expr
         size_out = str(size)
         if anim in ("slide_in", "slide_out", "slide_in_out"):
-            in_expr = (f"({x_expr})*(t-{start})/{ad}-text_w*(1-(t-{start})/{ad})")
+            # Spring entrance (v1.45.0, R6): the text slides in
+            # with a spring overshoot (~15% past its rest x,
+            # settling by the end of the window) instead of the
+            # old linear ramp. The exit stays linear — a spring
+            # exit would overshoot off-screen, which is
+            # invisible, so there is nothing to gain.
+            _su = _easing_factor("spring", f"(t-{start})/{ad}")
+            in_expr = (f"({x_expr})*{_su}-text_w*(1-{_su})")
             out_expr = (f"({x_expr})+(w-({x_expr})+text_w)*((t-({end}-{ad}))/{ad})")
             if anim == "slide_in":
                 x_out = f"if(lt(t,{start + ad}),{in_expr},{x_expr})"
@@ -2839,14 +3809,15 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             size_out = (f"if(lt(t,{start + ad}),"
                         f"{size}*(0.5+0.5*(t-{start})/{ad}),{size})")
         if anim == "pop_in":
-            # Scale pop with ease_out_back overshoot (v1.44.0,
-            # F4): 0.3x at u=0, ~1.06x at u=0.5, 1.0x at u=1.
-            # Same formula as the shared easing system
-            # (_easing_factor / motion.apply_easing).
+            # Scale pop with the spring (v1.45.0, R6): 0.3x at
+            # u=0, ~1.10x at the spring peak (u~0.27), 1.0x at
+            # u=1 — a livelier pop than the old ease_out_back
+            # (~1.06x). Same formula as the shared easing
+            # system (_easing_factor / motion.apply_easing).
             _pu = f"(t-{start})/{ad}"
+            _ps = _easing_factor("spring", _pu)
             size_out = (f"if(lt(t,{start + ad}),"
-                        f"{size}*(0.3+0.7*(1+2.70158*pow({_pu}-1,3)"
-                        f"+1.70158*pow({_pu}-1,2))),{size})")
+                        f"{size}*(0.3+0.7*{_ps}),{size})")
         # fade_up: the text rises from 40px below, decelerating
         # (ease_out quadratic), and fades in over the same
         # window (fade_in is set by the preset). y_out defaults
@@ -2895,8 +3866,31 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 raise ValueError(
                     "FONT_NOT_FOUND: no usable font for the counter "
                     f"{item.get('_counter_affixes', '')!r}; Arabic "
-                    "text needs Noto Naskh Arabic, Latin text needs "
+                    "text needs Noto Sans Arabic, Latin text needs "
                     "DejaVuSans (bundled fonts/ or $AGENTCUT_FONT_DIR)")
+            # Counter pill (v1.45.0, R5): a boxed counter gets
+            # the rounded pill, sized to the widest value it
+            # can show (_counter_max_text, centred on the
+            # counter's numeric centre). box_part is already
+            # ":box=0" when _use_pill is set.
+            if _use_pill:
+                _cmax = str(item.get("_counter_max_text") or "0")
+                _cw = _measure_text_width(_cmax, item_font, size,
+                                          _width_cache)
+                _cpad = int(item.get("box_padding", 12))
+                _cbw = int(_cw + 2 * _cpad + 0.5)
+                _cbh = int(float(size) * 1.4 + 2 * _cpad + 0.5)
+                _ccx = float(item.get("_counter_cx", 0.0))
+                _cbx = max(0, int(_ccx - _cbw / 2))
+                _cby = max(0, int(float(item.get("y", 0)) - _cpad))
+                _crad = item.get("box_radius")
+                _crad = 16 if _crad is None else int(_crad)
+                vcur = _emit_text_pill(
+                    filters, vcur, overlay_index, _cbx, _cby,
+                    _cbw, _cbh, _crad,
+                    item.get("box_color", "black"),
+                    float(item.get("box_opacity", 0.5)),
+                    fps, _afmt, start, end)
             filters.append(
                 f"[{vcur}]drawtext=fontfile={item_font}:"
                 f"text='{item['_counter_expr']}':"
@@ -2917,9 +3911,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # expanded into render_items above, so they are covered
             # here exactly like titles, pop texts and SRT cues.
             fh.write(bidi_display_text(str(item["text"])))
-        # Font by script: Arabic text gets Noto Naskh Arabic when
-        # present, everything else keeps the validated default font.
-        # v1.41.0: an explicit font option wins over script
+        # Font by script: Arabic text gets Noto Sans Arabic (Bold)
+        # when present, everything else keeps the validated default
+        # font. v1.41.0: an explicit font option wins over script
         # detection (tajawal-bold for display titles); a named
         # font that cannot be found fails loudly, never tofu.
         # Deliberately NO fallback to the Latin font for Arabic text
@@ -2937,27 +3931,76 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 f"FONT_NOT_FOUND: no usable font for text "
                 f"{str(item['text'])[:40]!r}"
                 + (f" (requested font '{item['font']}')" if item.get("font") else "")
-                + f"; Arabic text needs Noto Naskh "
+                + f"; Arabic text needs Noto Sans "
                 "Arabic, Latin text needs DejaVuSans (bundled fonts/ or "
                 "$AGENTCUT_FONT_DIR)")
-        # Rounded text background box (v1.36.0): a generated
-        # rounded-rect colour source overlaid UNDER the text, in
-        # place of drawtext's rectangular box. Geometry mirrors
-        # _text_box (same width estimate, same preset positions)
-        # so the pill hugs the text; the radius clamps to half
-        # the smaller pill side. Validation forbids combining
-        # this with animation or fades (the pill would not move
-        # or fade with the text). Wrapped caption lines each get
-        # their own pill.
-        box_radius = int(item.get("box_radius", 0) or 0)
-        if box_radius > 0:
+        # Unified block background (v1.45.0, R4c-3a, Defect 3):
+        # one background for the whole multi-line caption block,
+        # emitted on the first line (before its drawtext, so it
+        # sits below all the lines). Geometry: the union of the
+        # lines' rects (each line centred/left/right by the same
+        # position rule) plus the 12px box padding, from the
+        # first line's top to the last line's bottom. Rounded
+        # when the item has box_radius (the same geq mask as the
+        # per-line pill — with radius 0 the factor is 1, a sharp
+        # rect); colour/opacity from box_color/box_opacity
+        # (default black@0.5, the old per-line box look).
+        if _in_block and item.get("_block_first"):
+            _blines = list(item.get("_block_texts") or [item["text"]])
+            _bwidths = [_measure_text_width(
+                _ln, item_font, size, _width_cache) for _ln in _blines]
+            _bpos = item.get("position")
+            _bx_expr = (POS_MAP[_bpos][0] if _bpos in POS_MAP
+                        else "(w-text_w)/2")
+            _blefts = [_pos_expr_value(_bx_expr, width, height,
+                                       _bw, float(size) * 1.4)
+                       for _bw in _bwidths]
+            _bleft = min(_blefts)
+            _bright = max(_l + _w for _l, _w in zip(_blefts, _bwidths))
+            _bpad = 12
+            _bbx = max(0, int(_bleft - _bpad))
+            _bby = max(0, int(float(item["_block_top"]) - _bpad))
+            _bbw = int(_bright - _bleft + 2 * _bpad + 0.5)
+            _bbh = int((int(item["_block_n"]) - 1)
+                       * float(item["_block_lh"]) + float(size) * 1.4
+                       + 2 * _bpad + 0.5)
+            _bbw = max(1, min(_bbw, width - _bbx))
+            _bbh = max(1, min(_bbh, height - _bby))
+            _bbr = item.get("box_radius")
+            _bbr = 16 if _bbr is None else int(_bbr)
+            vcur = _emit_text_pill(
+                filters, vcur, overlay_index, _bbx, _bby,
+                _bbw, _bbh, _bbr, item.get("box_color", "black"),
+                float(item.get("box_opacity", 0.5)),
+                fps, _afmt, start, end)
+        # Rounded text background (v1.36.0 pill, v1.45.0 R5
+        # default): a generated rounded-rect colour source
+        # overlaid UNDER the text, in place of drawtext's
+        # rectangular box. Since R5 the pill IS the default
+        # boxed-text background (see _use_pill above): the
+        # sharp drawtext box is gone except for animated /
+        # fading / tracked texts, which keep it because a
+        # static pill cannot follow them. Geometry mirrors
+        # the drawtext position (same width, same preset
+        # positions) so the pill hugs the text; the width is
+        # the shaped (HarfBuzz) width, not the old 0.6xsize
+        # estimate (which ran far too wide for Arabic). The
+        # radius is the item's box_radius when set, else 16
+        # (a soft rounded card); 0 gives a sharp rect through
+        # this same mechanism. Validation forbids combining a
+        # box_radius with animation or fades (the pill would
+        # not move or fade with the text) — and _use_pill
+        # excludes those items from the pill entirely.
+        if _use_pill:
             box_part = ":box=0"
-            est_w = max(10.0, len(str(item["text"])) * float(size) * 0.6)
+            est_w = _measure_text_width(str(item["text"]), item_font,
+                                        size, _width_cache)
             est_h = float(size) * 1.4
             pad = int(item.get("box_padding", 12))
             bw = int(est_w + 2 * pad + 0.5)
             bh = int(est_h + 2 * pad + 0.5)
-            br = min(box_radius, bw // 2, bh // 2)
+            _brad = item.get("box_radius")
+            _brad = 16 if _brad is None else int(_brad)
             pos = item.get("position")
             if is_caption:
                 if "_wrap_y" in item:
@@ -3011,36 +4054,31 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                                     if _m else (width - est_w) / 2)
             bx = max(0, int(left - pad))
             by = max(0, int(top - pad))
-            bop = float(item.get("box_opacity", 0.5))
-            filters.append(
-                f"color=c={_ff_color(item.get('box_color', 'black'))}:s={bw}x{bh}:r={fps},"
-                f"format={_afmt},geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                f"a='{_rounded_alpha_factor(br)}*255*{bop}'[box{overlay_index}]")
-            filters.append(
-                f"[{vcur}][box{overlay_index}]overlay=x={bx}:y={by}:"
-                f"eof_action=pass:enable='between(t,{start},{end})'[vbox{overlay_index}]")
-            vcur = f"vbox{overlay_index}"
+            vcur = _emit_text_pill(
+                filters, vcur, overlay_index, bx, by, bw, bh,
+                _brad, item.get("box_color", "black"),
+                float(item.get("box_opacity", 0.5)),
+                fps, _afmt, start, end)
         # Highlight sweep / underline swipe (v1.44.0, F4): a bar
         # behind (highlight) or under (underline) the line that
         # sweeps in over the first 0.6s, then holds. The bar hugs
-        # the TRUE ink width (measured, never the 0.6*size
-        # estimate), so it never splits a word: the whole line
-        # is one bar. Arabic (RTL) sweeps right-to-left; Latin
-        # sweeps left-to-right. Built as a colour source scaled
-        # with eval=frame and overlaid (NOT a drawbox: drawbox
-        # w/h are config-time on this build) AFTER the pill (if
-        # any) and BEFORE the drawtext, so it sits below the text.
+        # the shaped text width (HarfBuzz, v1.45.0 R2 — always
+        # >= the true ink width, so it never splits a word and
+        # never under-covers the text): the whole line is one
+        # bar. Arabic (RTL) sweeps right-to-left; Latin sweeps
+        # left-to-right. Built as a colour source scaled with
+        # eval=frame and overlaid (NOT a drawbox: drawbox w/h
+        # are config-time on this build) AFTER the pill (if any)
+        # and BEFORE the drawtext, so it sits below the text.
         if item.get("_sweep") in ("highlight", "underline"):
             _sw_text = str(item["text"])
             _sw_rtl = bool(_ARABIC_RE.search(_sw_text))
             _sw_dur = min(0.6, max(0.1, end - start))
-            _ink = _measure_word_ink(_sw_text, item_font, size,
-                                     text_dir, _ink_cache)
-            if _ink is None or _ink >= 2300:
-                # Measurement failed, or the line ran off the
-                # 2400px measurement canvas: fall back to the
-                # 0.6 x size per character estimate.
-                _ink = max(10.0, len(_sw_text) * float(size) * 0.6)
+            # v1.45.0, R2: HarfBuzz shaped width (never None, no
+            # canvas limit — the old >=2300 guard was for the
+            # cropdetect canvas, not a real line width).
+            _ink = _measure_text_width(_sw_text, item_font, size,
+                                       _width_cache)
             _pad = 12
             _bar_w = float(_ink) + 2 * _pad
             if is_caption:
@@ -3113,12 +4151,24 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # /tmp/r7probe bar_ltr/bar_rtl probes); the overlay
             # reads the scaled width as overlay_w, so the RTL
             # bar keeps its right edge fixed as it grows.
+            # v1.45.0, R1: clamp u to [0,1] BEFORE the smoothstep.
+            # The bar is a colour-source input scaled with
+            # eval=frame, so its w expression is evaluated for
+            # EVERY frame from t=0 — including frames before the
+            # sweep starts, where u=(t-start)/dur is NEGATIVE.
+            # The smoothstep polynomial u^2*(3-2u) is unbounded
+            # for negative u (u=-100 -> 2,030,000), so a late
+            # sweep (start=60) asked scale for an 860,720,000px
+            # wide image and the render died with "Picture size
+            # ... is invalid" (explainer-video production).
+            # Clamped, the width is 2px before the sweep, grows
+            # through the same smoothstep during it, and is the
+            # full bar width after — byte-identical for t>=start.
             _sw_x0 = max(0, int(_sw_left - _pad))
             _sw_x1 = _sw_x0 + int(_bar_w)
-            _su = f"(t-{start})/{_sw_dur}"
-            _w_expr = (f"if(lt(t,{start + _sw_dur}),"
-                       f"max(2.0,{_bar_w:.1f}*({_su}*{_su}*(3-2*{_su}))),"
-                       f"{_bar_w:.1f})")
+            _su = f"min(1,max(0,(t-{start})/{_sw_dur}))"
+            _w_expr = (f"max(2.0,{_bar_w:.1f}*"
+                       f"({_su}*{_su}*(3-2*{_su})))")
             if _sw_rtl:
                 _x_expr_sw = f"{_sw_x1}-overlay_w"
             else:
@@ -3408,29 +4458,57 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     for _si, (_st, _name, _vol, _pitch) in enumerate(sfx_entries):
         _ms = int(round(float(_st) * 1000))
         if _name in SFX_SOURCES:
-            # Built-ins (v1.37.1): full-timeline gated lavfi
-            # INPUTS, not adelay-delayed short sources. The input
-            # is appended here, after the metadata input, so no
-            # earlier input index shifts. The gated expression
-            # (single-quoted: its if() commas are not option
-            # separators) is silent outside the window, so no
-            # adelay, apad, atrim or asetpts is needed or wanted
-            # — see the root-cause note at SFX_SOURCES. The
-            # source duration is the whole timeline, so the
-            # stream is exactly `total` long. Pitch (v1.42.0):
-            # the expression's frequencies are scaled BEFORE
-            # gating, so the burst stays at its scheduled start
-            # (an atempo/ asetrate after the gate would move it).
-            _expr, _dur = SFX_SOURCES[_name]
-            _gated = _gated_sfx_expression(
-                _pitch_sfx_expression(_expr, _pitch), float(_st), _dur)
+            _spec = SFX_SOURCES[_name]
+            _dur = _spec["duration"]
             _sfx_idx = _input_count(argv)
-            argv += ["-f", "lavfi", "-i",
-                     f"aevalsrc='{_gated}':duration={total}:sample_rate=48000"]
-            filters.append(
-                f"[{_sfx_idx}:a]pan=stereo|c0=c0|c1=c0,aresample=48000,"
-                f"aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"volume={_vol}[sfx{_si}]")
+            if _spec["kind"] == "noise":
+                # Noise built-ins (v1.45.0, R3): short anoisesrc
+                # sources, adelay-delayed like file SFX (adelay
+                # alone preserves the leading silence — see the
+                # root-cause note at SFX_SOURCES). Fixed seed:
+                # the same name renders the same noise every
+                # time. Pitch is atempo BEFORE adelay, so the
+                # stretch applies to the short source only.
+                # The gain normalises the chain to the design
+                # level (see SFX_SOURCES); pitch 1.0 omits
+                # atempo (old graph unchanged).
+                _atempo = (f"atempo={_pitch},"
+                           if _pitch != 1.0 else "")
+                argv += ["-f", "lavfi", "-i",
+                         f"anoisesrc=color={_spec['color']}"
+                         f":duration={_dur}:seed={_spec['seed']}"
+                         f":sample_rate=48000"]
+                filters.append(
+                    f"[{_sfx_idx}:a]pan=stereo|c0=c0|c1=c0,"
+                    f"aresample=48000,{_spec['filters']},"
+                    f"volume={_spec['gain']},{_atempo}"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"volume={_vol},adelay={_ms}|{_ms}[sfx{_si}]")
+            else:
+                # Sine built-ins (thud only, v1.45.0): full-
+                # timeline gated lavfi INPUTS, not adelay-delayed
+                # short sources. The input is appended here,
+                # after the metadata input, so no earlier input
+                # index shifts. The gated expression
+                # (single-quoted: its if() commas are not option
+                # separators) is silent outside the window, so no
+                # adelay, apad, atrim or asetpts is needed or
+                # wanted — see the root-cause note at
+                # SFX_SOURCES. The source duration is the whole
+                # timeline, so the stream is exactly `total` long.
+                # Pitch (v1.42.0): the expression's frequencies
+                # are scaled BEFORE gating, so the burst stays at
+                # its scheduled start (an atempo/asetrate after
+                # the gate would move it).
+                _gated = _gated_sfx_expression(
+                    _pitch_sfx_expression(_spec["expr"], _pitch),
+                    float(_st), _dur)
+                argv += ["-f", "lavfi", "-i",
+                         f"aevalsrc='{_gated}':duration={total}:sample_rate=48000"]
+                filters.append(
+                    f"[{_sfx_idx}:a]pan=stereo|c0=c0|c1=c0,aresample=48000,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"volume={_vol}[sfx{_si}]")
         else:
             # File SFX (v1.37.1): adelay alone. Its leading
             # silence frames ARE the delay; atrim after adelay
@@ -3790,23 +4868,30 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
         diagram_dir = tempfile.mkdtemp(prefix="agentcut-diagrams-")
         register_temp_dir(diagram_dir)
         for di, dg in enumerate(info["diagrams"]):
-            dg_video = os.path.join(diagram_dir, f"diagram_{di}.mov")
-            try:
-                encode_diagram_video(dg, info["fps"], dg_video)
-            except RuntimeError as exc:
-                _remove_quietly(tmp_path)
-                shutil.rmtree(diagram_dir, ignore_errors=True)
-                if prescale_dir:
-                    shutil.rmtree(prescale_dir, ignore_errors=True)
-                if stab_dir:
-                    shutil.rmtree(stab_dir, ignore_errors=True)
-                if meta_dir:
-                    shutil.rmtree(meta_dir, ignore_errors=True)
-                return False, {"code": "RENDER_FAILED", "message": str(exc)}
-            dg["_video"] = dg_video
+            if not dg.get("adapted_to_motion"):
+                # v1.45.0, R4b-3: an adapted template diagram has
+                # no strokes and no video — the motion element
+                # renders it. Its card (below) still generates.
+                dg_video = os.path.join(diagram_dir, f"diagram_{di}.mov")
+                try:
+                    encode_diagram_video(dg, info["fps"], dg_video)
+                except RuntimeError as exc:
+                    _remove_quietly(tmp_path)
+                    shutil.rmtree(diagram_dir, ignore_errors=True)
+                    if prescale_dir:
+                        shutil.rmtree(prescale_dir, ignore_errors=True)
+                    if stab_dir:
+                        shutil.rmtree(stab_dir, ignore_errors=True)
+                    if meta_dir:
+                        shutil.rmtree(meta_dir, ignore_errors=True)
+                    return False, {"code": "RENDER_FAILED", "message": str(exc)}
+                dg["_video"] = dg_video
             # v1.41.0 Fix 6: static backdrop card, generated at
             # the diagram's canvas size so the graph's dw:-2
-            # scale lands it exactly under the diagram.
+            # scale lands it exactly under the diagram. For an
+            # adapted diagram the canvas IS the display size
+            # (set by the adapter), so the card lands exactly
+            # under the motion element.
             if dg.get("card"):
                 from .diagrams import (resolve_color, rounded_card_rgba,
                                        write_png_rgba)
@@ -3830,7 +4915,8 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
     motion_dir = None
     _motion_els = [el for el in (info.get("motion") or [])
                    if el.get("kind") in ("shape", "bars", "donut", "pie",
-                                         "line_chart", "lower_third")]
+                                         "line_chart", "lower_third",
+                                         "comparison_cards")]
     if _motion_els:
         from .motion import encode_motion_video
         motion_dir = tempfile.mkdtemp(prefix="agentcut-motion-")
@@ -4463,6 +5549,186 @@ def poster_frame(project, output_path, time=None, timeout=600):
     return True, {"output": output_path, "time": t,
                   "width": probe["width"] if probe else None,
                   "height": probe["height"] if probe else None}
+
+
+def render_contact_sheet(video_path, output_path, project=None,
+                         columns=4, rows=3):
+    """Extract 12 key frames from a rendered video into a 4x3
+    grid PNG with MM:SS timestamps (v1.45.0, R9) — the agent's
+    self-inspection sheet.
+
+    video_path is a rendered video file; output_path is the
+    PNG to write; project (optional) is a project dict (or a
+    path to one) whose timeline picks the SMART timestamps:
+    chapter starts, diagram completions (start + draw),
+    motion-element starts/ends and text starts. Without a
+    project (or when it yields fewer than 12 moments) the
+    remaining slots are evenly spaced across the duration.
+    Each thumbnail is scaled to a quarter of the video width
+    (a 720-wide video gives 180px thumbnails, 4 across =
+    720px wide; a 1280-wide video gives 320px thumbnails)
+    and stamped MM:SS (drawtext, bottom-left, boxed so it
+    reads on any background). The grid is a single PNG via
+    xstack. Returns (ok, info) where info carries output,
+    frames [{time, label}], width, height and the smart
+    moments used. A missing/unreadable video or a video
+    with no measurable duration is a structured error, not
+    a traceback.
+    """
+    from .validate import probe_media
+    src = resolve_path(video_path) if isinstance(video_path, str) else None
+    if not src or not os.path.isfile(src):
+        return False, {"code": "FILE_NOT_FOUND",
+                       "message": f"contact sheet video not found: {video_path}",
+                       "fix": "pass a rendered video file path"}
+    probe = probe_media(src)
+    if probe is None or probe.get("duration") is None \
+            or float(probe["duration"]) <= 0:
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"contact sheet video has no measurable duration: {video_path}",
+                       "fix": "pass a rendered video ffprobe can read"}
+    dur = float(probe["duration"])
+    vw = int(probe.get("width") or 720)
+    vh = int(probe.get("height") or 1280)
+    n = int(columns) * int(rows)
+    # Smart moments from the project timeline (if any).
+    moments = []
+    proj = None
+    if isinstance(project, dict):
+        proj = project
+    elif isinstance(project, str) and os.path.isfile(resolve_path(project)):
+        try:
+            with open(resolve_path(project), encoding="utf-8") as fh:
+                proj = json.load(fh)
+        except Exception:
+            proj = None
+    if isinstance(proj, dict):
+        for ch in (proj.get("chapters") or []):
+            if isinstance(ch, dict) and ch.get("start") is not None:
+                moments.append(float(ch["start"]))
+        for dg in (proj.get("diagrams") or []):
+            if not isinstance(dg, dict):
+                continue
+            try:
+                ds = float(dg.get("start", 0))
+                dd = float(dg.get("draw", 0) or 0)
+                moments.append(min(ds + dd, dur))
+            except (TypeError, ValueError):
+                pass
+        for el in (proj.get("motion") or []):
+            if not isinstance(el, dict):
+                continue
+            try:
+                moments.append(float(el.get("start", 0)))
+                moments.append(float(el.get("end", 0)))
+            except (TypeError, ValueError):
+                pass
+        for tx in (proj.get("texts") or []):
+            if not isinstance(tx, dict):
+                continue
+            try:
+                moments.append(float(tx.get("start", 0)))
+            except (TypeError, ValueError):
+                pass
+    # Clamp to [0, dur), dedupe within 1s, sort.
+    moments = sorted({round(m, 3) for m in moments
+                      if 0 <= m < dur})
+    deduped = []
+    for m in moments:
+        if not deduped or m - deduped[-1] >= 1.0:
+            deduped.append(m)
+    moments = deduped
+    if len(moments) > n:
+        # Spread the pick across the whole video, not just
+        # the first 12 moments.
+        step = len(moments) / n
+        moments = [moments[min(len(moments) - 1, int(i * step))]
+                   for i in range(n)]
+        moments = sorted(set(moments))
+    if len(moments) < n:
+        # Fill the remaining slots evenly across the duration.
+        need = n - len(moments)
+        fill = [round(dur * (i + 1) / (need + 1), 3) for i in range(need)]
+        moments = sorted(set(moments + fill))
+        # If dedupe still left us short (a fill collided with
+        # a smart moment), top up with evenly spaced times.
+        while len(moments) < n:
+            cand = round(dur * len(moments) / n, 3)
+            if cand not in moments:
+                moments.append(cand)
+            moments = sorted(moments)
+            if len(moments) >= n:
+                break
+            cand = round(dur * (len(moments) + 0.5) / n, 3)
+            if cand not in moments:
+                moments.append(cand)
+            moments = sorted(moments)
+    moments = sorted(moments)[:n]
+    # Extract the frames (one fast seek per frame, like the
+    # preview path) into a temp dir.
+    tmp = tempfile.mkdtemp(prefix="agentcut-contact-")
+    frames = []
+    try:
+        for k, t in enumerate(moments):
+            fp = os.path.join(tmp, f"f{k:02d}.png")
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-ss", str(t),
+                 "-i", src, "-frames:v", "1", fp],
+                capture_output=True, text=True, timeout=60)
+            if proc.returncode == 0 and os.path.isfile(fp):
+                mm = int(t // 60)
+                ss = int(t % 60)
+                frames.append({"time": t, "label": f"{mm:02d}:{ss:02d}",
+                               "path": fp})
+        if len(frames) < n:
+            return False, {"code": "RENDER_FAILED",
+                           "message": f"contact sheet extracted {len(frames)}/{n} frames from {video_path}",
+                           "fix": "check the video is a readable render"}
+        # Thumbnail size: a quarter of the video width, aspect
+        # preserved. The grid is columns x rows via xstack.
+        # The MM:SS label goes through a textfile (not text=):
+        # the colon in "00:07" would be parsed as an option
+        # separator inside a filter description ("No option
+        # name near '00:fontsize=...'").
+        tw = max(2, (vw // int(columns)) // 2 * 2)
+        th = max(2, int(round(tw * vh / vw)) // 2 * 2)
+        font = find_font_for_text("00:00") or find_font()
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for f in frames:
+            cmd += ["-i", f["path"]]
+        parts = []
+        for i, f in enumerate(frames):
+            lf = os.path.join(tmp, f"label{i:02d}.txt")
+            with open(lf, "w", encoding="utf-8") as fh:
+                fh.write(f["label"])
+            parts.append(
+                f"[{i}:v]scale={tw}:{th},drawtext=fontfile={font}:"
+                f"textfile={lf}:fontsize=28:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=8:"
+                f"x=8:y=h-44[v{i}]")
+        layout = "|".join(
+            f"{(i % int(columns)) * tw}_{(i // int(columns)) * th}"
+            for i in range(len(frames)))
+        parts.append(
+            f"{''.join(f'[v{i}]' for i in range(len(frames)))}"
+            f"xstack=inputs={len(frames)}:layout={layout}[out]")
+        cmd += ["-filter_complex", ";".join(parts),
+                "-map", "[out]", "-frames:v", "1", output_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=120)
+        if proc.returncode != 0 or not os.path.isfile(output_path):
+            return False, {"code": "RENDER_FAILED",
+                           "message": "contact sheet grid failed: "
+                                      + proc.stderr[-400:],
+                           "fix": "check the video frames extract cleanly"}
+        return True, {"output": output_path,
+                      "frames": [{"time": f["time"], "label": f["label"]}
+                                 for f in frames],
+                      "width": tw * int(columns),
+                      "height": th * int(rows),
+                      "video": src, "duration": dur}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def preview_project(project, out_dir, scale_factor=0.5, guides=True,
@@ -5203,6 +6469,67 @@ EXPLAINER_LOOKS = {
 }
 
 
+def _explainer_pacing_beats(start, dur, title, si, nscenes,
+                            width, height):
+    """Visual-beat motion elements for one LONG explainer scene
+    (v1.45.0, R8).
+
+    The prompt's Visual Beat Interval is 5.0..7.0s: in a long
+    scene the automatic schedule alternates visual events so
+    no stretch of the scene is static for more than ~7s.
+    Beat windows (prompt): 0-5s opening lower_third (scene
+    title, spring entrance); 5-13s live motion chart in a
+    glass card (the scene diagram — constrained to this
+    window by the caller, not here); 13-20s counter (scene
+    progress %) or keyword highlight. The cycle repeats
+    every 20s for scenes longer than 20s (lower_third,
+    chart, counter), each beat clamped to the scene end.
+    Only the lower_third and the counter are built here;
+    the chart is the scene's diagram (see produce_explainer).
+    Returns a list of motion elements (possibly empty).
+    A scene is "long" (pacing applies) when dur >= 13s —
+    shorter scenes keep the pre-pacing behaviour (static
+    scene title, diagram spanning the whole scene), which
+    the existing produce_explainer tests rely on.
+    """
+    beats = []
+    if dur < 13.0:
+        return beats
+    n = int(nscenes) if nscenes else 1
+    # Progress % at the end of this scene (a real derived
+    # number: scene index / total scenes).
+    pct = int(round(100.0 * (si + 1) / max(1, n)))
+    cycle = 0
+    while True:
+        base = start + cycle * 20.0
+        if base >= start + dur:
+            break
+        # Beat A (0-5s of the cycle): lower_third scene title.
+        a0, a1 = base, min(base + 5.0, start + dur)
+        if a1 > a0 and isinstance(title, str) and title.strip():
+            beats.append({
+                "id": f"pace-lt-{si + 1}-{cycle + 1}",
+                "kind": "lower_third", "text": title,
+                "x": 60, "y": height - 200, "h": 90,
+                "start": round(a0, 3), "end": round(a1, 3),
+                "enter": 0.6, "exit": 0.6})
+        # Beat C (13-20s of the cycle): progress counter.
+        # The suffix is ٪ (U+066A, Arabic percent sign), NOT
+        # % — % is a filter-breaking character in drawtext
+        # and validation rejects it (see the fix hint for
+        # motion.suffix).
+        c0, c1 = base + 13.0, min(base + 20.0, start + dur)
+        if c1 > c0:
+            beats.append({
+                "id": f"pace-ct-{si + 1}-{cycle + 1}",
+                "kind": "counter", "from": 0, "to": pct,
+                "suffix": "٪", "x": 360, "y": 600,
+                "size": 72, "color": "yellow",
+                "start": round(c0, 3), "end": round(c1, 3)})
+        cycle += 1
+    return beats
+
+
 def produce_explainer(brief, output_path, review_dir=None):
     """One-button board explainer (v1.39.0): one brief in, one
     finished video out. No hand-written project.json: every
@@ -5262,6 +6589,19 @@ def produce_explainer(brief, output_path, review_dir=None):
     - Optional music: when "music" names a file it is added
       as a music track with deterministic 12 dB ducking
       windows = the narration spans.
+    - Pacing (v1.45.0, R8): "pacing" defaults to true. In a
+      LONG scene (>= 13s) the visual beat is 5.0..7.0s: 0-5s
+      the scene title appears as a lower_third (spring
+      entrance) instead of the static yellow text; 5-13s the
+      scene diagram is the live motion chart in a glass card
+      (an explicit diagram start/end in the brief always
+      wins over the 5-13s window); 13-20s a counter shows
+      the scene's progress % (a real derived number: scene
+      index / total scenes). The cycle repeats every 20s
+      for scenes longer than 20s. Short scenes (< 13s)
+      keep the pre-1.45.0 layout (static title, diagram
+      spanning the whole scene). pacing=false restores the
+      old layout for every scene.
     Returns (ok, info_or_error); info carries output,
     duration, the derived scenes list, chapters, review
     frames and the built project (callers strip it, as
@@ -5360,9 +6700,24 @@ def produce_explainer(brief, output_path, review_dir=None):
                        "message": "sfx_density must be 'minimal' or 'rich'",
                        "fix": "set sfx_density to 'rich' for scene-transition whoosh + keyword pops + diagram chimes, or remove it for the minimal default"}
     rich = (sfx_density == "rich")
+    # v1.45.0, R8: visual pacing (Visual Beat Interval
+    # 5.0..7.0s). Default ON: long scenes (>= 13s) get
+    # lower_third + chart + counter beats so no stretch is
+    # static for more than ~7s. pacing=false restores the
+    # pre-1.45.0 behaviour (static scene title, diagram
+    # spanning the whole scene) for every scene. Short
+    # scenes (< 13s) always keep the old behaviour, even
+    # with pacing on — the existing produce_explainer tests
+    # (4s/3s scenes) rely on it.
+    pacing = brief.get("pacing", True)
+    if not isinstance(pacing, bool):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "explainer pacing must be true or false",
+                       "fix": "set pacing to true for the 5-7s visual beat (default), or false for the pre-1.45.0 static layout"}
     # Derive the timeline: probe every narration first, so a
     # bad scene fails before any render starts.
     scenes, clips, texts, captions, diagrams, audio = [], [], [], [], [], []
+    motion_els = []
     # v1.41.0 Fix 6 safe margins (modern look only): the title
     # stack is zoned — fixed title at or below the 10% line,
     # scene title below it, keywords below that — so diagrams
@@ -5438,7 +6793,15 @@ def produce_explainer(brief, output_path, review_dir=None):
         audio.append({"src": narration, "kind": "voice", "volume": 1.0,
                       "start": start})
         stitle = scene.get("title")
-        if isinstance(stitle, str) and stitle.strip():
+        # v1.45.0, R8: a long paced scene shows its title as
+        # a lower_third (beat 0, spring) instead of the static
+        # yellow text — the static text would duplicate it.
+        # Short scenes and pacing=false keep the static text.
+        _long_paced = bool(pacing) and dur >= 13.0
+        if _long_paced:
+            motion_els.extend(_explainer_pacing_beats(
+                start, dur, stitle, si, len(scenes_in), width, height))
+        if isinstance(stitle, str) and stitle.strip() and not _long_paced:
             if look.get("title_style"):
                 texts.append({"text": stitle, "start": start, "end": end,
                               "x": "center", "y": _scene_y,
@@ -5468,6 +6831,13 @@ def produce_explainer(brief, output_path, review_dir=None):
                                "fix": "set template to one of: " + ", ".join(sorted(TEMPLATES))}
             rel_start = dg.get("start", 0.0)
             rel_end = dg.get("end", dur)
+            # v1.45.0, R8: a long paced scene's diagram is the
+            # beat-1 chart (5-13s in a glass card), not the
+            # whole scene — unless the brief gave an explicit
+            # window, which always wins. Short scenes keep the
+            # whole-scene default (the e2e tests rely on it).
+            if _long_paced and "start" not in dg and "end" not in dg:
+                rel_start, rel_end = 5.0, min(13.0, dur)
             try:
                 rel_start, rel_end = float(rel_start), float(rel_end)
             except (TypeError, ValueError):
@@ -5579,6 +6949,7 @@ def produce_explainer(brief, output_path, review_dir=None):
         "captions": captions,
         "audio": audio,
         "diagrams": diagrams,
+        "motion": motion_els,
         "scrims": {"top": True, "bottom": True},
         "default_image_motion": motion == "gentle",
     }

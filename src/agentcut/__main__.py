@@ -3,7 +3,7 @@ import json
 import sys
 
 from .package import package_project
-from .render import poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_project, run_job_worker, split_clip, timeline_summary
+from .render import poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_contact_sheet, render_project, run_job_worker, split_clip, timeline_summary
 from .server import serve
 from .validate import probe_media, validate_project
 
@@ -47,6 +47,14 @@ def _main(argv):
         ok, info = poster_frame(_load(argv[1]), argv[2], time=t)
         print(json.dumps(info, indent=2, default=str))
         return 0 if ok else 1
+    if argv[0] == "contact-sheet" and len(argv) in (3, 4):
+        # v1.45.0, R9: contact-sheet <video> <out.png> [project.json]
+        # — 12 key frames in a 4x3 grid PNG with MM:SS labels.
+        # The optional project JSON drives the smart timestamps.
+        proj = _load(argv[3]) if len(argv) == 4 else None
+        ok, info = render_contact_sheet(argv[1], argv[2], project=proj)
+        print(json.dumps(info, indent=2, default=str))
+        return 0 if ok else 1
     if argv[0] == "produce-variants" and len(argv) == 3:
         ok, info = produce_variants(_load(argv[1]), argv[2])
         print(json.dumps(info, indent=2, default=str))
@@ -83,12 +91,12 @@ def _main(argv):
     if argv[0] == "package" and len(argv) in (3, 4):
         trim = len(argv) == 4 and argv[3] == "--trim-clips"
         if len(argv) == 4 and not trim:
-            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
+            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
             return 2
         summary = package_project(_load(argv[1]), argv[2], trim_clips=trim)
         print(json.dumps(summary, indent=2, default=str))
         return 0
-    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
+    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
     return 2
 
 

@@ -49,13 +49,93 @@ import subprocess
 
 from .diagrams import resolve_color
 
-EASINGS = ("linear", "smoothstep", "ease_in", "ease_out", "ease_in_out", "ease_out_back")
+EASINGS = ("linear", "smoothstep", "ease_in", "ease_out", "ease_in_out", "ease_out_back", "spring", "cubic_bezier")
+
+# Spring constants (v1.45.0, R6): the prompt's defaults
+# (stiffness 180, damping 14, mass 1). Underdamped (zeta
+# ~0.52), so the motion overshoots ~15% and settles by
+# u~0.7. The same constants drive the Python curve and the
+# FFmpeg expression below, so the two agree.
+_SPRING_K = 180.0
+_SPRING_C = 14.0
+_SPRING_M = 1.0
+_SPRING_W = math.sqrt(_SPRING_K / _SPRING_M)
+_SPRING_ZETA = _SPRING_C / (2.0 * math.sqrt(_SPRING_K * _SPRING_M))
+_SPRING_WD = _SPRING_W * math.sqrt(1.0 - _SPRING_ZETA ** 2)
+_SPRING_ZW = _SPRING_ZETA * _SPRING_W
+
+
+def spring_ease(t, stiffness=180.0, damping=14.0, mass=1.0):
+    """Spring-physics easing (v1.45.0, R6).
+
+    Underdamped harmonic response from rest: f(0)=0, f(1)=1,
+    ~15% overshoot peaking at u~0.27, settled by u~0.7 (with
+    the prompt's defaults k=180, c=14, m=1). The closed form
+    for an underdamped spring released from 0 toward 1:
+    f(u) = 1 - exp(-zeta*w*u) * (cos(wd*u) + (zeta*w/wd) *
+    sin(wd*u)), where w=sqrt(k/m), zeta=c/(2*sqrt(k*m)),
+    wd=w*sqrt(1-zeta^2). u is clamped to [0, 1]; outside it
+    the endpoints hold (the overshoot lives INSIDE [0, 1]).
+    """
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    w = math.sqrt(float(stiffness) / float(mass))
+    zeta = float(damping) / (2.0 * math.sqrt(float(stiffness)
+                                             * float(mass)))
+    if zeta >= 1.0:
+        # Critically/overdamped: no overshoot; fall back to
+        # the smooth exponential approach (never used with
+        # the prompt's defaults, which are underdamped).
+        return 1.0 - math.exp(-w * t) * (1.0 + w * t)
+    wd = w * math.sqrt(1.0 - zeta * zeta)
+    zw = zeta * w
+    return (1.0 - math.exp(-zw * t)
+            * (math.cos(wd * t) + (zw / wd) * math.sin(wd * t)))
+
+
+def cubic_bezier_ease(t, x1=0.25, y1=0.1, x2=0.25, y2=1.0):
+    """CSS cubic-bezier easing (v1.45.0, R6), exact.
+
+    The standard CSS "ease" curve (0.25, 0.1, 0.25, 1.0) by
+    default. Solved exactly by Newton iteration on the
+    x-component (8 iterations, clamped) — the same curve the
+    FFmpeg side approximates with a degree-4 polynomial (see
+    _easing_expr_ffmpeg; the degree-5 fit was REJECTED in R6
+    because it is not monotonic, min derivative -0.347).
+    """
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+
+    def _bx(s):
+        return (3.0 * x1 * (1.0 - s) ** 2 * s
+                + 3.0 * x2 * (1.0 - s) * s * s + s ** 3)
+
+    def _by(s):
+        return (3.0 * y1 * (1.0 - s) ** 2 * s
+                + 3.0 * y2 * (1.0 - s) * s * s + s ** 3)
+
+    def _bxd(s):
+        return (3.0 * x1 * ((1.0 - s) ** 2 - 2.0 * s * (1.0 - s))
+                + 3.0 * x2 * (2.0 * s * (1.0 - s) - s * s)
+                + 3.0 * s * s)
+
+    s = float(t)
+    for _ in range(8):
+        d = _bxd(s)
+        if d == 0.0:
+            break
+        s = max(0.0, min(1.0, s - (_bx(s) - t) / d))
+    return _by(s)
 
 # Raster kinds: elements that produce a transparent video. Counter
 # produces no video (it is a drawtext eif expression); labels and
 # lower-third text are derived drawtext items in render.py.
 RASTER_KINDS = ("shape", "bars", "donut", "pie", "line_chart",
-                "lower_third")
+                "lower_third", "comparison_cards")
 
 MOTION_KINDS = RASTER_KINDS + ("counter",)
 
@@ -65,13 +145,20 @@ def apply_easing(name, u):
 
     Same formulas as render.py `_easing_factor`, plus smoothstep
     (u^2 * (3 - 2u), the gentle default for motion graphics).
-    All are monotonic, so an interpolated value stays between its
-    keyframe endpoints and the keyframe-union bbox is exact.
+    Monotonic easings keep an interpolated value between its
+    keyframe endpoints; spring and ease_out_back OVERSHOOT
+    (spring peaks ~1.146, ease_out_back ~1.088), so the
+    keyframe-union bbox must sample inside segments (see
+    shape_bbox), not just at keyframes.
     """
     if u <= 0.0:
         return 0.0
     if u >= 1.0:
         return 1.0
+    if name == "spring":
+        return spring_ease(u)
+    if name == "cubic_bezier":
+        return cubic_bezier_ease(u)
     if name == "smoothstep":
         return u * u * (3.0 - 2.0 * u)
     if name == "ease_in":
@@ -194,15 +281,30 @@ def shape_vertices(el, state):
 def shape_bbox(el):
     """Keyframe-union bbox (bx, by, bw, bh) in absolute frame coords.
 
-    Sampled at every keyframe (interpolation is monotonic per
-    segment, so extremes land on keyframes). Includes half the
+    Sampled at every keyframe AND at the quarter points of
+    every segment (u = 0, 0.25, 0.5, 0.75, 1.0). The old code
+    sampled keyframes only, which is exact when interpolation
+    is monotonic per segment — but spring (~15% overshoot,
+    peak at u~0.27) and ease_out_back (~9% overshoot) are
+    NOT monotonic, so a shape's extremes can land inside a
+    segment (e.g. a spring scale overshoots past both
+    keyframes). The quarter samples catch the overshoot
+    peak (u~0.27) to within a few percent. Includes half the
     stroke width plus a 2px AA pad.
     """
     kfs = el["keyframes"]
+    _times = set()
+    for kf in kfs:
+        _times.add(float(kf["t"]))
+    for i in range(len(kfs) - 1):
+        _t0 = float(kfs[i]["t"])
+        _t1 = float(kfs[i + 1]["t"])
+        for _u in (0.25, 0.5, 0.75):
+            _times.add(_t0 + (_t1 - _t0) * _u)
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
-    for kf in kfs:
-        st = shape_state(el, float(kf["t"]))
+    for _t in sorted(_times):
+        st = shape_state(el, _t)
         verts = shape_vertices(el, st)
         if el["shape"] == "circle":
             r = float(el["radius"]) * float(st["scale"])
@@ -482,6 +584,9 @@ def element_frame_signature(el, t):
                                      for p in donut_progress(el, t))
     if el["kind"] == "line_chart":
         return ("line_chart", round(line_chart_progress(el, t), 6))
+    if el["kind"] == "comparison_cards":
+        return ("comparison_cards",) + tuple(round(p, 6)
+                                            for p in cards_progress(el, t))
     if el["kind"] == "lower_third":
         left, opacity = lower_third_state(el, t)
         return ("lower_third", round(left, 6), round(opacity, 6))
@@ -500,13 +605,16 @@ def render_element_frame(el, t):
         _draw_donut(canvas, el, t, bx, by)
     elif el["kind"] == "line_chart":
         _draw_line_chart(canvas, el, t, bx, by)
+    elif el["kind"] == "comparison_cards":
+        _draw_cards(canvas, el, t, bx, by)
     elif el["kind"] == "lower_third":
         _draw_lower_third(canvas, el, t, bx, by)
     return canvas.bytes()
 
 
 # ------------------------------------------------------------------
-# Charts: bars, donut/pie, line_chart (v1.43.0, Round 2).
+# Charts: bars, donut/pie, line_chart, comparison_cards
+# (v1.43.0, Round 2; comparison_cards v1.45.0, R4b-1).
 #
 # Charts use a TOP-LEFT anchor (x, y, w, h) — except donut/pie,
 # which use a CENTER (x, y) + radius, since they are radial.
@@ -517,7 +625,10 @@ def render_element_frame(el, t):
 # requires (n-1)*stagger + grow <= 1, so every bar finishes.
 # Labels are NOT rasterized here: render.py derives drawtext
 # items for them (see _motion_derived_texts), so Arabic labels
-# keep the BiDi-verified path.
+# keep the BiDi-verified path. Comparison cards rasterize only
+# the card body (dark glass-tint rounded rect + white border +
+# coloured accent bar); their label and value are derived
+# drawtext, so they stay crisp and Arabic-correct.
 # ------------------------------------------------------------------
 
 def _fmt_value(v):
@@ -533,21 +644,38 @@ def _clamp01(v):
 
 
 def _window_u(el, t):
-    span = float(el["end"]) - float(el["start"])
+    """Window progress 0..1 at time t.
+
+    When `draw` is set (chart kinds only, v1.45.0 R4b-2), the
+    progress runs over the draw duration from the element's
+    start and then holds at 1 — the chart finishes drawing
+    early and stays put for the rest of its window. Every chart
+    progress path (bars, donut, line_chart, comparison_cards)
+    reads through here, so one change covers them all.
+    """
+    start = float(el["start"])
+    draw = el.get("draw")
+    span = float(draw) if draw is not None else float(el["end"]) - start
     if span <= 0:
         return 1.0
-    return _clamp01((float(t) - float(el["start"])) / span)
+    return _clamp01((float(t) - start) / span)
 
 
 def _staggered_progress(el, t, count):
-    """Per-item growth 0..1 at time t (smoothstep-eased stagger)."""
+    """Per-item growth 0..1 at time t (spring-eased stagger).
+
+    The growth easing is the element's `easing` (spring by
+    default since v1.45.0, R6 — the bars/donut segments grow
+    with a spring overshoot); an explicit easing wins.
+    """
     u = _window_u(el, t)
     stagger = float(el.get("stagger", 0.12))
     grow = float(el.get("grow", 0.5))
+    easing = el.get("easing", "spring")
     out = []
     for i in range(count):
         p = (u - i * stagger) / grow if grow > 0 else 1.0
-        out.append(apply_easing("smoothstep", _clamp01(p)))
+        out.append(apply_easing(easing, _clamp01(p)))
     return out
 
 
@@ -753,6 +881,94 @@ def _draw_line_chart(canvas, el, t, ox, oy):
     canvas.fill_circle(frontier[0], frontier[1], 7.0, head_color, 1.0)
 
 
+def _rounded_rect_points(x0, y0, w, h, r, steps=6):
+    """Polygon points for a rounded rect (screen coords, y down).
+
+    Corners are arcs (clockwise): top-right -90..0, bottom-right
+    0..90, bottom-left 90..180, top-left 180..270. Straight edges
+    are implied between consecutive arc endpoints.
+    """
+    r = max(0.0, min(float(r), w / 2.0, h / 2.0))
+    pts = [(x0 + r, y0)]
+    pts += _arc_points(x0 + w - r, y0 + r, r, -90, 0, steps)
+    pts += _arc_points(x0 + w - r, y0 + h - r, r, 0, 90, steps)
+    pts += _arc_points(x0 + r, y0 + h - r, r, 90, 180, steps)
+    pts += _arc_points(x0 + r, y0 + r, r, 180, 270, steps)
+    return pts
+
+
+def cards_layout(el):
+    """Per-card geometry (absolute coords) + label/value/color.
+
+    Cards sit in a row inside (x, y, w, h); card_gap is a
+    fraction of the chart width between neighbours.
+    """
+    cards = el["cards"]
+    n = len(cards)
+    x = float(el["x"])
+    y = float(el["y"])
+    w = float(el["w"])
+    h = float(el["h"])
+    gap = float(el.get("card_gap", 0.04)) * w
+    cw = (w - (n - 1) * gap) / n
+    colors = el.get("colors") or [(250, 204, 21)]
+    # Raw (unvalidated) elements carry colour names/hex strings;
+    # validated ones carry resolved RGB tuples. Normalise here so
+    # both paths (rasterizer and derived texts) draw the same.
+    norm = []
+    for c in colors:
+        if isinstance(c, str):
+            rc = resolve_color(c)
+            norm.append(rc if rc is not None else (250, 204, 21))
+        else:
+            norm.append(tuple(c))
+    colors = norm
+    out = []
+    for i, c in enumerate(cards):
+        x0 = x + i * (cw + gap)
+        out.append({"x0": x0, "y0": y, "w": cw, "h": h,
+                    "cx": x0 + cw / 2.0, "cy": y + h / 2.0,
+                    "color": colors[i % len(colors)],
+                    "label": c["label"], "value": c.get("value")})
+    return out
+
+
+def cards_progress(el, t):
+    """Per-card growth 0..1 at time t (staggered, like bars)."""
+    return _staggered_progress(el, t, len(el["cards"]))
+
+
+def _draw_cards(canvas, el, t, ox, oy):
+    """Comparison cards popping in with stagger.
+
+    The card body is a dark glass-tint rounded rect (the R7
+    backdrop-blur tint, rgba(15, 23, 42, 0.68)) with a white
+    hairline border and a coloured accent bar near the top.
+    Labels and values are derived drawtext in render.py, so they
+    stay crisp and Arabic-correct; they appear when the card
+    finishes growing (p == 1), so the drawn card is always at
+    full size underneath them.
+    """
+    for card, p in zip(cards_layout(el), cards_progress(el, t)):
+        if p <= 0.0:
+            continue
+        # Pop-in: scale 0.85 -> 1.0 around the card centre.
+        s = 0.85 + 0.15 * p
+        w2 = card["w"] * s
+        h2 = card["h"] * s
+        x0 = card["cx"] - w2 / 2.0 - ox
+        y0 = card["cy"] - h2 / 2.0 - oy
+        r = min(20.0, w2 / 2.0, h2 / 2.0)
+        pts = _rounded_rect_points(x0, y0, w2, h2, r)
+        canvas.fill_polygon(pts, (15, 23, 42), 0.68 * p)
+        canvas.stroke_polyline(pts + [pts[0]], (255, 255, 255),
+                               1.5, 0.22 * p)
+        # Coloured accent bar near the top of the card.
+        aw = max(1.0, w2 - 20.0)
+        apts = _rounded_rect_points(x0 + 10.0, y0 + 10.0, aw, 6.0, 3.0)
+        canvas.fill_polygon(apts, card["color"], p)
+
+
 # ------------------------------------------------------------------
 # Counter and lower_third (v1.43.0, Round 3).
 #
@@ -801,7 +1017,32 @@ def _contains_arabic(text):
 
 def _easing_expr_ffmpeg(name, u):
     """FFmpeg eval expression for an easing of u (u is an
-    expression string evaluating to 0..1)."""
+    expression string evaluating to 0..1).
+
+    spring: the closed-form underdamped response with the
+    prompt's constants (k=180, c=14, m=1; zw=7.0, wd=11.4477,
+    zw/wd=0.6114) — FFmpeg's exp/cos/sin evaluate it per
+    frame, exactly as spring_ease does in Python.
+    cubic_bezier: the CSS-ease (0.25, 0.1, 0.25, 1.0) curve
+    as a degree-4 polynomial fit, CLAMPED to [0, 1]. The
+    degree-5 fit was rejected (not monotonic, min derivative
+    -0.347); the degree-4 fit IS monotonic (min derivative
+    +0.11) with max error 0.022, and clamping fixes its
+    endpoint overshoot (poly(0)=-0.027, poly(1)=1.021).
+    """
+    if name == "spring":
+        # R12 fix: clamp u to [0,1] (same as render.py's
+        # _easing_factor — see the comment there). Without
+        # the clamp, exp(-7*u) overflows for negative u
+        # (t < the element's start), which failed a render
+        # with "fontsize overflow" for a late pop_in.
+        _uc = f"(min(max({u},0),1))"
+        return (f"(1-exp(-7*{_uc})*(cos(11.4477*{_uc})"
+                f"+0.6114*sin(11.4477*{_uc})))")
+    if name == "cubic_bezier":
+        _p = (f"(4.214797*pow({u},4)-8.825972*pow({u},3)"
+              f"+4.624145*pow({u},2)+1.034968*({u})-0.02652)")
+        return f"(min(max({_p},0),1))"
     if name == "smoothstep":
         return f"({u})*({u})*(3-2*({u}))"
     if name == "ease_in":
@@ -876,8 +1117,12 @@ def lower_third_state(el, t):
     """(left, opacity) of the lower-third card at absolute time t.
 
     The card slides in from fully off-screen left (left = -w)
-    over `enter` seconds with a linear fade, holds at (x, 1),
-    then slides back out over `exit` seconds with a linear fade.
+    over `enter` seconds with a SPRING entrance (v1.45.0, R6
+    — the default; it overshoots ~15% past its rest position
+    and settles), holds at (x, 1), then slides back out over
+    `exit` seconds with a linear fade. The opacity follows
+    the spring too (clamped to [0, 1], since the spring
+    overshoots above 1).
     """
     start = float(el["start"])
     end = float(el["end"])
@@ -890,7 +1135,8 @@ def lower_third_state(el, t):
         return (off, 0.0)
     if enter > 0 and t < start + enter:
         u = (t - start) / enter
-        return (off + (x - off) * u, u)
+        s = spring_ease(u)
+        return (off + (x - off) * s, min(1.0, max(0.0, s)))
     if exit_ <= 0 or t <= end - exit_:
         return (x, 1.0)
     u = (t - (end - exit_)) / exit_
@@ -900,8 +1146,11 @@ def lower_third_state(el, t):
 def lower_third_bbox(el):
     """Union bbox of the lower-third card over its window.
 
-    From fully off-screen left (left = -w) to the rest position
-    (left = x); a 2px pad for the polygon edge AA.
+    From fully off-screen left (left = -w) to the rest
+    position (left = x), PLUS the spring-entrance overshoot:
+    the card slides ~15% past its rest position (peak 1.146),
+    so the right edge extends 0.15*(x+w) past x+w. A 2px pad
+    for the polygon edge AA.
     """
     x = float(el["x"])
     y = float(el["y"])
@@ -909,7 +1158,7 @@ def lower_third_bbox(el):
     h = float(el["h"])
     bx = int(math.floor(-w)) - 2
     by = int(math.floor(y)) - 2
-    bw = int(math.ceil(x + w)) - bx
+    bw = int(math.ceil(x + w + 0.15 * (x + w))) - bx
     bh = int(math.ceil(y + h)) - by
     return (bx, by, max(1, bw), max(1, bh))
 
@@ -928,6 +1177,23 @@ def _draw_lower_third(canvas, el, t, ox, oy):
     alpha = opacity * float(el.get("card_opacity", 0.75))
     canvas.fill_polygon(_rounded_rect_points(x, y, w, h, r), color,
                         alpha)
+    # Accent bar (v1.45.0, R4c-4, Defect 4): an optional
+    # vertical bar on the card edge — left for Latin text,
+    # right for Arabic (the reading edge). 6px wide, inset
+    # 8px from the top/bottom so it stays inside the card's
+    # rounded corners. It fades with the card's slide
+    # (opacity) but is solid within it, so it reads as a
+    # vivid edge. Absent when accent_color is not set.
+    _accent = el.get("accent_color")
+    if _accent is not None:
+        _bw = 6.0
+        _bh = max(1.0, h - 16.0)
+        if _contains_arabic(el.get("text", "")):
+            _bx = x + w - 8.0 - _bw
+        else:
+            _bx = x + 8.0
+        _bpts = _rounded_rect_points(_bx, y + 8.0, _bw, _bh, 3.0)
+        canvas.fill_polygon(_bpts, _accent, opacity)
 
 
 def encode_motion_video(el, fps, out_path):

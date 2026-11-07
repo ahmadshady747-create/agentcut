@@ -151,6 +151,28 @@ def _ink_groups(ink, min_gap=3):
     return out
 
 
+def _ink_y_rows(ink, min_count=20, min_gap=4):
+    """Group an ink mask into top-to-bottom text rows: a row
+    counts only if it holds >= min_count ink pixels (the board
+    image carries ~4 bright noise pixels per row, which would
+    otherwise merge every row into one group). Returns a list
+    of (y0, y1) with absolute y, gaps of <= min_gap merged."""
+    if not ink:
+        return []
+    rows = {}
+    for (_x, y) in ink:
+        rows[y] = rows.get(y, 0) + 1
+    groups = []
+    for y in sorted(rows):
+        if rows[y] < min_count:
+            continue
+        if groups and y - groups[-1][1] <= min_gap:
+            groups[-1][1] = y
+        else:
+            groups.append([y, y])
+    return [(a, b) for a, b in groups]
+
+
 def _best_template_iou(template, frame_ink, x0=90, x1=270):
     """Slide a template mask (relative coords) across a frame
     ink mask in x; return (best IoU, best x0)."""
@@ -1450,7 +1472,7 @@ class TestAgentCut(unittest.TestCase):
     def test_arabic_text_renders(self):
         # Visual shaping was verified by eye on a frame (joined
         # letters, correct RTL order) with this FFmpeg build
-        # (libfribidi + libharfbuzz) and Noto Naskh Arabic; this
+        # (libfribidi + libharfbuzz) and Noto Sans Arabic Bold; this
         # test pins the render path so it cannot silently regress
         # to missing glyphs or a failed render.
         proj = {"id": "arabic-smoke", "version": 1,
@@ -1728,8 +1750,13 @@ class TestAgentCut(unittest.TestCase):
         out = os.path.join(BASE, "data", "test_slide.mp4")
         ok, info = render_project(proj, out)
         self.assertTrue(ok, info)
-        self.assertGreater(white_strip(out, 0.2, 0, 120), 100)
-        self.assertEqual(white_strip(out, 0.2, 120, 120), 0)
+        # Spring entrance (v1.45.0, R6): the text reaches rest
+        # by u~0.27, so the "still at the left" sample moves
+        # from t=0.2 to t=0.05 (u=0.05, spring ~0.17 — the text
+        # is at the left, 896 white px in the left strip and 0
+        # in the centre strip; by t=0.2 it is already centred).
+        self.assertGreater(white_strip(out, 0.05, 0, 120), 100)
+        self.assertEqual(white_strip(out, 0.05, 120, 120), 0)
         self.assertGreater(white_strip(out, 2.0, 120, 120), 500)
         # Pop: small early, full size late.
         proj = dict(base); proj["id"] = "r7-pop"
@@ -2559,13 +2586,13 @@ class TestAgentCut(unittest.TestCase):
         import tempfile
         import agentcut.validate as val
         env_dir = tempfile.mkdtemp(prefix="agentcut-fontenv-")
-        shutil.copy(os.path.join(BASE, "fonts", "NotoNaskhArabic-Regular.ttf"),
-                    os.path.join(env_dir, "NotoNaskhArabic-Regular.ttf"))
+        shutil.copy(os.path.join(BASE, "fonts", "NotoSansArabic-Bold.ttf"),
+                    os.path.join(env_dir, "NotoSansArabic-Bold.ttf"))
         old = os.environ.get("AGENTCUT_FONT_DIR")
         try:
             os.environ["AGENTCUT_FONT_DIR"] = env_dir
             self.assertEqual(val.find_font_for_text("مرحبا"),
-                             os.path.join(env_dir, "NotoNaskhArabic-Regular.ttf"))
+                             os.path.join(env_dir, "NotoSansArabic-Bold.ttf"))
         finally:
             if old is None:
                 os.environ.pop("AGENTCUT_FONT_DIR", None)
@@ -3483,7 +3510,7 @@ class TestAgentCut(unittest.TestCase):
             y1, x1, n1 = _yellow_stats(out, 1.0)
             y2, x2, n2 = _yellow_stats(out, 2.0)
             # v1.41.0 Fix 2 calibration: libass rasterizes the
-            # same small word (هذا, 3 thin Naskh letters at
+            # same small word (هذا, 3 thin Sans letters at
             # size 40) with fewer strict-threshold yellow pixels
             # than drawtext did (measured: 47/32 strict, 93/130
             # pale-yellow, baseline 0 with no caption). The
@@ -3790,44 +3817,109 @@ class TestAgentCut(unittest.TestCase):
             n += 1
         self.assertEqual(n, 60)
         self.assertEqual(last, full)
-        # Template hand order: chart axes first, faint grid
-        # (small weights) in the middle, yellow tip last.
-        _cw, _ch, cstrokes = build_template("chart", {"values": [10, 12, 14, 18]})
-        self.assertEqual(cstrokes[0]["kind"], "arrow")
-        self.assertEqual(cstrokes[0]["color"], "white")
-        self.assertEqual(cstrokes[-1]["kind"], "arrow")
-        self.assertEqual(cstrokes[-1]["color"], "yellow")
-        self.assertEqual([s.get("weight") for s in cstrokes[2:5]], [50, 50, 50])
+        # v1.45.0, R4b-3: the chart template no longer builds
+        # strokes — it adapts to a line_chart motion element, and
+        # build_template raises for it (the stroke-animator part
+        # above still covers custom strokes).
+        from agentcut.diagrams import build_template as _bt
+        with self.assertRaises(ValueError):
+            _bt("chart", {"values": [10, 12, 14, 18]})
+        p = {"id": "d", "version": 1,
+             "output": {"width": 360, "height": 640, "fps": 30},
+             "clips": [{"id": "a", "kind": "image",
+                        "src": "data/test_red.png", "duration": 6}],
+             "diagrams": [{"id": "c1", "start": 0, "end": 6,
+                           "template": "chart",
+                           "params": {"values": [10, 12, 14, 18]},
+                           "size": 0.8, "x": 36, "y": 100}]}
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["motion"][0]["kind"], "line_chart")
+        self.assertEqual(info["motion"][0]["values"],
+                         [10.0, 12.0, 14.0, 18.0])
+        self.assertTrue(info["diagrams"][0]["adapted_to_motion"])
 
     def test_loop138_templates_geometry(self):
         # 1.38.0: templates are parameterized geometry, not
-        # pictures — values/counts change the strokes in the
-        # expected direction, and nothing is baked text.
-        from agentcut.diagrams import build_template
-        _w, _h, rising = build_template("chart", {"values": [10, 20, 30]})
-        curve = [s for s in rising if s["kind"] == "polyline"][-1]
-        self.assertLess(curve["points"][-1][1], curve["points"][0][1])
-        _w, _h, flat = build_template("chart", {"values": [10, 10, 10]})
-        fcurve = [s for s in flat if s["kind"] == "polyline"][-1]
-        self.assertEqual(fcurve["points"][0][1], fcurve["points"][-1][1])
-        _w, _h, b1 = build_template("basket", {"coins": 1})
-        _w, _h, b5 = build_template("basket", {"coins": 5})
-        self.assertEqual(len([s for s in b1 if s["kind"] == "circle"]), 2)
-        self.assertEqual(len([s for s in b5 if s["kind"] == "circle"]), 10)
-        _w, _h, heavy_left = build_template("balance", {"left": 5, "right": 1})
-        _w, _h, heavy_right = build_template("balance", {"left": 1, "right": 5})
-        _w, _h, level = build_template("balance", {"left": 3, "right": 3})
-        beam_l = [s for s in heavy_left if s["kind"] == "polyline"][4]
-        beam_r = [s for s in heavy_right if s["kind"] == "polyline"][4]
-        beam_0 = [s for s in level if s["kind"] == "polyline"][4]
-        # Canvas y grows downward: the heavier side sits lower.
-        self.assertGreater(beam_l["points"][0][1], beam_l["points"][1][1])
-        self.assertLess(beam_r["points"][0][1], beam_r["points"][1][1])
-        self.assertEqual(beam_0["points"][0][1], beam_0["points"][1][1])
-        _w, _h, c2 = build_template("causes", {"rows": 2})
-        _w, _h, c3 = build_template("causes", {"rows": 3})
-        self.assertEqual(len(c2), 6)
-        self.assertEqual(len(c3), 11)
+        # pictures — values/counts change the art in the expected
+        # direction, and nothing is baked text. v1.45.0, R4b-3:
+        # the four legacy templates are motion adapters now, so
+        # the geometry is asserted on the ADAPTED motion element
+        # (line_chart / bars / comparison_cards) at the diagram's
+        # display rect — not on chalk strokes, which are gone.
+        from agentcut.motion import line_chart_points
+
+        def _adapt(template, params, **kw):
+            dg = {"id": "c1", "start": 0, "end": 6,
+                  "template": template, "params": params,
+                  "size": 0.8, "x": 36, "y": 100}
+            dg.update(kw)
+            p = {"id": "d", "version": 1,
+                 "output": {"width": 360, "height": 640, "fps": 30},
+                 "clips": [{"id": "a", "kind": "image",
+                            "src": "data/test_red.png", "duration": 6}],
+                 "diagrams": [dg]}
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            return info
+
+        # chart -> line_chart: rising values rise (canvas y
+        # grows downward, so the last point has the smaller y);
+        # flat values are flat.
+        rising = _adapt("chart", {"values": [10, 20, 30]})
+        self.assertEqual(rising["motion"][0]["kind"], "line_chart")
+        pts = line_chart_points(rising["motion"][0])
+        self.assertLess(pts[-1][1], pts[0][1])
+        flat = _adapt("chart", {"values": [10, 10, 10]})
+        fpts = line_chart_points(flat["motion"][0])
+        self.assertEqual(fpts[0][1], fpts[-1][1])
+        # Display rect: size 0.8 of a 360px frame -> w 288,
+        # chart aspect 900x560 -> h 178 (even).
+        self.assertEqual(rising["motion"][0]["x"], 36)
+        self.assertEqual(rising["motion"][0]["y"], 100)
+        self.assertEqual(rising["motion"][0]["w"], 288)
+        self.assertEqual(rising["motion"][0]["h"], 178)
+        # basket -> bars: one unit bar per coin, labelled 1..n.
+        # A single coin is a circle, not a chart (motion bars
+        # needs >= 2 values): it adapts to a static white shape
+        # circle centred in the diagram rect.
+        b1 = _adapt("basket", {"coins": 1})
+        b5 = _adapt("basket", {"coins": 5})
+        self.assertEqual(b1["motion"][0]["kind"], "shape")
+        self.assertEqual(b1["motion"][0]["shape"], "circle")
+        # resolve_color("white") is the off-white (246,246,238).
+        self.assertEqual(b1["motion"][0]["fill"], (246, 246, 238))
+        self.assertEqual(b5["motion"][0]["kind"], "bars")
+        self.assertEqual(b5["motion"][0]["values"], [1.0] * 5)
+        self.assertEqual(b5["motion"][0]["labels"],
+                         ["1", "2", "3", "4", "5"])
+        # balance -> comparison_cards: the two values ride on
+        # the left/right cards.
+        heavy_left = _adapt("balance", {"left": 5, "right": 1})
+        heavy_right = _adapt("balance", {"left": 1, "right": 5})
+        level = _adapt("balance", {"left": 3, "right": 3})
+        for info in (heavy_left, heavy_right, level):
+            self.assertEqual(info["motion"][0]["kind"],
+                             "comparison_cards")
+        self.assertEqual(
+            [(c["label"], c["value"])
+             for c in heavy_left["motion"][0]["cards"]],
+            [("left", 5.0), ("right", 1.0)])
+        self.assertEqual(
+            [(c["label"], c["value"])
+             for c in heavy_right["motion"][0]["cards"]],
+            [("left", 1.0), ("right", 5.0)])
+        self.assertEqual(
+            [(c["label"], c["value"])
+             for c in level["motion"][0]["cards"]],
+            [("left", 3.0), ("right", 3.0)])
+        # causes -> comparison_cards: one card per row.
+        c2 = _adapt("causes", {"rows": 2})
+        c3 = _adapt("causes", {"rows": 3})
+        self.assertEqual(len(c2["motion"][0]["cards"]), 2)
+        self.assertEqual(len(c3["motion"][0]["cards"]), 3)
+        self.assertEqual([c["label"] for c in
+                          c3["motion"][0]["cards"]], ["1", "2", "3"])
 
     def test_loop138_diagram_validation(self):
         # 1.38.0: diagram schema errors are structured with fix
@@ -4100,11 +4192,31 @@ class TestAgentCut(unittest.TestCase):
                 [(c["tags"]["title"], float(c["start_time"]))
                  for c in probe["chapters"]],
                 [("ما هي؟", 0.0), ("كيف تكشفها؟", 4.0)])
-            # Diagram: dim at draw start, bright once drawn.
-            early = _crop_mean(out, 0.3, 101, 330, 518, 265)
+            # Diagram (v1.45.0, R4b-3): the causes template is
+            # comparison_cards now — the dark card bodies DARKEN
+            # the region once drawn (the old chalk strokes
+            # brightened it), and the yellow accent bar on card 0
+            # is the positive proof the cards are there. Card 0
+            # centre x = 101 + 518/4 = 225 (two cards in a 518px
+            # row); its accent bar is at y = 330 + 13.
+            # (v1.45.0, R7: the glass card darkens the region
+            # from t=0, so the old early-vs-done comparison no
+            # longer separates — the region is already dark at
+            # t=0.3. The valid comparison is against the bare
+            # board beside/below the diagram, ~11 darker.)
             done = _crop_mean(out, 3.9, 101, 330, 518, 265)
-            self.assertGreater(sum(done) / 3, sum(early) / 3 + 5,
-                               (early, done))
+            board_l = _crop_mean(out, 3.9, 10, 330, 80, 265)
+            board_r = _crop_mean(out, 3.9, 630, 330, 80, 265)
+            self.assertLess(sum(done) / 3,
+                            sum(board_l) / 3 - 5, (done, board_l))
+            self.assertLess(sum(done) / 3,
+                            sum(board_r) / 3 - 5, (done, board_r))
+            _frame_png(out, 3.9, os.path.join(tmp, "cards.png"))
+            _w, _h, cpx = _png_px(os.path.join(tmp, "cards.png"))
+            r, g, b = cpx(225, 343)[:3]
+            self.assertGreater(r, 200, (r, g, b))
+            self.assertGreater(g, 150, (r, g, b))
+            self.assertLess(b, 100, (r, g, b))
             # Title (top band) and caption (bottom band) both
             # leave near-white pixels on the dark board.
             frame = os.path.join(tmp, "f.png")
@@ -4155,10 +4267,13 @@ class TestAgentCut(unittest.TestCase):
             out = os.path.join(tmp, "t.mp4")
             ok, info = produce_explainer(brief, out)
             self.assertTrue(ok, info)
+            # v1.45.0, R4b-3: the causes cards darken the
+            # region (see the end-to-end note above) — the old
+            # chalk strokes brightened it.
             before = _crop_mean(out, 1.5, 101, 330, 518, 265)
             inside = _crop_mean(out, 6.9, 101, 330, 518, 265)
-            self.assertGreater(sum(inside) / 3, sum(before) / 3 + 5,
-                               (before, inside))
+            self.assertLess(sum(inside) / 3, sum(before) / 3 - 3,
+                            (before, inside))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -4313,17 +4428,28 @@ class TestRefactoring(unittest.TestCase):
                               capture_output=True).stdout
 
     # ---- Task 1: diagrams ----
-    def test_refactor_stamp_mask_cache_and_idempotent_restamp(self):
-        from agentcut.diagrams import Canvas, _stamp_mask
-        m1 = _stamp_mask(3.5, 0.25, 0.75)
-        m2 = _stamp_mask(3.5, 0.25, 0.75)
-        self.assertIs(m1, m2)
-        c = Canvas(40, 40)
-        c.stamp(20.25, 20.75, 3.5, (255, 255, 255), 0.9, 7)
-        first = c.bytes()
-        self.assertGreater(sum(1 for i in range(3, len(first), 4) if first[i] > 0), 0)
-        c.stamp(20.25, 20.75, 3.5, (255, 255, 255), 0.9, 7)
-        self.assertEqual(c.bytes(), first)
+    def test_refactor_segments_deterministic_and_idempotent(self):
+        # v1.45.0, R4a: Canvas.stamp / draw_points / _stamp_mask
+        # are deleted with the chalk discs; the SDF engine
+        # (draw_segments) is deterministic and idempotent in
+        # their place — the same segments twice give identical
+        # bytes, and re-drawing a segment changes nothing.
+        from agentcut.diagrams import Canvas, stroke_to_points
+        # draw_segments expects densely sampled points (as
+        # stroke_to_points produces, ~width/3 px apart); a
+        # sparse jump over 15px is a barb jump and is skipped
+        # by design, so sparse points would draw nothing.
+        pts, _c, _w, _a = stroke_to_points(
+            {"kind": "line", "points": [[10, 10], [100, 10]],
+             "color": "white", "width": 7})
+        c1, c2 = Canvas(200, 200), Canvas(200, 200)
+        c1.draw_segments(pts, (255, 255, 255), 7, 0.95)
+        c2.draw_segments(pts, (255, 255, 255), 7, 0.95)
+        self.assertEqual(c1.bytes(), c2.bytes())
+        first = c1.bytes()
+        c1.draw_segments(pts, (255, 255, 255), 7, 0.95)
+        self.assertEqual(c1.bytes(), first)
+        self.assertGreater(c1.opaque_pixel_count(), 0)
 
     def test_refactor_primitives_template_and_line_kind(self):
         from agentcut.diagrams import build_template, stroke_to_points
@@ -4805,16 +4931,18 @@ class TestDelta(unittest.TestCase):
              "start_angle": 0, "end_angle": 90})
         # 0 degrees is east, positive is clockwise on screen
         # (y grows down): 0 -> 90 runs east -> south.
-        self.assertAlmostEqual(pts[0][0], 150, delta=3)
-        self.assertAlmostEqual(pts[0][1], 100, delta=3)
-        self.assertAlmostEqual(pts[-1][0], 100, delta=3)
-        self.assertAlmostEqual(pts[-1][1], 150, delta=3)
+        # v1.45.0, R4a: the deltas are tight (0.5) because the
+        # wobble is gone — the points are the exact arc.
+        self.assertAlmostEqual(pts[0][0], 150, delta=0.5)
+        self.assertAlmostEqual(pts[0][1], 100, delta=0.5)
+        self.assertAlmostEqual(pts[-1][0], 100, delta=0.5)
+        self.assertAlmostEqual(pts[-1][1], 150, delta=0.5)
         # A zero sweep means a full circle, closing on itself.
         full, _c, _w, _a = stroke_to_points(
             {"kind": "arc", "center": [100, 100], "radius": 50,
              "start_angle": 0, "end_angle": 0})
-        self.assertAlmostEqual(full[-1][0], full[0][0], delta=3)
-        self.assertAlmostEqual(full[-1][1], full[0][1], delta=3)
+        self.assertAlmostEqual(full[-1][0], full[0][0], delta=0.5)
+        self.assertAlmostEqual(full[-1][1], full[0][1], delta=0.5)
         self.assertGreater(len(full), len(pts))
 
     def test_delta_arc_validation(self):
@@ -4832,35 +4960,38 @@ class TestDelta(unittest.TestCase):
         errors, _info = validate_project(p)
         self.assertNotEqual(errors, [])
 
-    # ---- Axis 2: stamp feathering + eased strokes ----
-    def test_delta_stamp_feathering_is_smoothstep(self):
-        import math
-        from agentcut.diagrams import _stamp_mask
-        mask = _stamp_mask(7, 0.0, 0.0)
-        band = False
-        differs_from_linear = False
-        for xx, yy, edge in mask:
-            d = math.hypot(xx, yy)
-            u = 1.0 if d <= 6 else max(0.0, (8 - d) / 2)
-            self.assertAlmostEqual(edge, u * u * (3 - 2 * u), places=9)
-            if 0 < edge < 1:
-                band = True
-                if abs(edge - u) > 0.05:
-                    differs_from_linear = True
-        self.assertTrue(band, "feather band must exist")
-        self.assertTrue(differs_from_linear,
-                        "falloff must be smoothstep, not linear")
+    # ---- Axis 2: clean vector strokes (v1.45.0, R4a) ----
+    def test_delta_stroke_points_are_clean_vectors(self):
+        # The wobble is deleted: a horizontal line's points lie
+        # exactly on y=0 (before, the wobble offset them by up
+        # to ~1.2px perpendicular to the path).
+        from agentcut.diagrams import stroke_to_points
+        pts, _c, _w, _a = stroke_to_points(
+            {"kind": "line", "points": [[0, 0], [400, 0]],
+             "color": "white", "width": 7})
+        self.assertGreater(len(pts), 10)
+        for x, y in pts:
+            self.assertAlmostEqual(y, 0.0, places=6)
 
-    def test_delta_stamp_idempotent_and_animator_eased(self):
+    def test_delta_segments_idempotent_and_animator_eased(self):
+        # v1.45.0, R4a: draw_points is deleted with the stamp
+        # path; the idempotence check now uses draw_segments.
         from agentcut.diagrams import (Canvas, DiagramAnimator,
-                                       render_diagram_rgba)
+                                       render_diagram_rgba,
+                                       stroke_to_points)
         strokes = [{"kind": "line", "points": [[0, 0], [400, 0]],
                     "width": 7}]
+        # Dense points (stroke_to_points), not a sparse pair:
+        # a jump over 15px is a barb jump and is skipped.
+        pts, _c, _w, _a = stroke_to_points(
+            {"kind": "line", "points": [[100, 100], [200, 100]],
+             "color": "white", "width": 7})
         c1, c2 = Canvas(900, 560), Canvas(900, 560)
-        c1.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
-        c2.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
-        c2.draw_points([(100, 100)], (255, 255, 255), 7, 0.95, 0)
+        c1.draw_segments(pts, (255, 255, 255), 7, 0.95)
+        c2.draw_segments(pts, (255, 255, 255), 7, 0.95)
+        c2.draw_segments(pts, (255, 255, 255), 7, 0.95)
         self.assertEqual(c1.bytes(), c2.bytes())
+        self.assertGreater(c1.opaque_pixel_count(), 0)
         anim = DiagramAnimator(strokes, 900, 560, 10, 1.0)
         total = len(anim.prepared[0][0])
         fracs = []
@@ -5977,28 +6108,42 @@ class TestLoop141(unittest.TestCase):
     """Life & Typography package (1.41.0), round 1: kinetic ink
     measurement + chunk fit."""
 
-    def test_measure_arabic_word_ink_returns_true_width(self):
-        from agentcut.render import _measure_word_ink, find_font_for_text
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            w = _measure_word_ink("المتنافسون",
-                                  find_font_for_text("المتنافسون"),
-                                  60, td, {})
-        self.assertIsNotNone(w, "measurement must not fall back")
-        # Ground truth from a stdlib PNG decode is 227px; the
-        # fixed cropdetect call measures 224.
-        self.assertGreaterEqual(w, 200)
-        self.assertLessEqual(w, 240)
+    def test_measure_text_width_harfbuzz(self):
+        # v1.45.0, R2: _measure_word_ink (cropdetect subprocesses)
+        # is deleted; _measure_text_width shapes in-process with
+        # HarfBuzz. Probed against cropdetect ink on 12 words
+        # (sizes 48-60): the shaped width is always >= the ink
+        # width (ratio 1.020-1.208), so a bar sized by it always
+        # covers its text.
+        from agentcut.render import _measure_text_width, find_font_for_text
+        font = find_font_for_text("المتنافسون")
+        cache = {}
+        w = _measure_text_width("المتنافسون", font, 60, cache)
+        # Probe value 305.64 with the 1.45.0 default font (Noto
+        # Sans Arabic Bold; the R2 probe value 234.3 was Noto
+        # Naskh Regular, replaced as the default in R4c-1). The
+        # window allows a HarfBuzz-version drift but not the old
+        # 0.6*size fallback (360) or a garbage struct read.
+        self.assertGreaterEqual(w, 290)
+        self.assertLessEqual(w, 320)
+        w2 = _measure_text_width("Hello World", font, 60, cache)
+        self.assertGreaterEqual(w2, 360)
+        self.assertLessEqual(w2, 390)
+        # Cache: a repeat call for the same key reuses the entry.
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(_measure_text_width("المتنافسون", font, 60,
+                                            cache), w)
+        self.assertEqual(len(cache), 2)
+        # Fallback: a missing font file returns the 0.6 estimate.
+        self.assertEqual(_measure_text_width(
+            "Hello", "/nonexistent/font.ttf", 60, {}), 180.0)
 
-    def test_fit_chunk_widths(self):
-        from agentcut.render import _fit_chunk_widths
-        ws, sp, sc = _fit_chunk_widths([100.0, 120.0], 18.0, 720)
-        self.assertEqual(sc, 1.0)
-        self.assertEqual((ws, sp), ([100.0, 120.0], 18.0))
-        ws, sp, sc = _fit_chunk_widths([400.0, 400.0], 18.0, 720)
-        self.assertLess(sc, 1.0)
-        self.assertAlmostEqual(sum(ws) + sp, 700.0, places=6)
-        self.assertAlmostEqual(ws[0] / ws[1], 1.0, places=6)
+    # test_fit_chunk_widths was deleted in v1.45.0, R2 with its
+    # function: the chunk-fit clamp was defence in depth for the
+    # cropdetect measurement, and kinetic chunks now centre by
+    # libass font advances (1.41.0 Fix 2). The end-to-end fit
+    # behaviour is still covered by
+    # test_kinetic_arabic_title_fits_frame below.
 
     def test_kinetic_arabic_title_fits_frame(self):
         # The Step-0 defect: the 4-word scene-8 title at size 60
@@ -6340,36 +6485,16 @@ class TestLoop141(unittest.TestCase):
             self.assertTrue(errors)
 
 
-    def test_chart_grid_points_and_fill(self):
-        from agentcut.diagrams import chart_grid_points, template_chart
-        # Default gridlines unchanged (backward compatibility).
-        g = chart_grid_points({"values": [10, 12, 14, 18]})
-        self.assertEqual(g["grid_ys"], [160, 260, 360])
-        self.assertEqual(g["plot"], {"x0": 140, "x1": 830, "y0": 60,
-                                     "y1": 470, "baseline": 500})
-        self.assertEqual(len(g["curve_points"]), 4)
-        # Custom grid values map through the same normalization
-        # as the curve: value 14 sits exactly on curve point 3.
-        g2 = chart_grid_points({"values": [10, 12, 14, 18],
-                                "y_grid_values": [10, 14, 18]})
-        self.assertAlmostEqual(g2["grid_ys"][1],
-                               g2["curve_points"][2][1], delta=1.0)
-        # Fill: ~50 translucent yellow verticals, all before
-        # the white curve stroke; no-fill template unchanged.
-        _, _, st = template_chart({"values": [10, 12, 14, 18],
-                                   "fill": True,
-                                   "y_grid_values": [10, 14, 18]})
-        fills = [s for s in st if s.get("color") == "yellow"
-                 and s.get("weight") == 5]
-        self.assertGreater(len(fills), 40)
-        curve_i = next(i for i, s in enumerate(st)
-                       if s.get("kind") == "polyline"
-                       and s.get("color") == "white"
-                       and s.get("width") == 9)
-        self.assertTrue(all(st.index(f) < curve_i for f in fills))
-        _, _, st0 = template_chart({"values": [10, 12, 14, 18]})
-        self.assertEqual(len(st0), 7)
-        # Validation of the new params.
+    def test_chart_adapter_params(self):
+        # v1.45.0, R4b-3: chart_grid_points and the chalk chart
+        # builder are gone — the chart template is a motion
+        # adapter now. Its params (fill, y_grid_values) are still
+        # ACCEPTED for backward compatibility, but they no longer
+        # build geometry: fill is dropped (the motion line_chart
+        # has no area fill) and y_grid_values no longer anchors
+        # gridlines (the motion grid is positional). The adapted
+        # element is a line_chart with grid on, and the diagram
+        # entry keeps the params verbatim.
         base = {"id": "ch", "version": 1,
                 "output": {"width": 360, "height": 640, "fps": 30},
                 "clips": [{"id": "a", "kind": "image",
@@ -6384,38 +6509,38 @@ class TestLoop141(unittest.TestCase):
         errors, info = validate_project(base)
         self.assertEqual(errors, [], errors)
         self.assertEqual(info["diagrams"][0]["params"]["fill"], True)
-        bad = {"id": "ch-bad", "version": 1,
-               "output": {"width": 360, "height": 640, "fps": 30},
-               "clips": [{"id": "a", "kind": "image",
-                          "src": os.path.join(BASE, "data", "test_media",
-                                              "pattern.png"),
-                          "duration": 2}],
-               "diagrams": [{"id": "d1", "template": "chart",
-                             "params": {"values": [10, 12],
-                                        "fill": "yes"},
-                             "start": 0, "end": 2}]}
-        errors, _ = validate_project(bad)
-        self.assertTrue(errors)
-        bad2 = {"id": "ch-bad2", "version": 1,
-                "output": {"width": 360, "height": 640, "fps": 30},
-                "clips": [{"id": "a", "kind": "image",
-                           "src": os.path.join(BASE, "data", "test_media",
-                                               "pattern.png"),
-                           "duration": 2}],
-                "diagrams": [{"id": "d1", "template": "chart",
-                              "params": {"values": [10, 12],
-                                         "y_grid_values": ["high"]},
-                              "start": 0, "end": 2}]}
-        errors, _ = validate_project(bad2)
-        self.assertTrue(errors)
+        self.assertEqual(info["diagrams"][0]["params"]["y_grid_values"],
+                         [10.0, 12.0])
+        self.assertEqual(info["motion"][0]["kind"], "line_chart")
+        self.assertTrue(info["motion"][0]["grid"])
+        # build_template raises for the legacy names now.
+        from agentcut.diagrams import build_template
+        for name in ("chart", "basket", "balance", "causes"):
+            with self.assertRaises(ValueError):
+                build_template(name, {})
+        # Invalid fill / y_grid_values are still rejected.
+        for params in ({"values": [10, 12], "fill": "yes"},
+                       {"values": [10, 12],
+                        "y_grid_values": ["high"]}):
+            bad = {"id": "ch-bad", "version": 1,
+                   "output": {"width": 360, "height": 640, "fps": 30},
+                   "clips": [{"id": "a", "kind": "image",
+                              "src": os.path.join(BASE, "data", "test_media",
+                                                  "pattern.png"),
+                              "duration": 2}],
+                   "diagrams": [{"id": "d1", "template": "chart",
+                                 "params": params,
+                                 "start": 0, "end": 2}]}
+            errors, _ = validate_project(bad)
+            self.assertTrue(errors, params)
 
-    def test_chart_fill_renders_yellow_area(self):
-        # Real render: the translucent fill must tint the plot
-        # area yellow — blended over the dark board it reads as
-        # dark olive (r-b well above the board's ~0), not as
-        # bright yellow, so the check is a tint excess, not a
-        # brightness threshold. The opaque yellow tip sits
-        # above the scanned band and cannot false-positive it.
+    def test_chart_fill_is_dropped_by_adapter(self):
+        # v1.45.0, R4b-3: a chart template with fill=True still
+        # validates and renders (backward compat), but the motion
+        # line_chart has no area fill — the plot area must NOT
+        # tint yellow anymore. The line itself IS present: the
+        # midpoint of segment 2-3 (x=360, y=651) is white at
+        # t=3.9, after the 3.5s draw completes.
         import tempfile
         p = {"id": "chfill", "version": 1,
              "output": {"width": 720, "height": 1280, "fps": 30},
@@ -6439,12 +6564,20 @@ class TestLoop141(unittest.TestCase):
                 r, g, b = px(x, y)[:3]
                 return (r - b) > 30 and g > 80
             # Diagram at x=36, size 0.9: plot interior maps to
-            # roughly x 162..783, fill band y ~500..850.
-            self.assertTrue(any(fill_tint(x, y)
-                                for x in range(170, 780, 4)
-                                for y in range(700, 850, 4)),
-                            "fill area must tint the plot")
-
+            # roughly x 162..783, fill band y ~500..850. No pixel
+            # there may carry the old yellow fill tint. The scan
+            # stops at x=680: the board image itself has a brown
+            # strip at x~694 (r-b ~70) that false-positives this
+            # tint check — the old test could not tell it from
+            # the fill either.
+            self.assertFalse(any(fill_tint(x, y)
+                                 for x in range(170, 680, 4)
+                                 for y in range(700, 850, 4)),
+                             "the adapter drops the chart fill")
+            r, g, b = px(360, 651)[:3]
+            self.assertGreater(r, 180, (r, g, b))
+            self.assertGreater(g, 180, (r, g, b))
+            self.assertGreater(b, 180, (r, g, b))
 
     def test_display_font_option(self):
         # Noto Sans Arabic Bold validates, renders, and shows text;
@@ -6941,7 +7074,7 @@ class TestLoop141(unittest.TestCase):
         c = Canvas(300, 200)
         pts = [(20.0 + 260.0 * i / 130.0, 20.0 + 130.0 * i / 130.0)
                for i in range(131)]
-        c.draw_segments(pts, (255, 255, 255), 6, 0.95, 0)
+        c.draw_segments(pts, (255, 255, 255), 6, 0.95)
         dx, dy = 260.0, 130.0
         L = _math.hypot(dx, dy)
         nx, ny = -dy / L, dx / L
@@ -6964,7 +7097,7 @@ class TestLoop141(unittest.TestCase):
         run1 = [(20.0 + 2.0 * i, 100.0) for i in range(21)]
         run2 = [(200.0 + 2.0 * i, 60.0) for i in range(21)]
         c = Canvas(300, 200)
-        c.draw_segments(run1 + run2, (255, 255, 255), 6, 0.95, 0)
+        c.draw_segments(run1 + run2, (255, 255, 255), 6, 0.95)
         # Jump chord midpoint (110, 80): no ink.
         self.assertEqual(c.buf[(80 * 300 + 110) * 4 + 3], 0)
         # Both runs solid at their centres.
@@ -7009,7 +7142,7 @@ class TestLoop141(unittest.TestCase):
         else:
             self.assertEqual(type(cv).__name__, "Canvas")
         cv.draw_segments([(10.0 + 2.0 * i, 50.0) for i in range(41)],
-                         (255, 255, 255), 6, 0.95, 0)
+                         (255, 255, 255), 6, 0.95)
         self.assertGreater(cv.opaque_pixel_count(), 0)
 
     def test_camera_image_supersamples_4x(self):
@@ -7248,7 +7381,7 @@ class TestLoop141(unittest.TestCase):
         self.assertEqual(info["diagrams"][0]["card_opacity"], 0.6)
         self.assertEqual(
             (info["diagrams"][0]["canvas_w"],
-             info["diagrams"][0]["canvas_h"]), (900, 560))
+             info["diagrams"][0]["canvas_h"]), (518, 322))
         for bad, msg in (
                 ({"card": "yes"}, "card must be true or false"),
                 ({"card_opacity": 1.5}, "card_opacity must be"),
@@ -7265,6 +7398,12 @@ class TestLoop141(unittest.TestCase):
         # (both chains scale dw:-2), and the frame shows the
         # board darkened under the card with the white diagram
         # still drawn on top of it.
+        # v1.45.0, R4b-3: the chart template is a motion adapter
+        # now (no strokes, no diagram video), so this test uses
+        # a primitives diagram — the only template that still
+        # builds strokes — to exercise the diagram-video + card
+        # path. Canvas 900x560 at size 0.72 keeps the display
+        # width 518, as before.
         from agentcut.render import build_ffmpeg_args, render_project
         from agentcut.diagrams import (encode_diagram_video,
                                        rounded_card_rgba, write_png_rgba)
@@ -7272,8 +7411,12 @@ class TestLoop141(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="agentcut-card-")
         try:
             board = os.path.join(BASE, "data", "test_media", "board.png")
-            dg = {"id": "d1", "template": "chart",
-                  "params": {"values": [10, 14, 18, 16, 20]},
+            dg = {"id": "d1", "template": "primitives",
+                  "params": {"canvas": {"width": 900, "height": 560},
+                             "strokes": [{"kind": "polyline",
+                                          "points": [[50, 500], [300, 150],
+                                                     [550, 300], [850, 100]],
+                                          "color": "white", "width": 6}]},
                   "start": 0.0, "end": 2.0, "draw": 1.0,
                   "size": 0.72, "x": 101, "y": 420,
                   "card": True, "card_opacity": 0.45}
@@ -7726,8 +7869,11 @@ class TestLoop142(unittest.TestCase):
         # (a trailing space survives; the after-run's trailing
         # space rendered fine). This test pins the emission and
         # renders the scene-8 title, counting ink groups at
-        # min_gap=6 (a word space is ~6px at size 30; sub-word
-        # gaps after non-joining letters are 1-3px): 4 words ->
+        # min_gap=3 (v1.45.0 re-calibration: the default Arabic
+        # font is now Noto Sans Arabic Bold, whose size-30 word
+        # spaces are 4-5px and sub-word gaps 1-2px, measured
+        # 2026-11-07; the old min_gap=6 was calibrated for Noto
+        # Naskh Regular, whose word spaces were ~6px): 4 words ->
         # 4 groups at EVERY window midpoint AND the hold, with
         # spans matching the hold. The old code gives 3 groups
         # at indices 1-3 (measured in the R7b experiment:
@@ -7785,12 +7931,12 @@ class TestLoop142(unittest.TestCase):
         ok, _ = render_project(p, out)
         self.assertTrue(ok)
         hold_ink = _ink_mask(out, 5.5, y0=90, y1=160, x0=90, x1=270)
-        hold_groups = _ink_groups(hold_ink, min_gap=6)
+        hold_groups = _ink_groups(hold_ink, min_gap=3)
         self.assertEqual(len(hold_groups), 4, hold_groups)
         hold_spans = [(g[0], g[1]) for g in hold_groups]
         for t in (0.625, 1.875, 3.125, 4.375):
             ink = _ink_mask(out, t, y0=90, y1=160, x0=90, x1=270)
-            groups = _ink_groups(ink, min_gap=6)
+            groups = _ink_groups(ink, min_gap=3)
             self.assertEqual(len(groups), 4, (t, groups))
             spans = [(g[0], g[1]) for g in groups]
             for (lo, hi), (hlo, hhi) in zip(spans, hold_spans):
@@ -7846,16 +7992,20 @@ class TestLoop142(unittest.TestCase):
 
     def test_fix3_pop_moved_40px_below_diagram(self):
         # The exact v2 scene-4 geometry: diagram box bottom
-        # 742.56, cascade moved the pop to 758.56 (+16), the
-        # zone manager must push it to 782.56 (+40) — inside
-        # the callout band [768, 896].
+        # 742.25, cascade moved the pop to 758.25 (+16), the
+        # zone manager must push it to 782.25 (+40) — inside
+        # the callout band [768, 896]. (v1.45.0, R4b-3: the
+        # balance template is a comparison_cards adapter now,
+        # so the diagram box bottom is 742.25, not the old
+        # chalk-canvas 742.56 — a 0.31px shift; the +16 cascade
+        # and +24 zone push are unchanged.)
         ok, info = validate_project(self._zone_project())
         self.assertEqual(ok, [], ok)
         zone = {m["index"]: m for m in info.get("zone_moves", [])}
         self.assertIn(2, zone)
-        self.assertEqual(zone[2]["old_y"], 758.56)
-        self.assertEqual(zone[2]["new_y"], 782.56)
-        self.assertLessEqual(782.56 + 54 * 1.4, 0.70 * 1280)
+        self.assertAlmostEqual(zone[2]["old_y"], 758.25, places=2)
+        self.assertAlmostEqual(zone[2]["new_y"], 782.25, places=2)
+        self.assertLessEqual(782.25 + 54 * 1.4, 0.70 * 1280)
         codes = [w["code"] for w in info.get("warnings", [])]
         self.assertNotIn("callout_outside_zone", codes)
         self.assertNotIn("caption_outside_subtitle_zone", codes)
@@ -7958,6 +8108,13 @@ class TestLoop142(unittest.TestCase):
             for x in range(w):
                 r, g, b = px(x, y)[:3]
                 if r > 150 and g > 150 and b < 100:
+                    # v1.45.0, R4b-3: the balance diagram is a
+                    # comparison_cards adapter now, and its card-0
+                    # accent bar is yellow — 567px at y 150-249,
+                    # outside the band. Count only yellow below
+                    # the diagram (y >= 320), i.e. the pop itself.
+                    if y < 320:
+                        continue
                     tot += 1
                     if 384 <= y <= 448:
                         in_band += 1
@@ -8289,43 +8446,57 @@ class TestLoop142(unittest.TestCase):
             self.assertTrue(errs, att)
 
     def test_fix5_pitch_expression(self):
+        # v1.45.0, R3: pop/whoosh/cash/ding are noise now, so pitch
+        # is atempo in the graph (see test_fix5_plan_in_graph);
+        # _pitch_sfx_expression survives for the thud — the only
+        # sine left — and its contract is unchanged: frequency
+        # constants scale, decay envelopes and amplitudes do not.
         from agentcut.render import _pitch_sfx_expression, SFX_SOURCES
-        pop = SFX_SOURCES["pop"][0]
-        self.assertEqual(_pitch_sfx_expression(pop, 1.03),
-                         "sin(2*PI*927.0*t)*exp(-18*t)")
-        self.assertEqual(_pitch_sfx_expression(pop, 0.97),
-                         "sin(2*PI*873.0*t)*exp(-18*t)")
-        whoosh = SFX_SOURCES["whoosh"][0]
-        self.assertEqual(_pitch_sfx_expression(whoosh, 1.03),
-                         "sin(2*PI*(309.0*t+927.0*t*t))"
-                         "*(1-exp(-8*t))*exp(-2.5*t)")
-        cash = SFX_SOURCES["cash"][0]
-        pitched = _pitch_sfx_expression(cash, 0.97)
-        self.assertIn("1520.96*t", pitched)
-        self.assertIn("0.6*sin(2*PI*2030.21*t)", pitched)
-        # Decay envelopes and amplitudes are untouched.
-        self.assertIn("exp(-2.5*t)", pitched)
-        self.assertIn("exp(-3*t)", pitched)
-        self.assertEqual(_pitch_sfx_expression(
-            SFX_SOURCES["ding"][0], 1.0), SFX_SOURCES["ding"][0])
+        thud = SFX_SOURCES["thud"]["expr"]
+        pitched = _pitch_sfx_expression(thud, 1.03)
+        self.assertIn("72.1*t", pitched)
+        self.assertIn("56.65*t", pitched)
+        self.assertIn("exp(-6*t)", pitched)
+        self.assertIn("exp(-8*t)", pitched)
+        self.assertEqual(_pitch_sfx_expression(thud, 1.0), thud)
+        # The noise names are noise-kind with a fixed seed and a
+        # gain, not sine expressions.
+        for name in ("pop", "whoosh", "click", "ding", "cash", "chime"):
+            spec = SFX_SOURCES[name]
+            self.assertEqual(spec["kind"], "noise", name)
+            self.assertIn("seed", spec)
+            self.assertIn("filters", spec)
+            self.assertIn("gain", spec)
+        self.assertEqual(SFX_SOURCES["pop"]["color"], "pink")
+        self.assertEqual(SFX_SOURCES["whoosh"]["color"], "pink")
+        self.assertEqual(SFX_SOURCES["ding"]["color"], "white")
 
     def test_fix5_plan_in_graph(self):
-        # The graph carries exactly the 3 kept SFX (as gated
-        # aevalsrc inputs) with pitch-scaled frequencies: the
-        # 16.0 pop at pitch 0.97 (873.0), the 0.0 whoosh at
-        # 1.03 (309.0/927.0), the 31.0 ding at 1.03 (1812.8).
+        # v1.45.0, R3: the graph carries exactly the 3 kept SFX
+        # as anoisesrc inputs (noise re-voicing) with their fixed
+        # seeds, atempo pitch and adelay at the scheduled start:
+        # the 0.0 whoosh at pitch 1.03, the 16.0 pop at 0.97,
+        # the 31.0 ding at 1.03. No aevalsrc remains for these
+        # three (only the thud still uses it).
         from agentcut.render import build_ffmpeg_args
         p = self._fix5_project()
         ok, info = validate_project(p)
         self.assertEqual(ok, [], ok)
         argv, total, td = build_ffmpeg_args(p, info, "/tmp/s.mp4")
         graph = " ".join(argv)
-        self.assertEqual(graph.count("aevalsrc="), 3)
-        # Frequencies are gated, so t is re-based: 873.0*(t-16.0).
-        self.assertIn("873.0*(t-16.0)", graph)
-        self.assertIn("309.0*(t-0.0)", graph)
-        self.assertIn("1812.8*(t-31.0)", graph)
-        self.assertNotIn("900*(t-16.0)", graph)
+        self.assertEqual(graph.count("anoisesrc="), 3)
+        self.assertEqual(graph.count("aevalsrc="), 0)
+        self.assertIn("anoisesrc=color=pink:duration=1.0:seed=23",
+                      graph)
+        self.assertIn("anoisesrc=color=pink:duration=0.3:seed=11",
+                      graph)
+        self.assertIn("anoisesrc=color=white:duration=0.9:seed=41",
+                      graph)
+        self.assertIn("atempo=1.03", graph)
+        self.assertIn("atempo=0.97", graph)
+        self.assertIn("adelay=0|0", graph)
+        self.assertIn("adelay=16000|16000", graph)
+        self.assertIn("adelay=31000|31000", graph)
 
     def test_fix5_rendered_sfx_cooldown_and_levels(self):
         # Render the cooldown pattern (SFX only, no voice):
@@ -8394,11 +8565,11 @@ class TestLoop142(unittest.TestCase):
         self.assertIn("-b:a 192k", graph)
         self.assertIn("-ar 48000", graph)
 
-    def test_fix6_version_is_1_44_0(self):
+    def test_fix6_version_is_1_45_0(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "1.44.0")
+        self.assertEqual(agentcut.__version__, "1.45.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.44.0")
+            self.assertEqual(f.read().strip(), "1.45.0")
 
 
 class TestLoop143(unittest.TestCase):
@@ -8736,38 +8907,46 @@ class TestLoop143(unittest.TestCase):
 
     def test_bars_grow_render(self):
         # Bar A (yellow, full height 100px, top y=320) is half
-        # grown at t=1.0 and full at t=3.5; bar D (orange, full
-        # height 300px) has not started at t=1.0.
+        # grown at t=0.2 and full at t=3.5; bar D (orange, full
+        # height 300px) has not started at t=0.6. Times are
+        # calibrated for the spring default (v1.45.0, R6):
+        # spring(0.1)=0.52 at t=0.2 (draw=2s), so bar A is
+        # half grown there, and bar D's stagger (0.36) starts
+        # it at t=0.72, so it is absent at t=0.6.
         p = self._base_project([self._bars_el()])
         errors, info = validate_project(p)
         self.assertEqual(errors, [], errors)
         out = os.path.join(BASE, "data", "test_output_loop143c.mp4")
         ok, _ = render_project(p, out)
         self.assertTrue(ok)
-        r, g, b = _crop_mean(out, 1.0, 115, 330, 40, 40)
+        r, g, b = _crop_mean(out, 0.2, 115, 330, 40, 40)
         self.assertLess(r + g, 150, (r, g, b))
         r, g, b = _crop_mean(out, 3.5, 115, 330, 40, 40)
         self.assertGreater(r + g, 300, (r, g, b))
-        r, g, b = _crop_mean(out, 1.0, 565, 130, 40, 40)
+        r, g, b = _crop_mean(out, 0.6, 565, 130, 40, 40)
         self.assertLess(r, 100, (r, g, b))
         r, g, b = _crop_mean(out, 3.5, 565, 130, 40, 40)
         self.assertGreater(r, 150, (r, g, b))
 
     def test_donut_sweep_render(self):
-        # Yellow X (right half) is absent at t=4.2 and full at
-        # t=7.5; green Z (top-left) is absent at t=5.0 and
+        # Yellow X (right half) is absent at t=4.05 and full at
+        # t=7.5; green Z (top-left) is absent at t=4.4 and
         # present at t=6.0. The hole stays dark at all times.
+        # Times are calibrated for the spring default (v1.45.0,
+        # R6): X reaches the (445,685) crop (80 deg into its
+        # 180 deg arc) at t~4.09, and Z's stagger starts it at
+        # t=4.48, so it is absent at t=4.4.
         p = self._base_project([self._donut_el()], duration=12.0)
         errors, info = validate_project(p)
         self.assertEqual(errors, [], errors)
         out = os.path.join(BASE, "data", "test_output_loop143d.mp4")
         ok, _ = render_project(p, out)
         self.assertTrue(ok)
-        r, g, b = _crop_mean(out, 4.2, 445, 685, 30, 30)
+        r, g, b = _crop_mean(out, 4.05, 445, 685, 30, 30)
         self.assertLess(r + g, 150, (r, g, b))
         r, g, b = _crop_mean(out, 7.5, 445, 685, 30, 30)
         self.assertGreater(r + g, 300, (r, g, b))
-        r, g, b = _crop_mean(out, 5.0, 258, 635, 30, 30)
+        r, g, b = _crop_mean(out, 4.4, 258, 635, 30, 30)
         self.assertLess(g, 120, (r, g, b))
         r, g, b = _crop_mean(out, 6.0, 258, 635, 30, 30)
         self.assertGreater(g, 150, (r, g, b))
@@ -10116,28 +10295,45 @@ class TestLoop144(unittest.TestCase):
                                  - (bb_c[1] - bb_c[0])), 4)
 
     def test_144_preset_slide_in_render(self):
-        # slide_in: the text slides from off-screen left and
-        # fades in over 0.5s. At t=0.4 (u=0.8) it is still ~85px
-        # left of rest; at t=1.0 it is at rest.
+        # slide_in: the text slides from off-screen left with a
+        # spring overshoot (v1.45.0 R6 — was a linear ramp). The
+        # spring peaks ~15% past rest (u~0.27), so at t=0.2 the
+        # text sits RIGHT of rest (left edge 323 vs rest 304),
+        # then settles back to rest by t=1.0. The early frames
+        # are too faint to pin (fade_in 0.5s), so the test pins
+        # the overshoot + the settle + the spring expression.
         p = self._text_project(
             [{"text": "Hello", "start": 0, "end": 2, "size": 48,
               "preset": "slide_in"}], duration=2.0)
-        errors, _ = validate_project(p)
+        errors, info = validate_project(p)
         self.assertEqual(errors, [], errors)
+        from agentcut.render import build_ffmpeg_args
+        import shutil
+        argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        graph = " ".join(argv)
+        self.assertIn("exp(-7*", graph)
+        self.assertIn("11.4477", graph)
         out = os.path.join(self.tmp, "slide_in.mp4")
         ok, _ = render_project(p, out)
         self.assertTrue(ok)
-        bb_early = self._ink_bbox(out, 0.4, 80, 200)
+        bb_over = self._ink_bbox(out, 0.2, 80, 200)
         bb_rest = self._ink_bbox(out, 1.0, 80, 200)
-        self.assertIsNotNone(bb_early)
+        self.assertIsNotNone(bb_over)
         self.assertIsNotNone(bb_rest)
-        self.assertLess(bb_early[0], bb_rest[0] - 40)
+        # Overshoot: past rest to the right at the spring peak.
+        self.assertGreater(bb_over[0], bb_rest[0] + 5)
+        # Settle: at rest by t=0.4.
+        bb_settle = self._ink_bbox(out, 0.4, 80, 200)
+        self.assertIsNotNone(bb_settle)
+        self.assertLess(abs(bb_settle[0] - bb_rest[0]), 10)
 
     def test_144_preset_pop_in_render(self):
-        # pop_in: fontsize pops with ease_out_back overshoot
-        # (0.3x -> ~1.06x -> 1.0x over 0.5s). At t=0.05 the text
-        # is small; at t=1.0 it is at full size. The graph pins
-        # the overshoot constant.
+        # pop_in: fontsize pops with spring overshoot (0.3x ->
+        # ~1.10x -> 1.0x over 0.5s, v1.45.0 R6 — was ease_out_back
+        # ~1.06x). At t=0.05 the text is small; at t=1.0 it is at
+        # full size. The graph pins the spring expression.
         p = self._text_project(
             [{"text": "POP", "start": 0, "end": 2, "size": 48,
               "preset": "pop_in"}], duration=2.0)
@@ -10148,11 +10344,17 @@ class TestLoop144(unittest.TestCase):
         argv, _, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
         if _td:
             shutil.rmtree(_td, ignore_errors=True)
-        self.assertIn("2.70158", " ".join(argv))
+        graph = " ".join(argv)
+        self.assertIn("exp(-7*", graph)
+        self.assertIn("11.4477", graph)
+        self.assertNotIn("2.70158", graph)
         out = os.path.join(self.tmp, "pop_in.mp4")
         ok, _ = render_project(p, out)
         self.assertTrue(ok)
-        bb_small = self._ink_bbox(out, 0.05, 80, 200)
+        # Spring rises faster than the old ease_out_back (f=0.52
+        # at u=0.1 vs 0.41), so the "small" sample moves earlier
+        # to t=0.02 (u=0.04, f~0.12) to still catch it small.
+        bb_small = self._ink_bbox(out, 0.02, 80, 200)
         bb_full = self._ink_bbox(out, 1.0, 80, 200)
         self.assertIsNotNone(bb_small)
         self.assertIsNotNone(bb_full)
@@ -10350,6 +10552,1459 @@ class TestLoop144(unittest.TestCase):
         self.assertTrue(errors, errors)
         self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
         self.assertIn("typewriter", errors[0]["message"])
+
+
+class TestLoop145(unittest.TestCase):
+    """Spring / glass / pacing / contact-sheet package (v1.45.0),
+    Round 1: validator KeyError fixes + sweep scale clamp."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _base(self, duration=4.0, **kw):
+        p = {"id": "loop145", "version": 1,
+             "output": {"width": 720, "height": 1280, "fps": 30},
+             "clips": [{"id": "c1", "kind": "image",
+                        "src": os.path.join(BASE, "data", "test_media",
+                                            "board.png"),
+                        "duration": duration}]}
+        p.update(kw)
+        return p
+
+    def _err_codes(self, errors):
+        return [e["code"] for e in errors]
+
+    def _shape(self, **kw):
+        el = {"id": "s1", "kind": "shape", "shape": "circle",
+              "radius": 60, "fill": "yellow", "start": 0, "end": 4,
+              "keyframes": [{"t": 0, "x": 120, "y": 640},
+                            {"t": 4, "x": 600, "y": 640}]}
+        el.update(kw)
+        return el
+
+    def test_145_circle_without_radius_is_invalid_schema(self):
+        # R1 (parent B): a circle shape with no radius used to
+        # crash the validator with KeyError; it must return
+        # INVALID_SCHEMA with a fix hint instead.
+        el = self._shape()
+        del el["radius"]
+        errors, _ = validate_project(self._base(motion=[el]))
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        self.assertTrue(any("radius" in e["message"]
+                            for e in errors), errors)
+        self.assertTrue(any(e.get("fix") for e in errors), errors)
+
+    def test_145_rect_without_w_is_invalid_schema(self):
+        # Same crash class for rect/ellipse geometry: a missing
+        # w (or h) raised KeyError on float(el[gname]).
+        el = self._shape(shape="rect")
+        el.pop("radius", None)
+        el.update({"w": 200, "h": 100})
+        del el["w"]
+        errors, _ = validate_project(self._base(motion=[el]))
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        self.assertTrue(any("w" in e["message"]
+                            for e in errors), errors)
+
+    def test_145_motion_keyframe_without_t_is_invalid_schema(self):
+        # Same crash class for keyframes: a keyframe with no t
+        # raised KeyError on float(kf["t"]).
+        el = self._shape()
+        el["keyframes"] = [{"x": 120, "y": 640},
+                           {"t": 4, "x": 600, "y": 640}]
+        errors, _ = validate_project(self._base(motion=[el]))
+        self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+        self.assertTrue(any("keyframe" in e["message"]
+                            for e in errors), errors)
+
+    def test_145_late_highlight_sweep_renders(self):
+        # R1 (parent A): the sweep bar's scale expression is
+        # evaluated for every frame from t=0, and the unclamped
+        # smoothstep u^2*(3-2u) explodes for negative u — a sweep
+        # at start=10 asks scale for a ~2.3M px wide image at
+        # t=0 and the render dies ("Picture size ... is invalid").
+        # With u clamped to [0,1] the same project renders, and
+        # the bar still sweeps in over its 0.6s window.
+        p = self._base(duration=11.0)
+        p["texts"] = [{"text": "اختبار", "start": 10, "end": 11,
+                       "size": 48, "preset": "highlight_sweep"}]
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "late_sweep.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        probe = probe_media(out)
+        self.assertIsNotNone(probe)
+        self.assertAlmostEqual(probe["duration"], 11.0, delta=0.2)
+
+    # ---- R4b-1: comparison_cards motion kind
+    def _cards(self, **kw):
+        el = {"id": "cards1", "kind": "comparison_cards",
+              "start": 0, "end": 4, "x": 60, "y": 400, "w": 600,
+              "h": 240,
+              "cards": [{"label": "أ", "value": 10},
+                        {"label": "ب", "value": 20}]}
+        el.update(kw)
+        return el
+
+    def test_145_comparison_cards_validates(self):
+        errors, info = validate_project(
+            self._base(duration=4.0, motion=[self._cards()]))
+        self.assertEqual(errors, [], errors)
+        rel = info["motion"][0]
+        self.assertEqual(rel["kind"], "comparison_cards")
+        self.assertEqual(rel["cards"],
+                         [{"label": "أ", "value": 10},
+                          {"label": "ب", "value": 20}])
+        self.assertEqual(rel["value_size"], 44)
+        self.assertAlmostEqual(rel["card_gap"], 0.04)
+        self.assertFalse(rel["grid"])
+        self.assertEqual(rel["_bbox"], (60, 400, 600, 240))
+
+    def test_145_comparison_cards_rejections(self):
+        cases = [
+            # 1 card / 5 cards: the kind takes 2..4.
+            ({"cards": [{"label": "أ"}]},
+             "2..4"),
+            ({"cards": [{"label": str(i)} for i in range(5)]},
+             "2..4"),
+            # Empty label, bool value, string card.
+            ({"cards": [{"label": "  ", "value": 1},
+                        {"label": "ب", "value": 2}]},
+             "non-empty string label"),
+            ({"cards": [{"label": "أ", "value": True},
+                        {"label": "ب", "value": 2}]},
+             "number or a string"),
+            ({"cards": ["أ", "ب"]}, "non-empty string label"),
+            # values / labels / grid belong to other chart kinds.
+            ({"values": [1, 2]}, "takes cards, not values"),
+            ({"labels": ["أ", "ب"]},
+             "labels inside cards"),
+            ({"grid": True}, "does not take grid"),
+            # Stagger/grow must let the last card finish.
+            ({"stagger": 0.5, "grow": 0.9},
+             "leaves the last item unfinished"),
+            # Bbox must sit inside the frame.
+            ({"x": 600, "w": 600}, "outside the"),
+        ]
+        for kw, frag in cases:
+            with self.subTest(kw=kw):
+                errors, _ = validate_project(
+                    self._base(duration=4.0, motion=[self._cards(**kw)]))
+                self.assertTrue(errors, kw)
+                self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+                self.assertIn(frag, errors[0]["message"])
+
+    def test_145_comparison_cards_derived_texts(self):
+        from agentcut.render import _motion_derived_texts
+        el = self._cards(colors=["#facc15", "#22d3ee"])
+        # Layout: 2 cards in a 600px row, gap 0.04*600=24px, so
+        # card 0 is x 60..348 (centre 204) and card 1 x
+        # 372..660 (centre 516).
+        items = _motion_derived_texts({"motion": [el]}, 720, 1280)
+        self.assertEqual(len(items), 4)
+        labels = [it for it in items if it["text"] in ("أ", "ب")]
+        values = [it for it in items if it["text"] in ("10", "20")]
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(values), 2)
+        # Labels near the card top, values below them, both
+        # centred on the card, no drawtext box (the card is the
+        # box). Card 0 finishes at (0*0.12+0.5)*4 = 2.0s, card 1
+        # at (0.12+0.5)*4 = 2.48s.
+        self.assertEqual(labels[0]["x"], "(204.0-text_w/2)")
+        self.assertEqual(labels[0]["y"], 438)
+        self.assertEqual(labels[0]["size"], 28)
+        self.assertFalse(labels[0]["box"])
+        self.assertAlmostEqual(labels[0]["start"], 2.0)
+        self.assertEqual(labels[1]["x"], "(516.0-text_w/2)")
+        self.assertAlmostEqual(labels[1]["start"], 2.48)
+        # Values take the card accent colour at value_size.
+        self.assertEqual(values[0]["size"], 44)
+        self.assertEqual(values[0]["color"], "#facc15")
+        self.assertFalse(values[0]["box"])
+        self.assertEqual(values[1]["color"], "#22d3ee")
+
+    def test_145_comparison_cards_renders(self):
+        # The accent bar is the clean frame discriminator: the
+        # board is dark green (33,55,45), the bar is opaque
+        # yellow (250,204,21). At t=0.2 the cards have barely
+        # started (p ~ 0.03); at t=3.5 both are full.
+        p = self._base(duration=4.0, motion=[self._cards()])
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "cards.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        probe = probe_media(out)
+        self.assertIsNotNone(probe)
+        self.assertAlmostEqual(probe["duration"], 4.0, delta=0.2)
+        # (cx, expected accent at full growth): card 0 is
+        # yellow #facc15, card 1 is cyan #22d3ee.
+        for t, grown in ((0.2, False), (3.5, True)):
+            _w, _h, px = _frame_png(
+                out, t, os.path.join(self.tmp, f"cards_{t}.png"))
+            for cx, (er, eg, eb) in (
+                    (204, (250, 204, 21)), (516, (34, 211, 238))):
+                r, g, b = px(cx, 413)[:3]
+                if grown:
+                    self.assertAlmostEqual(r, er, delta=40,
+                                           msg=(t, cx, (r, g, b)))
+                    self.assertAlmostEqual(g, eg, delta=40,
+                                           msg=(t, cx, (r, g, b)))
+                    self.assertAlmostEqual(b, eb, delta=40,
+                                           msg=(t, cx, (r, g, b)))
+                else:
+                    # Barely started (p ~ 0.03): near the dark
+                    # board, nowhere near either accent colour.
+                    self.assertLess(r, 120, (t, cx, (r, g, b)))
+                    self.assertLess(b, 120, (t, cx, (r, g, b)))
+
+    # ---- R4b-2: draw + fade_out on motion elements
+    def _bars(self, **kw):
+        el = {"id": "bars1", "kind": "bars", "x": 60, "y": 120,
+              "w": 600, "h": 300, "values": [20, 40],
+              "colors": ["#facc15", "#22d3ee"], "start": 0, "end": 4}
+        el.update(kw)
+        return el
+
+    def test_145_motion_draw_and_fade_validate(self):
+        # draw: chart kinds only, 0 < draw <= window.
+        errors, info = validate_project(
+            self._base(duration=4.0, motion=[self._bars(draw=1.0)]))
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["motion"][0]["draw"], 1.0)
+        # fade_out + fade_start on a raster kind.
+        errors, info = validate_project(self._base(
+            duration=4.0,
+            motion=[self._bars(fade_out=1.0, fade_start=2.0)]))
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(info["motion"][0]["fade_out"], 1.0)
+        self.assertEqual(info["motion"][0]["fade_start"], 2.0)
+        # A fade that starts before the window end but runs past
+        # it is cut at the end (the diagram fade behaves the
+        # same way) — allowed, not an error.
+        errors, _ = validate_project(self._base(
+            duration=4.0,
+            motion=[self._bars(fade_out=1.0, fade_start=3.5)]))
+        self.assertEqual(errors, [], errors)
+        cases = [
+            (self._bars(draw=0), "draw must be > 0"),
+            (self._bars(draw=5.0), "draw must be > 0"),
+            (self._bars(fade_out=0), "fade_out must be > 0"),
+            (self._bars(fade_out=5.0), "fade_out must be > 0"),
+            (self._bars(fade_start=2.0), "fade_start needs fade_out"),
+            (self._bars(fade_out=1.0, fade_start=0.0),
+             "fade_start must be inside the window"),
+            (self._bars(fade_out=1.0, fade_start=4.0),
+             "fade_start must be inside the window"),
+            (self._shape(draw=1.0),
+             "draw applies to chart kinds only"),
+            (self._shape(fade_out=1.0), None),  # shape fades fine
+            ({"id": "ct1", "kind": "counter", "start": 0, "end": 4,
+              "x": 360, "y": 640, "from": 0, "to": 100, "draw": 1.0},
+             "counter does not take draw"),
+            ({"id": "ct1", "kind": "counter", "start": 0, "end": 4,
+              "x": 360, "y": 640, "from": 0, "to": 100,
+              "fade_out": 1.0},
+             "counter does not take fade_out"),
+            ({"id": "lt1", "kind": "lower_third", "start": 0,
+              "end": 4, "x": 60, "y": 1000, "w": 500, "h": 90,
+              "text": "hello", "draw": 1.0},
+             "draw applies to chart kinds only"),
+        ]
+        for el, frag in cases:
+            with self.subTest(el=el):
+                errors, _ = validate_project(
+                    self._base(duration=4.0, motion=[el]))
+                if frag is None:
+                    self.assertEqual(errors, [], errors)
+                else:
+                    self.assertTrue(errors, el)
+                    self.assertIn("INVALID_SCHEMA",
+                                  self._err_codes(errors))
+                    self.assertIn(frag, errors[0]["message"])
+
+    def _bar1_top(self, path, t):
+        # First strong-cyan pixel down the column through bar 1
+        # (cx 510, cyan #22d3ee). The white value label above the
+        # bar is excluded by the R<120 condition; the black label
+        # box is dark. Returns the y of that pixel.
+        _w, _h, px = _frame_png(
+            path, t, os.path.join(self.tmp, f"bar_top_{t}.png"))
+        for y in range(100, 420):
+            r, g, b = px(510, y)[:3]
+            if r < 120 and g > 180 and b > 180:
+                return y
+        return None
+
+    def test_145_motion_draw_renders_hold(self):
+        # draw=1.0 in a 4s window: bar 1 (value 40, full height
+        # 300, top y=120) is PARTIALLY grown at t=0.15 (top
+        # y~280-350 — the spring rises steeply, so the exact
+        # mid-growth y is frame-sensitive and is asserted only
+        # as "clearly not full"), is full at t=1.5 (top y~120)
+        # and HOLDS there at t=3.5 (same top as t=1.5). Times
+        # are calibrated for the spring default (v1.45.0, R6):
+        # with smoothstep the mid-growth point was t=0.5
+        # (top y~164); spring reaches full growth by t~0.22.
+        p = self._base(duration=4.0, motion=[self._bars(draw=1.0)])
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "draw_hold.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        top_early = self._bar1_top(out, 0.15)
+        top_mid = self._bar1_top(out, 1.5)
+        top_late = self._bar1_top(out, 3.5)
+        self.assertIsNotNone(top_early)
+        self.assertIsNotNone(top_mid)
+        self.assertIsNotNone(top_late)
+        self.assertGreater(top_early, 200, top_early)
+        self.assertAlmostEqual(top_mid, 120, delta=6)
+        self.assertAlmostEqual(top_late, 120, delta=6)
+        self.assertLessEqual(abs(top_mid - top_late), 2)
+
+    def test_145_motion_fade_out_renders(self):
+        # fade_out=1.0 in a 4s window: the fade runs 3.0..4.0.
+        # Bar 1's interior (510, 400) is full cyan (G≈211) at
+        # t=2.0 and ~half-faded (G≈133, a blend with the dark
+        # board) at t=3.5.
+        p = self._base(duration=4.0,
+                       motion=[self._bars(fade_out=1.0)])
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "fade_out.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        _w, _h, px_full = _frame_png(
+            out, 2.0, os.path.join(self.tmp, "fade_full.png"))
+        r, g, b = px_full(510, 400)[:3]
+        self.assertGreater(g, 180, (r, g, b))
+        _w, _h, px_half = _frame_png(
+            out, 3.5, os.path.join(self.tmp, "fade_half.png"))
+        r, g, b = px_half(510, 400)[:3]
+        self.assertGreater(g, 100, (r, g, b))
+        self.assertLess(g, 170, (r, g, b))
+
+    # ---- R4b-3: legacy template adapters
+    def _diagram(self, template, params, **kw):
+        dg = {"id": "d1", "start": 0, "end": 6, "template": template,
+              "params": params, "size": 0.5}
+        dg.update(kw)
+        return dg
+
+    def test_145_template_adapters_validate(self):
+        # Each legacy template validates to a motion element at
+        # the diagram's display rect, and the diagram entry
+        # stays (adapted_to_motion, no strokes, canvas = the
+        # display size, sfx + card carried).
+        cases = [
+            ("chart", {"values": [10, 12, 14, 18]}, "line_chart"),
+            ("basket", {"coins": 3}, "bars"),
+            ("balance", {"left": 5, "right": 1}, "comparison_cards"),
+            ("causes", {"rows": 2}, "comparison_cards"),
+        ]
+        for template, params, kind in cases:
+            with self.subTest(template=template):
+                p = self._base(duration=6.0, diagrams=[
+                    self._diagram(template, params, sfx="ding",
+                                  card=True)])
+                errors, info = validate_project(p)
+                self.assertEqual(errors, [], errors)
+                self.assertEqual(info["motion"][0]["kind"], kind)
+                self.assertEqual(info["motion"][0]["id"], "d1")
+                dg = info["diagrams"][0]
+                self.assertTrue(dg["adapted_to_motion"])
+                self.assertNotIn("strokes", dg)
+                self.assertEqual(dg["sfx"], "ding")
+                self.assertTrue(dg["card"])
+                self.assertEqual((dg["canvas_w"], dg["canvas_h"]),
+                                 (info["motion"][0]["w"],
+                                  info["motion"][0]["h"]))
+        # primitives still builds strokes.
+        p = self._base(duration=6.0, diagrams=[self._diagram(
+            "primitives",
+            {"strokes": [{"kind": "line",
+                          "points": [[0, 0], [100, 50]]}]})])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(info["diagrams"][0]["strokes"]), 1)
+        self.assertNotIn("adapted_to_motion", info["diagrams"][0])
+        self.assertEqual(info["motion"], [])
+        # build_template raises for the legacy names.
+        from agentcut.diagrams import build_template
+        for name in ("chart", "basket", "balance", "causes"):
+            with self.assertRaises(ValueError):
+                build_template(name, {})
+
+    def test_145_template_adapter_rejections(self):
+        cases = [
+            (self._diagram("pie", {}), "unknown diagram template"),
+            ({"id": "d1", "start": 0, "end": 2, "template": "chart",
+              "params": {"values": [1, 2]},
+              "strokes": [{"kind": "polyline",
+                           "points": [[0, 0], [10, 10]]}]},
+             "exactly one of strokes or template"),
+            (self._diagram("chart", {"values": [5]}),
+             "chart template needs values"),
+            (self._diagram("basket", {"coins": 9}),
+             "basket coins must be 1..5"),
+            (self._diagram("basket", {"coins": 3, "colour": "red"}),
+             "does not take params"),
+        ]
+        for dg, frag in cases:
+            with self.subTest(dg=dg):
+                errors, _ = validate_project(
+                    self._base(duration=6.0, diagrams=[dg]))
+                self.assertTrue(errors, dg)
+                self.assertIn("INVALID_SCHEMA", self._err_codes(errors))
+                self.assertIn(frag, errors[0]["message"])
+        # A user motion element colliding with an adapted diagram
+        # id is still caught (by the motion list's own duplicate
+        # check).
+        p = self._base(duration=6.0, diagrams=[
+            self._diagram("chart", {"values": [10, 12]})],
+            motion=[{"id": "d1", "kind": "bars", "x": 60, "y": 120,
+                     "w": 600, "h": 300, "values": [20, 40],
+                     "start": 0, "end": 6}])
+        errors, _ = validate_project(p)
+        self.assertTrue(errors, errors)
+        self.assertIn("duplicate", errors[0]["message"])
+
+    def test_145_template_adapter_renders(self):
+        # A basket template renders as bars: bar 1 (cyan, the
+        # second of three unit bars) is present at t=5.0. A
+        # chart template renders as a line_chart: the line
+        # midpoint is white at t=5.0 (after the draw).
+        p = self._base(duration=6.0, diagrams=[
+            self._diagram("basket", {"coins": 3}, x=72, y=100,
+                          size=0.6, draw=2.0)])
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "adapt_basket.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        # Basket display rect: size 0.6 of 720 -> w 432, aspect
+        # 700x560 -> h 346. Bars at x=72, w=432: bar 1 (of 3)
+        # centre x = 72 + 432/2 = 288, full height 346, so its
+        # interior at (288, 400) is cyan at t=5.0.
+        _w, _h, px = _frame_png(
+            out, 5.0, os.path.join(self.tmp, "adapt_basket.png"))
+        r, g, b = px(288, 400)[:3]
+        self.assertLess(r, 120, (r, g, b))
+        self.assertGreater(g, 180, (r, g, b))
+        self.assertGreater(b, 180, (r, g, b))
+
+    def test_145_template_adapter_card_renders(self):
+        # A chart template with card=True gets its dark rounded
+        # backdrop under the motion element: a point inside the
+        # card but away from the line is clearly darker than the
+        # same board outside the card.
+        dg = self._diagram("chart", {"values": [10, 12, 14, 18]},
+                           x=36, y=100, size=0.8, draw=2.0, card=True)
+        p = self._base(duration=6.0, diagrams=[dg])
+        errors, _ = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(self.tmp, "adapt_card.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        _w, _h, px = _frame_png(
+            out, 5.0, os.path.join(self.tmp, "adapt_card.png"))
+        # Inside the card (50, 110): far from the line (which
+        # starts at the bottom-left) and from the gridlines.
+        ri, gi, bi = px(50, 110)[:3]
+        # Outside the card, same row: the bare board.
+        ro, go, bo = px(650, 110)[:3]
+        self.assertLess((ri + gi + bi) / 3, (ro + go + bo) / 3 - 5,
+                        ((ri, gi, bi), (ro, go, bo)))
+
+    def test_145_noise_sfx_double_render_is_deterministic(self):
+        # R3: the noise SFX use a fixed anoisesrc seed, so the
+        # same project renders byte-identically twice (the
+        # 1.37.0 sine SFX were deterministic by construction;
+        # a random-seed noise source would not be).
+        import hashlib
+        p = self._base(duration=3.0)
+        p["texts"] = [{"text": "X", "start": 0.5, "end": 2.5,
+                       "size": 48, "sfx": "whoosh", "sfx_volume": 0.35}]
+        outs = []
+        for k in range(2):
+            out = os.path.join(self.tmp, f"sfx_det_{k}.mp4")
+            ok, info = render_project(p, out)
+            self.assertTrue(ok, info)
+            outs.append(out)
+        h = [hashlib.md5(open(o, "rb").read()).hexdigest()
+             for o in outs]
+        self.assertEqual(h[0], h[1], h)
+
+    def test_145_arabic_default_font_is_sans(self):
+        # R4c-1 (Defect 1): the default Arabic font is Noto Sans
+        # Arabic (Bold) everywhere — drawtext captions, ASS
+        # subtitles, and the SRT->ASS export. Noto Naskh is no
+        # longer the default: this FFmpeg build's drawtext
+        # mis-shapes it (false lam-alef ligature from logical
+        # alef+lam; "بالتجربة" -> "بلا تجربة"), while Noto Sans
+        # Arabic renders the same logical string correctly.
+        from agentcut.render import _ass_font_for
+        from agentcut.srt import cues_to_ass_text
+        from agentcut.validate import find_font_for_text
+        f = find_font_for_text("بالتجربة")
+        self.assertTrue(f and "NotoSansArabic" in f, f)
+        self.assertNotIn("Naskh", f, f)
+        self.assertEqual(_ass_font_for({}, "بالتجربة"),
+                         ("Noto Sans Arabic", -1))
+        ass = cues_to_ass_text(
+            [{"text": "Hello", "start": 0.0, "end": 1.0}],
+            width=360, height=640)
+        self.assertIn("Noto Sans Arabic", ass)
+        self.assertNotIn("Noto Naskh", ass)
+
+    def test_145_caption_lam_alef_renders_clean(self):
+        # R4c-1 (Defect 1), render proof: the caption
+        # "بالتجربة" must render as the Noto Sans Arabic
+        # reference, not the Noto Naskh one. Bright-ink masks
+        # (white text on the dark board) in the bottom band,
+        # aligned by bbox: calibrated 2026-11-07 at
+        # diff(sans)=0.02, diff(naskh)=0.86, so the thresholds
+        # below have a wide margin on both sides.
+        p = self._base(duration=3.0)
+        p["captions"] = [{"text": "بالتجربة", "start": 0, "end": 3,
+                          "position": "bottom_center", "size": 44,
+                          "color": "white"}]
+        out = os.path.join(self.tmp, "d1.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        word_path = os.path.join(self.tmp, "word.txt")
+        with open(word_path, "w", encoding="utf-8") as fh:
+            fh.write("بالتجربة")
+        refs = {}
+        for name, fname in (("sans", "NotoSansArabic-Bold.ttf"),
+                            ("naskh", "NotoNaskhArabic-Regular.ttf")):
+            ref = os.path.join(self.tmp, f"d1_{name}.png")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i",
+                            os.path.join(BASE, "data", "test_media",
+                                         "board.png"),
+                            "-vf", (f"drawtext=fontfile={os.path.join(BASE, 'fonts', fname)}:"
+                                    f"textfile={word_path}:fontsize=44:"
+                                    "fontcolor=white:x=(w-text_w)/2:"
+                                    "y=h-text_h-40"),
+                            "-frames:v", "1", ref],
+                           check=True, timeout=60)
+            refs[name] = ref
+
+        def _ink_mask(path):
+            w, h, px = _png_px(path)
+            pts = set()
+            for y in range(max(0, h - 200), h):
+                for x in range(w):
+                    r, g, b = px(x, y)[:3]
+                    if r > 150 and g > 150 and b > 150:
+                        pts.add((x, y))
+            return pts
+
+        def _mask_diff(a, b):
+            def _bbox(pts):
+                xs = [x for x, _ in pts]
+                ys = [y for _, y in pts]
+                return min(xs), min(ys)
+            ax, ay = _bbox(a)
+            bx, by = _bbox(b)
+            a2 = frozenset((x - ax, y - ay) for x, y in a)
+            b2 = frozenset((x - bx, y - by) for x, y in b)
+            union = a2 | b2
+            return len(a2 ^ b2) / max(1, len(union))
+
+        _frame_png(out, 1.5, os.path.join(self.tmp, "f.png"))
+        ac = _ink_mask(os.path.join(self.tmp, "f.png"))
+        self.assertGreater(len(ac), 500, "caption ink present")
+        d_sans = _mask_diff(ac, _ink_mask(refs["sans"]))
+        d_naskh = _mask_diff(ac, _ink_mask(refs["naskh"]))
+        self.assertLess(d_sans, 0.15,
+                        f"caption != Sans reference: {d_sans:.3f}")
+        self.assertLess(d_sans, d_naskh,
+                        f"caption closer to Naskh ({d_naskh:.3f}) "
+                        f"than Sans ({d_sans:.3f})")
+
+    def test_145_background_rects_and_centre(self):
+        # R4c-2 (Defect 2), unit: background rects come from
+        # motion shapes/lower_third (their _bbox) and diagram
+        # cards (display rect); charts, counters and line shapes
+        # are NOT backgrounds. The centre test suppresses only a
+        # text centred on a background, and only while their
+        # windows overlap.
+        from agentcut.render import (_background_rects,
+                                     _text_on_background)
+        info = {"motion": [
+            {"id": "c", "kind": "shape", "shape": "circle",
+             "start": 0, "end": 4, "_bbox": (246, 506, 228, 228)},
+            {"id": "lt", "kind": "lower_third",
+             "start": 0, "end": 4, "_bbox": (60, 920, 600, 90)},
+            {"id": "ch", "kind": "bars",
+             "start": 0, "end": 4, "_bbox": (100, 100, 200, 200)},
+            {"id": "ln", "kind": "shape", "shape": "line",
+             "start": 0, "end": 4, "_bbox": (0, 0, 720, 10)},
+        ], "diagrams": [
+            {"id": "dg", "card": True, "size": 0.5,
+             "canvas_w": 360, "canvas_h": 200,
+             "position": "bottom_right", "start": 0, "end": 4},
+        ]}
+        rects = _background_rects(info, 720, 1280)
+        # circle + lower_third + diagram card = 3 (bars and the
+        # line shape are excluded).
+        self.assertEqual(len(rects), 3, rects)
+        # Diagram card: dw = 0.5*720 = 360, dh = 360*200/360 =
+        # 200, bottom_right -> (720-360-20, 1280-200-20).
+        card = [r for r in rects if r[0] == 340.0]
+        self.assertEqual(len(card), 1, rects)
+        self.assertEqual(card[0][1], 1060.0, card)
+        wc = {}
+        on = {"text": "اضغط", "start": 0, "end": 4,
+              "x": "center", "y": 600, "size": 40}
+        self.assertTrue(_text_on_background(
+            on, False, 720, 1280, 40, rects, wc))
+        # Same text, but its window does not overlap the shape.
+        off_time = dict(on, start=5, end=6)
+        self.assertFalse(_text_on_background(
+            off_time, False, 720, 1280, 40, rects, wc))
+        # Same text, moved off the shape (top of the frame).
+        off_pos = dict(on, y=100)
+        self.assertFalse(_text_on_background(
+            off_pos, False, 720, 1280, 40, rects, wc))
+        # A long line crossing the shape's edge keeps its box
+        # (it starts at the left edge, so its centre is off the
+        # shape even though it spans across it).
+        wide = {"text": "x" * 60, "start": 0, "end": 4,
+                "x": 0, "y": 600, "size": 40}
+        self.assertFalse(_text_on_background(
+            wide, False, 720, 1280, 40, rects, wc))
+
+    def test_145_text_on_shape_loses_box(self):
+        # R4c-2 (Defect 2), render proof: the explainer video's
+        # two confirmed cases — "project.json" in the blue card
+        # and "اضغط" on the yellow circle — must render with no
+        # black box, while a control text over the bare board
+        # keeps its box. Pixel probes (calibrated 2026-11-07):
+        # just above the glyphs, inside the would-be box area,
+        # the card stays pure blue (B~92; a box would darken it
+        # to B~47), the circle stays pure yellow (R~249; a box
+        # would darken it to R~125), and the control's box stays
+        # dark (G~26 vs the bare board's G~55).
+        p = self._base(duration=6.0)
+        p["motion"] = [
+            {"id": "filecard", "kind": "shape", "shape": "rect",
+             "start": 0, "end": 3, "x": 360, "y": 620,
+             "w": 460, "h": 160, "fill": "#1e3a5f",
+             "stroke": "#facc15", "stroke_width": 3,
+             "corner_radius": 16,
+             "keyframes": [{"t": 0, "x": 360, "y": 620},
+                           {"t": 3, "x": 360, "y": 620}]},
+            {"id": "button", "kind": "shape", "shape": "circle",
+             "start": 3, "end": 6, "x": 360, "y": 620,
+             "radius": 110, "fill": "#facc15",
+             "stroke": "white", "stroke_width": 3,
+             "keyframes": [{"t": 3, "x": 360, "y": 620},
+                           {"t": 6, "x": 360, "y": 620}]},
+        ]
+        p["texts"] = [
+            {"text": "project.json", "start": 0, "end": 3,
+             "x": "center", "y": 600, "size": 48, "color": "white"},
+            {"text": "اضغط", "start": 3, "end": 6,
+             "x": "center", "y": 600, "size": 40,
+             "color": "#1e3a5f"},
+            {"text": "control", "start": 0, "end": 6,
+             "x": "center", "y": 200, "size": 48, "color": "white"},
+        ]
+        out = os.path.join(self.tmp, "d2.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        _w, _h, px1 = _frame_png(out, 1.5,
+                                 os.path.join(self.tmp, "d2a.png"))
+        # Card blue, not box-darkened blue.
+        self.assertGreater(px1(360, 592)[2], 70,
+                           f"card pixel {px1(360, 592)[:3]}")
+        # Control box still present (darkened board).
+        self.assertLess(px1(360, 200)[1], 40,
+                        f"control pixel {px1(360, 200)[:3]}")
+        _w, _h, px2 = _frame_png(out, 4.5,
+                                 os.path.join(self.tmp, "d2b.png"))
+        # Circle yellow, not box-darkened olive.
+        self.assertGreater(px2(360, 595)[0], 200,
+                           f"circle pixel {px2(360, 595)[:3]}")
+
+    def test_145_reveal_caption_lines_stay_at_fixed_y(self):
+        # R4c-3b (Defect 3): a multi-line caption with
+        # reveal="word" keeps every line at its fixed y in the
+        # full block. Before the fix the 1-line prefix sat
+        # ~55px lower (y~1202) and jumped to y~1147 when it
+        # grew to 2 lines. The (1252,1255) cluster is a
+        # constant board background feature, filtered out.
+        p = self._base(duration=3.0)
+        p["captions"] = [{"text": "جملة واحدة، أو موجز قصير، "
+                                  "ويتولى هو الباقي.",
+                          "start": 0, "end": 3,
+                          "position": "bottom_center", "size": 36,
+                          "color": "white", "reveal": "word"}]
+        out = os.path.join(self.tmp, "d3b.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+
+        def _rows(t):
+            ink = _ink_mask(out, t, 1000, 1280, 0, 680)
+            return [r for r in _ink_y_rows(ink) if r[0] < 1240]
+
+        early = _rows(0.3)
+        self.assertEqual(len(early), 1,
+                         f"early rows {early}")
+        self.assertTrue(1130 <= early[0][0] <= 1170,
+                        f"early line 0 top {early[0][0]}")
+        late = _rows(2.9)
+        self.assertEqual(len(late), 2,
+                         f"late rows {late}")
+        # Line 0 did not move when the prefix grew to 2 lines.
+        self.assertLess(abs(late[0][0] - early[0][0]), 10,
+                        f"line 0 moved {early[0]} -> {late[0]}")
+        # Line 1 is a distinct row below line 0.
+        self.assertGreater(late[1][0], late[0][1] + 5,
+                           f"lines overlap {late}")
+
+    def test_145_multiline_caption_has_one_background(self):
+        # R4c-3a (Defect 3): a 2-line caption gets ONE unified
+        # background for the whole block, not two overlapping
+        # per-line boxes. The discriminating pixel is at line
+        # 1's row but outside line 1's narrow box (x=200):
+        # with per-line boxes it is the bare board (G~55);
+        # with the unified background it is dark (G~27).
+        # The text rows themselves stay at distinct y.
+        p = self._base(duration=3.0)
+        p["captions"] = [{"text": "جملة واحدة، أو موجز قصير، "
+                                  "ويتولى هو الباقي.",
+                          "start": 0, "end": 3,
+                          "position": "bottom_center", "size": 36,
+                          "color": "white"}]
+        out = os.path.join(self.tmp, "d3a.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        _w, _h, px = _frame_png(out, 1.5,
+                                os.path.join(self.tmp, "d3a.png"))
+        # Unified background: dark at line 1's row on both
+        # sides of the narrow second line.
+        self.assertLess(px(200, 1210)[1], 40,
+                        f"left of line 1 {px(200, 1210)[:3]}")
+        self.assertLess(px(500, 1210)[1], 40,
+                        f"right of line 1 {px(500, 1210)[:3]}")
+        # The glyphs are still there (line 0 white at its row).
+        self.assertGreater(sum(px(200, 1160)[:3]), 600,
+                           f"line 0 glyph {px(200, 1160)[:3]}")
+
+    def test_145_lower_third_auto_width(self):
+        # R4c-4 (Defect 4), validation: w is optional now;
+        # when omitted the card is sized to its text —
+        # clamp(text_w + 80, 220, 0.82 * W). A short Arabic
+        # word ("الحياة", text_w ~120px at size 36) lands on
+        # the 220px minimum; a long line clamps to 0.82*W;
+        # an explicit w is kept as-is.
+        from agentcut.validate import validate_project
+        base = self._base(duration=6.0)
+        base["motion"] = [
+            {"id": "lt1", "kind": "lower_third", "start": 0.5,
+             "end": 5.5, "x": 60, "y": 920, "h": 90,
+             "text": "الحياة", "card_color": "#1e3a5f"}]
+        errors, info = validate_project(base)
+        self.assertEqual(errors, [])
+        self.assertEqual(info["motion"][0]["w"], 220.0)
+        long_text = ("السباق نحو الذكاء الاصطناعي يغير كل شيء "
+                     "في حياتنا اليومية")
+        base["motion"] = [
+            {"id": "lt1", "kind": "lower_third", "start": 0.5,
+             "end": 5.5, "x": 60, "y": 920, "h": 90,
+             "text": long_text, "card_color": "#1e3a5f"}]
+        errors, info = validate_project(base)
+        self.assertEqual(errors, [])
+        self.assertEqual(info["motion"][0]["w"], 0.82 * 720)
+        base["motion"] = [
+            {"id": "lt1", "kind": "lower_third", "start": 0.5,
+             "end": 5.5, "x": 60, "y": 920, "w": 600, "h": 90,
+             "text": "الحياة", "card_color": "#1e3a5f"}]
+        errors, info = validate_project(base)
+        self.assertEqual(errors, [])
+        self.assertEqual(info["motion"][0]["w"], 600.0)
+
+    def test_145_lower_third_arabic_right_aligned(self):
+        # R4c-4 (Defect 4), render proof: an Arabic
+        # lower_third is right-aligned in its card (its ink
+        # ends ~27px from the card's right edge, the 24px
+        # padding plus the glyph's own bearing) and, when an
+        # accent_color is set, the accent bar sits on the
+        # RIGHT edge (yellow at the card's right side). A
+        # Latin lower_third stays left-aligned (ink starts
+        # ~27px from the card's left edge). Pixel/ink probes
+        # calibrated 2026-11-07 (proof-d4).
+        p = self._base(duration=9.0)
+        p["motion"] = [
+            {"id": "lt-auto", "kind": "lower_third", "start": 0.5,
+             "end": 3.0, "x": 60, "y": 920, "h": 90,
+             "text": "الحياة", "card_color": "#1e3a5f",
+             "accent_color": "#facc15"},
+            {"id": "lt-wide", "kind": "lower_third", "start": 3.5,
+             "end": 6.0, "x": 60, "y": 920, "w": 600, "h": 90,
+             "text": "الحياة", "card_color": "#1e3a5f"},
+            {"id": "lt-lat", "kind": "lower_third", "start": 6.5,
+             "end": 9.0, "x": 60, "y": 920, "h": 90,
+             "text": "Hello World", "card_color": "#1e3a5f"},
+        ]
+        out = os.path.join(self.tmp, "d4.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+
+        def _text_span(t):
+            ink = _ink_mask(out, t, 940, 990, 0, 680)
+            gs = _ink_groups(ink, min_gap=4)
+            # Drop the board's constant edge features.
+            xs = [(g[0], g[1]) for g in gs
+                  if not (g[0] <= 27 or g[0] >= 690)]
+            return min(g[0] for g in xs), max(g[1] for g in xs)
+
+        # Auto card is 220px wide (x 60..280): the Arabic
+        # text ends near the card's right edge.
+        lo, hi = _text_span(2.0)
+        self.assertGreater(hi, 240, f"auto Arabic span {(lo, hi)}")
+        self.assertLess(hi, 280, f"auto Arabic span {(lo, hi)}")
+        # The accent bar is yellow on the card's right edge.
+        _w, _h, px = _frame_png(out, 2.0,
+                                os.path.join(self.tmp, "d4a.png"))
+        self.assertGreater(px(270, 965)[0], 200,
+                           f"accent pixel {px(270, 965)[:3]}")
+        self.assertLess(px(70, 965)[0], 60,
+                        f"left edge {px(70, 965)[:3]}")
+        # Wide explicit card (x 60..660): the Arabic text
+        # ends near the card's right edge, not the left.
+        lo, hi = _text_span(5.0)
+        self.assertGreater(hi, 600, f"wide Arabic span {(lo, hi)}")
+        self.assertLess(hi, 660, f"wide Arabic span {(lo, hi)}")
+        # Latin: the text starts near the card's left edge.
+        lo, hi = _text_span(8.0)
+        self.assertLess(lo, 110, f"Latin span {(lo, hi)}")
+
+    def test_145_produce_explainer_emits_no_floating_shapes(self):
+        # R4c-5 (Defect 5): produce_explainer emits NO
+        # floating shapes. The pink erratic rect and yellow
+        # spinning rect in the explainer video are in that
+        # video's HAND-BUILT project.json (a motion shape
+        # "erratic" t=2-26 and a rotating rect), not in
+        # produce_explainer output — this test pins that the
+        # one-button path never generates a motion shape, and
+        # that its diagrams are template adapters (motion
+        # kinds), not chalk. The video-level fix for those two
+        # rects is project-side (remove them from the
+        # hand-built project), not a produce_explainer change.
+        from agentcut.render import produce_explainer
+        tmp = tempfile.mkdtemp(prefix="agentcut-d5-")
+        try:
+            bg = os.path.join(BASE, "data", "test_media", "board.png")
+            v1 = os.path.join(tmp, "v1.wav")
+            v2 = os.path.join(tmp, "v2.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error",
+                            "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=2",
+                            v1], check=True)
+            subprocess.run(["ffmpeg", "-y", "-v", "error",
+                            "-f", "lavfi",
+                            "-i", "sine=frequency=660:duration=2",
+                            v2], check=True)
+            s1 = os.path.join(tmp, "s1.srt")
+            with open(s1, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\n"
+                         "الجملة الأولى\n")
+            brief = {
+                "id": "expl-d5", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": bg, "title": "اختبار",
+                "chapters": True, "motion": "gentle", "music": None,
+                "scenes": [
+                    {"id": "s1", "title": "ما هي؟",
+                     "narration": v1, "captions": s1,
+                     "diagram": {"template": "causes",
+                                 "params": {"rows": 2}, "draw": 1.5,
+                                 "size": 0.72, "x": 101, "y": 330},
+                     "keywords": [{"text": "رجل القش", "start": 0.5,
+                                   "end": 1.5, "sfx": "pop"}]},
+                    {"id": "s2", "title": "كيف؟",
+                     "narration": v2, "captions": s1},
+                ]}
+            out = os.path.join(tmp, "expl.mp4")
+            ok, info = produce_explainer(brief, out)
+            self.assertTrue(ok, info)
+            project = info["project"]
+            # No motion list at all (only default_image_motion
+            # camera); in particular no shape elements.
+            self.assertEqual(project.get("motion", []), [])
+            self.assertTrue(project.get("default_image_motion"))
+            # The diagram is a template adapter, not chalk.
+            self.assertEqual(len(project["diagrams"]), 1)
+            self.assertEqual(
+                project["diagrams"][0].get("template"), "causes")
+            # Every text is a labelled title/keyword (no
+            # unlabeled floating shape text).
+            for t in project["texts"]:
+                self.assertTrue(str(t.get("text", "")).strip())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_145_master_encode_defaults(self):
+        # R4c-6 (Defect 6): the master encode is ALREADY
+        # crf 17 / preset medium / AAC 192k at 48 kHz — the
+        # user's requested crf 18 is exceeded (lower CRF =
+        # higher quality), so there is nothing to raise. The
+        # 799 kbps video / 127 kbps audio the user quotes is
+        # the PHONE copy (a separate ABR encode), not the
+        # master: ffprobe of the explainer master reads
+        # 8.0 Mbps video / 191.6 kbps audio. This test pins
+        # the defaults in the encode argv so they cannot
+        # regress silently. The SFX half of Defect 6 (sine
+        # -> pink-noise whoosh) is R3, already done.
+        from agentcut.render import build_ffmpeg_args
+        from agentcut.validate import validate_project
+        p = self._base(duration=3.0)
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [])
+        argv, _total, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        joined = " ".join(argv)
+        self.assertIn("-crf 17", joined)
+        self.assertIn("-preset medium", joined)
+        self.assertIn("-b:a 192k", joined)
+        self.assertIn("-ar 48000", joined)
+        self.assertIn("+faststart", joined)
+
+    def test_145_default_text_gets_rounded_pill(self):
+        # R5: the default boxed text gets a ROUNDED pill,
+        # not the sharp drawtext box. Proof (calibrated
+        # 2026-11-07, proof-r5): for "Hello World" at size 48
+        # over the board, the pill spans x 210..507, y 588..678
+        # (91px tall, size*1.4 + padding); its top-left corner
+        # pixel is board-coloured (the rounded corner cuts it
+        # off), while the old sharp box's corner was dark.
+        # The argv carries no drawtext box=1 at all (the
+        # review timecode is preview-only and is not in this
+        # render path).
+        from agentcut.render import build_ffmpeg_args
+        from agentcut.validate import validate_project
+        p = self._base(duration=3.0)
+        p["texts"] = [{"text": "Hello World", "start": 0, "end": 3,
+                       "x": "center", "y": 600, "size": 48,
+                       "color": "white"}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [])
+        argv, _total, _td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
+        if _td:
+            shutil.rmtree(_td, ignore_errors=True)
+        joined = " ".join(argv)
+        self.assertNotIn("box=1", joined)
+        self.assertIn("geq=", joined)
+        out = os.path.join(self.tmp, "r5.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        _w, _h, px = _frame_png(out, 1.5,
+                                os.path.join(self.tmp, "r5.png"))
+        # Rounded corner: board-coloured, not dark.
+        self.assertGreater(px(210, 588)[1], 45,
+                           f"corner {px(210, 588)[:3]}")
+        # Just inside the pill: dark.
+        self.assertLess(px(230, 590)[1], 40,
+                        f"inside {px(230, 590)[:3]}")
+        # The text is still there (white glyphs in the pill).
+        _bright = sum(
+            1 for _y in range(600, 660) for _x in range(210, 508)
+            if sum(px(_x, _y)[:3]) > 600)
+        self.assertGreater(_bright, 100,
+                           f"bright glyph px {_bright}")
+
+    def test_145_animated_text_keeps_sharp_box(self):
+        # R5 exception (deliberate): a static pill cannot
+        # follow a moving/fading text, so an animated, fading
+        # or tracked text keeps the sharp drawtext box (part
+        # of the drawtext filter, so it moves/fades with the
+        # text). The pill default applies only to static
+        # boxed texts.
+        from agentcut.render import build_ffmpeg_args
+        from agentcut.validate import validate_project
+        for extra in ({"animation": "slide_in"},
+                      {"fade_in": 0.5},
+                      {"animation": "pop_in"}):
+            p = self._base(duration=3.0)
+            t = {"text": "Hello", "start": 0, "end": 3,
+                 "x": "center", "y": 600, "size": 48,
+                 "color": "white"}
+            t.update(extra)
+            p["texts"] = [t]
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], extra)
+            argv, _total, _td = build_ffmpeg_args(p, info,
+                                                  "/tmp/x.mp4")
+            if _td:
+                shutil.rmtree(_td, ignore_errors=True)
+            self.assertIn("box=1", " ".join(argv), extra)
+
+    # ---- R6: spring physics + cubic_bezier (v1.45.0) ----
+    def test_145_spring_ease_values(self):
+        # The prompt's constants (k=180, c=14, m=1): f(0)=0,
+        # a ~15% overshoot peaking at u~0.27, f(0.5)~0.98,
+        # settled by u~0.7, f(1)=1. Verified empirically in
+        # the R0 probe; pinned here so a constant change
+        # cannot silently change every entrance.
+        from agentcut.motion import spring_ease
+        self.assertAlmostEqual(spring_ease(0.0), 0.0, places=6)
+        self.assertAlmostEqual(spring_ease(1.0), 1.0, places=3)
+        peak = max(spring_ease(u / 100.0) for u in range(101))
+        self.assertGreater(peak, 1.13)
+        self.assertLess(peak, 1.17)
+        self.assertAlmostEqual(spring_ease(0.5), 0.984, places=2)
+        self.assertAlmostEqual(spring_ease(0.7), 0.997, places=2)
+        # Settles: stays within 1% of 1 after u=0.7.
+        for u in (0.7, 0.8, 0.9, 1.0):
+            self.assertLess(abs(spring_ease(u) - 1.0), 0.01, u)
+
+    def test_145_cubic_bezier_ease(self):
+        # Exact Newton solve in Python: monotonic (the
+        # degree-5 polynomial fit was REJECTED for failing
+        # monotonicity), accurate against the known CSS-ease
+        # values, endpoints 0 and 1.
+        from agentcut.motion import cubic_bezier_ease
+        self.assertAlmostEqual(cubic_bezier_ease(0.0), 0.0, places=6)
+        self.assertAlmostEqual(cubic_bezier_ease(1.0), 1.0, places=6)
+        prev = -1.0
+        for i in range(101):
+            v = cubic_bezier_ease(i / 100.0)
+            self.assertGreaterEqual(v, prev - 1e-9, i)
+            prev = v
+        self.assertAlmostEqual(cubic_bezier_ease(0.5), 0.8024,
+                               places=3)
+        self.assertAlmostEqual(cubic_bezier_ease(0.25), 0.4085,
+                               places=2)
+        self.assertAlmostEqual(cubic_bezier_ease(0.75), 0.9605,
+                               places=2)
+
+    def test_145_shape_bbox_samples_spring_overshoot(self):
+        # A shape whose keyframe segment eases with spring
+        # overshoots past both keyframes (~15% of the travel).
+        # The bbox must include that overshoot — the old
+        # keyframes-only sampling clipped it (the motion video
+        # is bbox-sized, so a clipped bbox cuts the shape).
+        from agentcut.motion import shape_bbox
+        el = {"shape": "rect", "x": 100, "y": 100, "w": 200,
+              "h": 100,
+              "keyframes": [
+                  {"t": 0, "x": 100, "y": 100, "scale": 1.0,
+                   "opacity": 1.0, "easing": "spring"},
+                  {"t": 1, "x": 300, "y": 100, "scale": 1.0,
+                   "opacity": 1.0, "easing": "linear"}]}
+        bx, by, bw, bh = shape_bbox(el)
+        # Keyframes-only union would end at x=400 (+pad);
+        # the spring overshoot reaches x~429 (+pad).
+        self.assertGreater(bx + bw, 420, (bx, by, bw, bh))
+        self.assertLess(bx + bw, 435, (bx, by, bw, bh))
+
+    def test_145_lower_third_spring_entrance(self):
+        # EMPIRICAL spring proof (parent E): the card slides
+        # in with a spring overshoot. x=60, w=600, enter=0.6:
+        # at the spring peak (t=0.16, u=0.27) the card's left
+        # is ~156 and its right edge ~756, so x=700 is INSIDE
+        # the card (dark); at rest (t=1.0) the card spans
+        # 60..660, so x=700 is the bare board (brighter).
+        p = self._base(duration=3.0)
+        p["motion"] = [{"id": "lt1", "kind": "lower_third",
+                        "text": "Test", "x": 60, "y": 920,
+                        "w": 600, "h": 90, "start": 0, "end": 3,
+                        "enter": 0.6, "exit": 0.6}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data", "test_output_loop145_r6lt.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        r, g, b = _crop_mean(out, 0.16, 690, 955, 20, 20)
+        self.assertLess(g, 30, (r, g, b))
+        r, g, b = _crop_mean(out, 1.0, 690, 955, 20, 20)
+        self.assertGreater(g, 40, (r, g, b))
+
+    def test_145_chart_and_counter_easing_defaults(self):
+        # Spring is the default growth easing for charts and
+        # counters (v1.45.0, R6); an explicit easing wins.
+        p = self._base(duration=4.0)
+        p["motion"] = [
+            {"id": "b1", "kind": "bars", "x": 60, "y": 120,
+             "w": 600, "h": 300, "values": [20, 45],
+             "labels": ["A", "B"], "start": 0, "end": 4},
+            {"id": "c1", "kind": "counter", "x": 360, "y": 400,
+             "from": 0, "to": 100, "start": 0, "end": 4},
+            {"id": "b2", "kind": "bars", "x": 60, "y": 120,
+             "w": 600, "h": 300, "values": [20, 45],
+             "labels": ["A", "B"], "start": 0, "end": 4,
+             "easing": "smoothstep"}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        rel = {m["id"]: m for m in info["motion"]}
+        self.assertEqual(rel["b1"]["easing"], "spring")
+        self.assertEqual(rel["c1"]["easing"], "spring")
+        self.assertEqual(rel["b2"]["easing"], "smoothstep")
+
+    def test_145_pop_in_slide_in_use_spring(self):
+        # pop_in and slide_in now use the spring expression
+        # in the generated filter graph (exp/cos/sin with the
+        # prompt's constants); fade_up is NOT in the prompt's
+        # spring list and stays on its ease_out quad.
+        from agentcut.render import build_ffmpeg_args
+        for anim, needle in (("slide_in", "exp(-7*"),
+                             ("pop_in", "exp(-7*")):
+            p = self._base(duration=3.0)
+            p["texts"] = [{"text": "Hello", "start": 0, "end": 3,
+                           "x": "center", "y": 600, "size": 48,
+                           "color": "white", "animation": anim,
+                           "animation_duration": 0.8}]
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            argv, _total, _td = build_ffmpeg_args(p, info,
+                                                  "/tmp/x.mp4")
+            if _td:
+                shutil.rmtree(_td, ignore_errors=True)
+            joined = " ".join(argv)
+            self.assertIn(needle, joined, anim)
+            self.assertIn("cos(11.4477*", joined, anim)
+
+    # ---- R7: glassmorphism backdrop_blur (v1.45.0) ----
+    def test_145_backdrop_blur_defaults(self):
+        # Glass is ON by default for chart motion elements
+        # and for diagram cards; an explicit false wins; a
+        # non-boolean is an error.
+        p = self._base(duration=4.0)
+        p["motion"] = [
+            {"id": "b1", "kind": "bars", "x": 60, "y": 120,
+             "w": 600, "h": 300, "values": [20, 45],
+             "labels": ["A", "B"], "start": 0, "end": 4},
+            {"id": "b2", "kind": "bars", "x": 60, "y": 120,
+             "w": 600, "h": 300, "values": [20, 45],
+             "labels": ["A", "B"], "start": 0, "end": 4,
+             "backdrop_blur": False}]
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        rel = {m["id"]: m for m in info["motion"]}
+        self.assertTrue(rel["b1"]["backdrop_blur"])
+        self.assertFalse(rel["b2"]["backdrop_blur"])
+        p["motion"] = [
+            {"id": "b3", "kind": "bars", "x": 60, "y": 120,
+             "w": 600, "h": 300, "values": [20, 45],
+             "labels": ["A", "B"], "start": 0, "end": 4,
+             "backdrop_blur": "yes"}]
+        errors, _info = validate_project(p)
+        self.assertTrue(errors, errors)
+        self.assertEqual(errors[0]["code"], "INVALID_SCHEMA")
+
+    def test_145_pacing_beats_helper(self):
+        # v1.45.0, R8 (unit): the pacing beats for a long
+        # scene. A 25s scene gets lower_third (0-5s) +
+        # counter (13-20s) in cycle 1, then lower_third
+        # (20-25s, clamped) in cycle 2; a 10s scene gets
+        # nothing (short scenes keep the old layout).
+        from agentcut.render import _explainer_pacing_beats
+        beats = _explainer_pacing_beats(0.0, 25.0, "العنوان",
+                                        1, 4, 720, 1280)
+        kinds = [(b["kind"], b["start"], b["end"]) for b in beats]
+        self.assertEqual(kinds, [
+            ("lower_third", 0.0, 5.0),
+            ("counter", 13.0, 20.0),
+            ("lower_third", 20.0, 25.0)])
+        # Counter is the scene progress %: scene 2 of 4 = 50%.
+        # The suffix is ٪ (Arabic percent sign) — % is a
+        # filter-breaking character and validation rejects it.
+        self.assertEqual(beats[1]["to"], 50)
+        self.assertEqual(beats[1]["suffix"], "٪")
+        # Lower_third uses the spring entrance (enter=0.6).
+        self.assertEqual(beats[0]["enter"], 0.6)
+        self.assertEqual(beats[0]["text"], "العنوان")
+        # Short scene: no beats.
+        self.assertEqual(
+            _explainer_pacing_beats(0.0, 10.0, "قصير", 0, 2, 720, 1280),
+            [])
+        # 13s (the minimum long scene): one lower_third + one
+        # counter (13-13 is empty, so only the lower_third...
+        # actually 13-13 has zero length, so no counter).
+        b13 = _explainer_pacing_beats(0.0, 13.0, "ثلاثة عشر",
+                                      0, 1, 720, 1280)
+        self.assertEqual([(b["kind"], b["start"], b["end"]) for b in b13],
+                         [("lower_third", 0.0, 5.0)])
+
+    def test_145_produce_explainer_pacing_long_scene(self):
+        # v1.45.0, R8 (e2e): a 14s scene with pacing (the
+        # default) derives a lower_third (0-5s) + counter
+        # (13-14s, clamped) in the project, the diagram is
+        # constrained to 5-13s, and the static scene title
+        # text is NOT emitted (the lower_third replaces it).
+        # A second brief with pacing=false derives no motion
+        # and keeps the static title + whole-scene diagram.
+        from agentcut.render import produce_explainer
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-expl-pace-")
+        try:
+            bg = os.path.join(BASE, "data", "test_media", "board.png")
+            v1 = os.path.join(tmp, "v1.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=14", v1],
+                           check=True)
+            s1 = os.path.join(tmp, "s1.srt")
+            with open(s1, "w", encoding="utf-8") as fh:
+                fh.write("1\n00:00:00,000 --> 00:00:02,000\nنص\n")
+            base = {
+                "id": "expl-pace", "style": "blackboard",
+                "output": {"width": 720, "height": 1280, "fps": 30},
+                "background": bg, "title": "اختبار الإيقاع",
+                "chapters": True, "motion": "gentle", "music": None,
+                "scenes": [
+                    {"id": "s1", "title": "المشهد الطويل",
+                     "narration": v1, "captions": s1,
+                     "diagram": {"template": "causes",
+                                 "params": {"rows": 2}, "draw": 2.0,
+                                 "size": 0.72, "x": 101, "y": 330}}]}
+            out = os.path.join(tmp, "pace.mp4")
+            ok, info = produce_explainer(base, out)
+            self.assertTrue(ok, info)
+            proj = info["project"]
+            motion = proj.get("motion") or []
+            kinds = [(m["kind"], m["start"], m["end"]) for m in motion]
+            self.assertIn(("lower_third", 0.0, 5.0), kinds)
+            self.assertIn(("counter", 13.0, 14.0), kinds)
+            # The counter is scene 1 of 1 = 100%.
+            ct = [m for m in motion if m["kind"] == "counter"][0]
+            self.assertEqual(ct["to"], 100)
+            # Diagram constrained to beat 1 (5-13s).
+            dg = proj["diagrams"][0]
+            self.assertEqual((dg["start"], dg["end"]), (5.0, 13.0))
+            # No static scene-title text (the lower_third
+            # replaces it); the fixed brief title stays.
+            titles = [t["text"] for t in proj["texts"]]
+            self.assertNotIn("المشهد الطويل", titles)
+            self.assertIn("اختبار الإيقاع", titles)
+            # pacing=false: no motion, static title, whole
+            # scene diagram.
+            out2 = os.path.join(tmp, "nopace.mp4")
+            ok2, info2 = produce_explainer(
+                dict(base, pacing=False), out2)
+            self.assertTrue(ok2, info2)
+            proj2 = info2["project"]
+            self.assertEqual(proj2.get("motion") or [], [])
+            titles2 = [t["text"] for t in proj2["texts"]]
+            self.assertIn("المشهد الطويل", titles2)
+            dg2 = proj2["diagrams"][0]
+            self.assertEqual((dg2["start"], dg2["end"]), (0.0, 14.0))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        # Extension #2 performance benchmark (v1.45.0, R12): a
+        # 10s / 300-frame motion element renders in under 1.5s
+        # on the Python side, thanks to the existing frame cache
+        # (element_frame_signature, 1.43.0 — identical
+        # consecutive frames are reused, not re-rendered) and
+        # bytearray slice assignment in MotionCanvas._fill_span.
+        # Measured: a 10s lower_third (19 unique frames, 281
+        # cache hits) renders in ~1.25s (probe_bench10b.py). A
+        # heavier bars chart (39 unique frames) is ~1.64s, so
+        # the benchmark uses the lower_third, the representative
+        # hold-mostly element. The FULL encode_motion_video
+        # (Python render + FFmpeg PNG encode of 300 frames) is
+        # ~2.66s — the FFmpeg encode dominates and is NOT part
+        # of the <1.5s claim; the claim is the Python-side
+        # motion render. Also asserts the two deletions from
+        # the prompt: _measure_word_ink is gone (R2, HarfBuzz
+        # replaced it) and the glass card uses no geq (R7 fast
+        # path: boxblur + PNG mask + alphamerge).
+        import time as _time
+        from agentcut.motion import (
+            render_element_frame, element_frame_signature)
+        p = self._base(duration=10.0, motion=[{
+            "id": "lt1", "kind": "lower_third", "text": "Benchmark",
+            "x": 60, "y": 920, "w": 300, "h": 90,
+            "start": 0.0, "end": 10.0, "enter": 0.6, "exit": 0.0}])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        el = info["motion"][0]
+        fps = 30.0
+        frames = int(round((el["end"] - el["start"]) * fps))
+        self.assertEqual(frames, 300)
+        t0 = _time.time()
+        prev_sig, prev_b, unique = None, None, 0
+        for i in range(frames):
+            tt = float(el["start"]) + i / fps
+            sig = element_frame_signature(el, tt)
+            if sig == prev_sig and prev_b is not None:
+                continue
+            prev_b = render_element_frame(el, tt)
+            prev_sig = sig
+            unique += 1
+        dt = _time.time() - t0
+        # Most frames are cache hits (the element holds still
+        # after its 0.6s entrance), so unique is small.
+        self.assertLess(unique, 40, unique)
+        self.assertLess(dt, 1.5, f"10s motion render took {dt:.2f}s")
+        # _measure_word_ink is gone (deleted in R2).
+        import agentcut.render as _render_mod
+        import inspect as _inspect
+        src = _inspect.getsource(_render_mod)
+        self.assertNotIn("def _measure_word_ink", src)
+        self.assertNotIn("_measure_word_ink(", src)
+        # The glass card (fast path) uses no geq: build the
+        # argv for a bars project with glass and confirm the
+        # glass filters contain boxblur + alphamerge, not geq.
+        from agentcut.render import build_ffmpeg_args
+        p2 = self._base(duration=4.0, motion=[self._bars()])
+        errors2, info2 = validate_project(p2)
+        self.assertEqual(errors2, [], errors2)
+        info2["motion"][0]["_video"] = "/tmp/motion_d1.mov"
+        argv, _total, _td = build_ffmpeg_args(p2, info2, "/tmp/x.mp4")
+        joined = " ".join(argv)
+        self.assertIn("boxblur=16:2", joined)
+        self.assertIn("alphamerge", joined)
+        self.assertNotIn("gblur=sigma=18", joined)
+        # No geq anywhere in this glass+bars graph (the bars
+        # project has no boxed text, so no pill geq either).
+        self.assertNotIn("geq=", joined)
+
+    def test_145_late_pop_in_spring_does_not_overflow(self):
+        # R12 regression: the R6 spring pop_in used
+        # exp(-7*u) with u=(t-start)/dur, and FFmpeg
+        # evaluates the fontsize expression for t < start
+        # too (the if() guard only bounds the upper end),
+        # where u is very negative and exp(+large) overflows
+        # — a pop_in starting at t=22.7 failed the whole
+        # render with "fontsize overflow" at t=0 (u=-45.4,
+        # exp(317)). The spring u is now clamped to [0,1]
+        # in both _easing_factor (render.py) and
+        # _easing_expr_ffmpeg (motion.py). Prove with a real
+        # render of a late pop_in (start=22.7, the explainer's
+        # "التجربة والخطأ" case) plus a late lower_third
+        # (its x/alpha also use the spring). Also asserts
+        # the spring expressions are paren-balanced (the
+        # motion.py clamp initially added one extra ")",
+        # which broke the eval parser the same way).
+        from agentcut.motion import _easing_expr_ffmpeg
+        from agentcut.render import _easing_factor
+        for fn in (_easing_expr_ffmpeg, _easing_factor):
+            s = fn("spring", "((t-0.500)/0.600)")
+            self.assertEqual(s.count("("), s.count(")"), s)
+        p = self._base(duration=26.0, texts=[{
+            "text": "التجربة والخطأ", "size": 56,
+            "x": "center", "y": 800, "start": 22.7, "end": 26.0,
+            "animation": "pop_in", "color": "white"}],
+            motion=[{
+                "id": "lt1", "kind": "lower_third",
+                "text": "Late", "x": 60, "y": 920, "w": 300,
+                "h": 90, "start": 22.0, "end": 26.0,
+                "enter": 0.6, "exit": 0.0}])
+        errors, info = validate_project(p)
+        self.assertEqual(errors, [], errors)
+        out = os.path.join(BASE, "data",
+                           "test_output_loop145_r12latepop.mp4")
+        ok, _ = render_project(p, out)
+        self.assertTrue(ok)
+        # The pop_in text is visible at its peak (t=23.5).
+        w, h, px = _frame_png(out, 23.5, os.path.join(
+            BASE, "data", "test_output_loop145_r12latepop.png"))
+        bright = sum(1 for x in range(200, 520, 4)
+                     for y in range(790, 830, 4)
+                     if sum(px(x, y)[:3]) > 300)
+        self.assertGreater(bright, 20, bright)
+
+    def test_145_glass_card_darkens_chart_background(self):
+        # A bars element with the default glass card: the
+        # board behind the chart (above the bars, y=130) is
+        # darkened by the tint (G~31 vs the bare board G~55),
+        # while the bars themselves stay vivid. With
+        # backdrop_blur: false the same pixel is the bare
+        # board. Probed in probe_glass.py (interior (20,31,42)
+        # vs board (32,55,43)).
+        for blur, want_dark in ((True, True), (False, False)):
+            p = self._base(duration=4.0, motion=[self._bars(
+                **({} if blur else {"backdrop_blur": False}))])
+            errors, info = validate_project(p)
+            self.assertEqual(errors, [], errors)
+            out = os.path.join(
+                BASE, "data",
+                f"test_output_loop145_r7glass_{blur}.mp4")
+            ok, _ = render_project(p, out)
+            self.assertTrue(ok)
+            r, g, b = _crop_mean(out, 3.5, 180, 130, 40, 20)
+            if want_dark:
+                self.assertLess(g, 40, (r, g, b))
+            else:
+                self.assertGreater(g, 45, (r, g, b))
+
+    def test_145_contact_sheet_grid_and_labels(self):
+        # v1.45.0, R9: render_contact_sheet extracts 12 key
+        # frames into one 4x3 grid PNG with MM:SS labels.
+        # Uses a short rendered video (basic.json, 8s) so the
+        # render is fast; the sheet itself is 12 seeks + 1
+        # xstack. Verifies the PNG size (360x480 for the
+        # 360x640 basic video: 90x160 thumbnails, 4 across, 3
+        # down) and that 12 frames with MM:SS labels are
+        # returned. Also verifies the smart timestamps: with
+        # the basic project (a caption at 1s and a text at
+        # 0s) the frame times include the project moments,
+        # not just evenly spaced slots.
+        from agentcut.render import render_contact_sheet
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="agentcut-contact-")
+        try:
+            proj = json.loads(open(os.path.join(
+                BASE, "examples", "basic.json")).read())
+            vid = os.path.join(tmp, "basic.mp4")
+            ok, _ = render_project(proj, vid)
+            self.assertTrue(ok)
+            out = os.path.join(tmp, "sheet.png")
+            ok, info = render_contact_sheet(vid, out, project=proj)
+            self.assertTrue(ok, info)
+            self.assertEqual(len(info["frames"]), 12)
+            self.assertEqual((info["width"], info["height"]),
+                             (360, 480))
+            # Labels are MM:SS.
+            for f in info["frames"]:
+                self.assertRegex(f["label"], r"^\d\d:\d\d$")
+            # Times are sorted and within the video.
+            times = [f["time"] for f in info["frames"]]
+            self.assertEqual(times, sorted(times))
+            self.assertTrue(all(0 <= t < 8.0 for t in times))
+            # The PNG is really a PNG of the grid size.
+            w, h, _px = _png_px(out)
+            self.assertEqual((w, h), (360, 480))
+            # Without a project the times are evenly spaced.
+            out2 = os.path.join(tmp, "sheet2.png")
+            ok2, info2 = render_contact_sheet(vid, out2)
+            self.assertTrue(ok2, info2)
+            self.assertEqual(len(info2["frames"]), 12)
+            t2 = [f["time"] for f in info2["frames"]]
+            self.assertEqual(t2, sorted(t2))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_145_contact_sheet_tool_registered(self):
+        # v1.45.0, R9: render_contact_sheet is the 23rd MCP
+        # tool (22 -> 23) and the CLI accepts contact-sheet.
+        from agentcut.server import TOOLS
+        names = [t["name"] for t in TOOLS]
+        self.assertEqual(len(names), 23, names)
+        self.assertIn("render_contact_sheet", names)
+        tool = [t for t in TOOLS if t["name"] == "render_contact_sheet"][0]
+        self.assertIn("video", tool["inputSchema"]["required"])
+        # CLI: contact-sheet with a missing video is a
+        # structured error (exit 1), not a traceback.
+        import subprocess as _sp
+        _env = dict(os.environ)
+        _env["PYTHONPATH"] = os.path.join(BASE, "src")
+        r = _sp.run([sys.executable, "-m", "agentcut", "contact-sheet",
+                     "/tmp/does-not-exist.mp4", "/tmp/x.png"],
+                    capture_output=True, text=True, cwd=BASE, env=_env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FILE_NOT_FOUND", r.stdout)
 
 
 if __name__ == "__main__":

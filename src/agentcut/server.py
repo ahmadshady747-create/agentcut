@@ -21,7 +21,7 @@ try:
 except ImportError:  # Windows / platforms without fcntl
     fcntl = None
 
-from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_project, split_clip, timeline_summary
+from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_contact_sheet, render_project, split_clip, timeline_summary
 from .validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -252,6 +252,13 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "time": {"type": "number"}},
          "required": ["id"]}},
+    {"name": "render_contact_sheet",
+     "description": "Agent self-inspection: extract 12 key frames from a rendered video into one 4x3 grid PNG with an MM:SS timestamp on each thumbnail. Timestamps are chosen smartly from a stored project's timeline when project_id is given (chapter starts, diagram completions, motion/text starts), else evenly spaced. Returns the PNG path, the 12 frame times/labels, and the grid size.",
+     "inputSchema": {"type": "object", "properties": {
+         "video": {"type": "string"},
+         "output": {"type": "string"},
+         "project_id": {"type": "string"}},
+         "required": ["video"]}},
     {"name": "produce_video",
      "description": "Producer one-call: take a short brief (format preset, media paths, optional title/texts/audio) and return a finished video plus review frames. Blocks until the render completes.",
      "inputSchema": {"type": "object", "properties": {
@@ -417,6 +424,32 @@ def call_tool(name, args):
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{args['id']}.png")
         ok, info = poster_frame(project, out_path, time=args.get("time"))
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "render_contact_sheet":
+        # v1.45.0, R9 (23rd tool): video is a file path
+        # (resolved via resolve_path inside render_contact_sheet);
+        # output defaults to <video>.contact.png; project_id is
+        # optional and, when it names a stored project, drives
+        # the smart timestamps.
+        from .validate import resolve_path
+        video = args.get("video")
+        if not isinstance(video, str) or not video:
+            return _tool_error({"code": "INVALID_SCHEMA",
+                                "message": "render_contact_sheet needs a video path",
+                                "fix": "pass video as a rendered video file path"})
+        out = args.get("output")
+        if not isinstance(out, str) or not out:
+            out = resolve_path(video) + ".contact.png"
+        proj = None
+        pid = args.get("project_id")
+        if isinstance(pid, str) and pid:
+            proj = _load_project(pid)
+            if proj is None:
+                return _tool_error({"code": "PROJECT_NOT_FOUND",
+                                    "message": pid})
+        ok, info = render_contact_sheet(video, out, project=proj)
         if not ok:
             return _tool_error(info)
         return _text(info)

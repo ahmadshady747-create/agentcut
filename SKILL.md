@@ -710,11 +710,13 @@ video-specific; the rebuilt video is the proof.
   medium, bt709, +faststart, AAC 192k at 48 kHz, VBV
   caps scaled by resolution (below 1080p: 8M/16M).
   Phone copy (delivery, e.g. for a storage link):
-  `-b:v 800k -maxrate 1000k -crf 21 -preset medium
-  -b:a 128k` — 78 MB measured on the v3 rebuild (video 973k,
-  audio 127k; −crf 21 governs, −b:v is overridden in CRF
-  mode, −maxrate 1000k caps spikes). The master is never re-encoded to make the
-  phone copy; the phone copy is a separate encode.
+  `-b:v 800k -maxrate 1000k -bufsize 2000k -preset medium
+  -b:a 128k` — 938 kbps measured (ABR, no -crf; the earlier
+  CRF variant `-b:v 800k -maxrate 1000k -crf 21` ran at
+  7.0 Mbps on grainy/karaoke content because CRF mode ignores
+  -b:v and -maxrate without -bufsize is unenforced). The master
+  is never re-encoded to make the phone copy; the phone copy is
+  a separate encode.
 
 ## Motion graphics (1.43.0)
 
@@ -806,3 +808,17 @@ AgentCut does NO analysis and NO AI. These features consume local JSON files pro
 - `adjustments` (project-level): `[{start, end, grade?, effects?}]` — `grade` must be a `GRADE_PRESETS` name, `effects` reuse the effects vocabulary, at least one required. Applies to the base video only (overlays/texts/motion sit above, unaffected).
 - Easing: `ease_out_back` added to the shared easing system (validate, render, motion) — pop_in overshoots to ~1.06x at mid-entrance.
 - Byte-identity: every new feature is opt-in; projects without the new fields render byte-identically to 1.43.0.
+
+## Prune + spring/glass/pacing/contact-sheet (1.45.0)
+
+- Old diagram templates (`chart`, `balance`, `basket`, `causes`) are now adapters to Motion Layer elements (`line_chart`, `bars`, `donut`, `comparison_cards` — a new vector card row with staggered pop-in, accent bars and label/value derived texts). Old projects still validate and render via motion. `comparison_cards` takes 2–4 `{label, value?}` cards; a basket with 1 coin renders as a static circle (motion bars needs ≥2 values). The chalk stamp/grain code is deleted; strokes are clean vectors. Motion charts accept `draw` (staggered growth over `draw` seconds, then hold) and `fade_out`/`fade_start` (raster kinds only). Chart value labels have no background box (a pill would overlap the chart).
+- Word measurement is HarfBuzz (`_measure_text_width`, in-memory, shaped advances) — `_measure_word_ink` (cropdetect) is deleted. The sweep bar and kinetic widths use it.
+- SFX are pink-noise whooshes (80–500 Hz, linear afade) and bandpassed noise clicks/dings; only the sub-thud keeps a sine. Phone preset is ABR: `-b:v 800k -maxrate 1000k -bufsize 2000k -preset medium -b:a 128k` (938 kbps measured; the CRF variant ran 7.0 Mbps because CRF ignores -b:v and -maxrate without -bufsize is unenforced).
+- Boxed texts get rounded pills by default (radius 16, HarfBuzz-measured width). Animated/fading/tracked texts keep the sharp drawtext box. Texts on motion shapes/cards force `box=0`. Multi-line captions get one unified background; reveal lines stay at fixed y. **Byte-identity deliberately broken for boxed texts** (`examples/basic.json` md5 changed) — the prompt requires ALL sharp boxes replaced.
+- Spring easing: `spring` (k=180, c=14, m=1; ~15% overshoot, settled by u≈0.7) is the default for lower-third entrances, bar/donut growth, counters, `pop_in` and `slide_in`; `cubic_bezier` (CSS-ease, degree-4 polynomial fit, monotonic) is available. The spring `u` is clamped to [0,1] in FFmpeg expressions. `shape_bbox` samples quarter points of every segment (spring/ease_out_back overshoot breaks keyframes-only sampling).
+- Glassmorphism: motion charts and diagram cards accept `backdrop_blur` (default true) — boxblur 16:2 + `rgba(15,23,42,0.68)` tint + rounded-rect PNG mask via `alphamerge` + 2px white border at 0.22 alpha, radius 20. Fast (pre-rendered cached masks); the geq version was 22x slower.
+- Arabic default font is Noto Sans Arabic Bold everywhere (drawtext + Noto Naskh corrupted ال into a لا-like form in captions; the defect is drawtext-specific — libass was already correct). Lower thirds right-align Arabic and auto-size (`clamp(text_w + 80, 220, 0.82W)`); an opt-in `accent_color` draws a 6px bar on the text side (right for Arabic, left for Latin).
+- `produce_explainer` pacing (default on): long scenes (≥13s) get lower-third (0–5s) + diagram chart (5–13s) + progress counter (13–20s, scene index/total as ٪), repeating every 20s. Short scenes keep the old layout. `pacing: false` opts out. `produce_explainer` emits no motion shapes by default.
+- `render_contact_sheet` (23rd MCP tool) + CLI `contact-sheet <video> <out.png> [project.json]`: 12 key frames in a 4x3 grid PNG with MM:SS labels (smart timestamps from the project timeline when given).
+- `reveal_mask` stays dropped (dynamic crop re-proven infeasible: crop w/h frozen at the first frame's value on FFmpeg 8.1). `_mask_geq` is kept for explicit mask projects (the explainer uses none); the glass geq was the bottleneck and is replaced.
+- Byte-identity: projects without new fields render byte-identically to 1.44.0, EXCEPT boxed texts (see above) and the phone preset (docs only).
