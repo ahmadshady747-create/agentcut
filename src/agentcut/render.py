@@ -8,7 +8,6 @@ core, not a replacement of it.
 from __future__ import annotations
 
 import copy
-import ctypes
 import hashlib
 import json
 import math
@@ -22,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-from .srt import build_karaoke_ass
+from .srt import build_karaoke_ass, measure_text_width
 from .validate import (CUSTOM_TRANSITIONS, GRADE_PRESETS,
                        SFX_NAMES, TEXT_PRESETS, TEXT_STYLES,
                        XFADE_TRANSITIONS,
@@ -787,8 +786,52 @@ def _emit_glass_card(filters, vcur, overlay_index, bx, by, bw, bh,
     return f"vglass{gi}"
 
 
+def _pill_png_path(bw, bh, radius, color, opacity):
+    """Cached path to a pre-rendered pill PNG (v1.46.0, R4).
+
+    The pill is a static rounded-rect (colour + rounded alpha
+    + opacity) — it never changes per frame — so rendering it
+    once as an RGBA PNG and looping it as an input replaces
+    the per-frame colour-source + geq that _emit_text_pill
+    used to build. Measured (30s, 900f, one 198x91 pill):
+    the per-frame geq costs ~7s while the looped PNG costs
+    ~0.5s (the colour source + overlay alone cost ~0.6s, so
+    the geq is the cost, not the overlay). Generated with
+    FFmpeg itself using the SAME geq expression, so the PNG
+    is pixel-identical to the per-frame version by
+    construction. Returns None on generation failure (the
+    caller then falls back to the per-frame geq).
+    """
+    br = min(int(radius), int(bw) // 2, int(bh) // 2)
+    _c = "".join(ch for ch in str(color) if ch.isalnum())[:16]
+    name = (f"pill_{int(bw)}x{int(bh)}_r{br}_{_c}_"
+            f"o{float(opacity):.2f}.png")
+    d = os.path.join(tempfile.gettempdir(), "agentcut-pill-masks")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    path = os.path.join(d, name)
+    if os.path.isfile(path):
+        return path
+    vf = (f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+          f"a='{_rounded_alpha_factor(br)}*255*{float(opacity)}'")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", f"color=c={_ff_color(color)}:s={int(bw)}x{int(bh)}",
+             "-vf", vf, "-frames:v", "1", path],
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if proc.returncode != 0 or not os.path.isfile(path):
+        return None
+    return path
+
+
 def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
-                    radius, color, opacity, fps, afmt, start, end):
+                    radius, color, opacity, fps, afmt, start, end,
+                    argv=None):
     """Append a rounded-rect text background (pill) overlay.
 
     A colour source masked by the rounded-rect geq factor,
@@ -801,12 +844,28 @@ def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
     through this mechanism, never through drawtext box=1.
     (bx, by) is the pill's top-left (already padded and
     clamped); (bw, bh) its size. Returns the new vcur.
+
+    Since v1.46.0 (R4) the pill is a pre-rendered PNG
+    (_pill_png_path) looped as an input when argv is given —
+    the per-frame geq cost ~7s per pill per 30s, while the
+    looped PNG costs ~0.5s. When argv is None (direct
+    callers that bypass build_ffmpeg_args) or PNG generation
+    fails, the per-frame geq is used as a fallback.
     """
     br = min(int(radius), bw // 2, bh // 2)
-    filters.append(
-        f"color=c={_ff_color(color)}:s={bw}x{bh}:r={fps},"
-        f"format={afmt},geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-        f"a='{_rounded_alpha_factor(br)}*255*{opacity}'[box{overlay_index}]")
+    _pp = _pill_png_path(bw, bh, br, color, opacity) if argv is not None else None
+    if _pp is not None:
+        _pidx = _input_count(argv)
+        argv += ["-i", _pp]
+        filters.append(
+            f"[{_pidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+            f"trim=end={end - start},setpts=PTS-STARTPTS,"
+            f"format=rgba[box{overlay_index}]")
+    else:
+        filters.append(
+            f"color=c={_ff_color(color)}:s={bw}x{bh}:r={fps},"
+            f"format={afmt},geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='{_rounded_alpha_factor(br)}*255*{opacity}'[box{overlay_index}]")
     filters.append(
         f"[{vcur}][box{overlay_index}]overlay=x={bx}:y={by}:"
         f"eof_action=pass:enable='between(t,{start},{end})'[vbox{overlay_index}]")
@@ -1097,9 +1156,11 @@ def _camera_zoompan_filter(keyframes, var_t, width, height, d, fps):
     edge (x=0 or 1) stays a valid crop at every zoom instead of
     running off the frame. Scales are validated 1.0..1.25, so
     the 1.37.2 comfort max holds by construction. width/height
-    are zoompan's OUTPUT size: image paths pass 2x output
-    (v1.41.0 Fix 4 supersampling) and downscale after, video
-    paths pass output size directly (2x pre-scale only)."""
+    are zoompan's OUTPUT size: since v1.46.0 both image and
+    video paths pass output size directly (the 4x pre-scale /
+    2x zoompan of v1.41.0 Fix 4 was removed — measured ~4x
+    slower for a sub-visible sharpness gain; see the camera
+    branch in the clip chain)."""
     z = _camera_interp_expr(keyframes, "scale", var_t)
     fx = _camera_interp_expr(keyframes, "x", var_t)
     fy = _camera_interp_expr(keyframes, "y", var_t)
@@ -1111,21 +1172,128 @@ def _camera_zoompan_filter(keyframes, var_t, width, height, d, fps):
             f"d={d}:s={width}x{height}:fps={fps}")
 
 
+def _treatment_has_shadow(treatment):
+    """True when a treatment dict sets shadow > 0."""
+    if not isinstance(treatment, dict):
+        return False
+    try:
+        return float(treatment.get("shadow", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _treatment_mask_path(treatment, width, height):
+    """Cached path to a shadow mask PNG (v1.46.0, R3).
+
+    The mask is a black RGBA frame whose ALPHA is the shadow
+    darkening (sh * f, where f is the smoothstepped
+    distance-to-edge falloff): overlaying it on a video
+    multiplies every pixel by (1 - sh*f), exactly as the
+    per-frame shadow geq would, but the mask is rendered
+    ONCE (1 frame, cached under the system temp dir) instead
+    of evaluated per frame. Generated with FFmpeg itself, so
+    the factor is exact by construction: the real shadow geq
+    expression is applied to a white frame and the resulting
+    brightness is converted to an alpha channel
+    (a = 255 - r). Returns None when the treatment sets no
+    shadow, or when generation fails (the call sites then
+    fall back to the inline shadow geq, so the effect is
+    never silently dropped).
+
+    VIGNETTE is deliberately NOT in this mask: the vignette
+    filter multiplies luma DIRECTLY (Y*f, including the
+    limited-range black offset — measured: a white frame and
+    a grey frame give the same corner factor ~0.235, so the
+    filter does not scale above black), while a
+    blend-toward-black overlay gives Y*f + 16*(1-f). No
+    single alpha reproduces the direct multiply for all
+    brightnesses, so a vignette mask is inexact by up to
+    ~11 levels at vig=1.0 (mean 3.84) and ~5 at vig=0.4.
+    The vignette therefore stays the built-in per-frame
+    filter (see _treatment_filters). The shadow geq, by
+    contrast, multiplies RGB (where black is 0), so the
+    overlay reproduces it exactly (measured mean 0.82,
+    max 4 — rounding-level).
+    """
+    if not _treatment_has_shadow(treatment):
+        return None
+    sh = float(treatment.get("shadow", 0) or 0)
+    w, h = int(width), int(height)
+    name = f"shadow_{w}x{h}_s{sh:.3f}.png"
+    d = os.path.join(tempfile.gettempdir(), "agentcut-treatment-masks")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    path = os.path.join(d, name)
+    if os.path.isfile(path):
+        return path
+    # No a() term: this build's geq has no a(X,Y) function
+    # (verified: "Unknown function in 'a(X,Y)'"). The shadow
+    # geq multiplies the white frame by (1 - sh*f), exactly
+    # as the inline geq multiplies the video (in RGBA, where
+    # black is 0, so the multiply and the blend agree).
+    dd = "min(min(X,W-1-X),min(Y,H-1-Y))"
+    u = f"min(max(1-({dd})/(0.12*min(W,H)),0),1)"
+    f = f"({u})*({u})*(3-2*({u}))"
+    vf = (f"format=rgba,geq=r='255*(1-{sh}*({f}))':"
+          f"g='255*(1-{sh}*({f}))':"
+          f"b='255*(1-{sh}*({f}))',"
+          f"geq=r=0:g=0:b=0:a='255-r(X,Y)'")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", f"nullsrc=s={w}x{h}",
+             "-vf", vf, "-frames:v", "1", path],
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if proc.returncode != 0 or not os.path.isfile(path):
+        return None
+    return path
+
+
+def _treatment_shadow_inline(treatment, _fmt="yuv420p", _afmt="rgba"):
+    """Inline shadow geq (v1.40.0 behaviour). FALLBACK ONLY:
+    used when the pre-rendered mask from _treatment_mask_path
+    is unavailable, so a mask-generation failure never
+    silently drops the effect. Shadow is a soft inner edge
+    shadow via geq — distance-to-edge falloff over 12% of the
+    smaller side, smoothstepped — which needs an alpha format,
+    so the chain converts to rgba (gbrap in rgb mode) and
+    back.
+    """
+    if not isinstance(treatment, dict):
+        return ""
+    sh = float(treatment.get("shadow", 0) or 0)
+    if sh <= 0:
+        return ""
+    d = "min(min(X,W-1-X),min(Y,H-1-Y))"
+    u = f"min(max(1-({d})/(0.12*min(W,H)),0),1)"
+    f = f"({u})*({u})*(3-2*({u}))"
+    return (f"format={_afmt},geq=r='r(X,Y)*(1-{sh}*({f}))':"
+            f"g='g(X,Y)*(1-{sh}*({f}))':"
+            f"b='b(X,Y)*(1-{sh}*({f}))',format={_fmt}")
+
+
 def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
     """FFmpeg filter chain for a treatment dict (v1.40.0).
 
     Returns "" when nothing is set (all default off, so old
-    projects render identically). Grain is temporal noise (alls
-    is the integer strength, allf=t so it shimmers per frame);
-    vignette maps strength 0..1 to the lens angle PI/40..PI/4
-    (measured on this build on flat grey: corner/centre 0.99
-    at PI/40, 0.33 at PI/4); shadow is a soft inner edge shadow
-    via geq — distance-to-edge falloff over 12% of the smaller
-    side, smoothstepped — which needs an alpha format, so the
-    chain converts to rgba (gbrap in rgb mode) and back
-    (the clip chain continues in yuv420p — gbrp in rgb mode —
-    afterwards, and the project chain feeds overlays that
-    expect the chain format)."""
+    projects render identically). Grain is temporal noise
+    (alls is the integer strength, allf=t so it shimmers per
+    frame); vignette maps strength 0..1 to the lens angle
+    PI/40..PI/4 (measured on this build on flat grey:
+    corner/centre 0.99 at PI/40, 0.33 at PI/4). Since v1.46.0
+    (R3) the SHADOW is NOT here: it is applied as a
+    pre-rendered 1-frame mask + overlay via
+    _treatment_mask_path (see the call sites in
+    build_ffmpeg_args), because the shadow geq is evaluated
+    per frame while the mask is rendered once. The vignette
+    stays a per-frame filter — a mask cannot reproduce it
+    exactly (see _treatment_mask_path). Grain stays per-frame
+    by design — it must shimmer, and it is nearly free as a
+    filter (its cost is encoder-side)."""
     if not isinstance(treatment, dict):
         return ""
     parts = []
@@ -1138,21 +1306,6 @@ def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
         import math as _math
         angle = _math.pi * (0.025 + 0.225 * vig)
         parts.append(f"vignette=angle={angle!r}")
-    sh = float(treatment.get("shadow", 0) or 0)
-    if sh > 0:
-        # No a() term: this build's geq has no a(X,Y) function
-        # (verified: "Unknown function in 'a(X,Y)'"), and the
-        # chain converts straight back to yuv420p below, which
-        # discards alpha anyway — so the alpha plane needs no
-        # expression here (unlike overlay masks, where alpha is
-        # the point and the expression is a constant).
-        d = "min(min(X,W-1-X),min(Y,H-1-Y))"
-        u = f"min(max(1-({d})/(0.12*min(W,H)),0),1)"
-        f = f"({u})*({u})*(3-2*({u}))"
-        parts.append(
-            f"format={_afmt},geq=r='r(X,Y)*(1-{sh}*({f}))':"
-            f"g='g(X,Y)*(1-{sh}*({f}))':"
-            f"b='b(X,Y)*(1-{sh}*({f}))',format={_fmt}")
     return ",".join(parts)
 
 
@@ -1174,147 +1327,15 @@ def _ffmetadata_escape(text):
             .replace("#", "\\#").replace("=", "\\="))
 
 
-# HarfBuzz (ctypes) shaped-text measurement (v1.45.0, R2).
-# Replaces _measure_word_ink (cropdetect subprocesses): HarfBuzz
-# shapes the text with the same engine FFmpeg's drawtext uses
-# (same font, same shaping), and the shaped-advance sum is the
-# width drawtext lays out. The 5-int32 hb_glyph_position_t
-# (20-byte stride, HarfBuzz 8.x) is load-bearing: a 4-int32
-# struct reads garbage advances (probed empirically). The library
-# is loaded lazily once; when it (or the font file) is missing,
-# _measure_text_width falls back to the 0.6 x size estimate.
-_HB = None
-_HB_TRIED = False
-
-
-class _HBPosition(ctypes.Structure):
-    _fields_ = [("x_advance", ctypes.c_int32),
-                ("y_advance", ctypes.c_int32),
-                ("x_offset", ctypes.c_int32),
-                ("y_offset", ctypes.c_int32),
-                ("var", ctypes.c_int32)]
-
-
-def _load_harfbuzz():
-    """Load libharfbuzz.so.0 once (ctypes); None when unavailable."""
-    global _HB, _HB_TRIED
-    if _HB_TRIED:
-        return _HB
-    _HB_TRIED = True
-    try:
-        import ctypes
-        hb = ctypes.CDLL("libharfbuzz.so.0")
-        hb.hb_blob_create.restype = ctypes.c_void_p
-        hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
-                                      ctypes.c_int, ctypes.c_void_p,
-                                      ctypes.c_void_p]
-        hb.hb_blob_destroy.restype = None
-        hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_face_create.restype = ctypes.c_void_p
-        hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        hb.hb_face_destroy.restype = None
-        hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_face_get_upem.restype = ctypes.c_uint
-        hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
-        hb.hb_font_create.restype = ctypes.c_void_p
-        hb.hb_font_create.argtypes = [ctypes.c_void_p]
-        hb.hb_font_destroy.restype = None
-        hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_ot_font_set_funcs.restype = None
-        hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
-        hb.hb_font_set_scale.restype = None
-        hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                         ctypes.c_int]
-        hb.hb_buffer_create.restype = ctypes.c_void_p
-        hb.hb_buffer_create.argtypes = []
-        hb.hb_buffer_destroy.restype = None
-        hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_buffer_add_utf8.restype = None
-        hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
-                                          ctypes.c_char_p, ctypes.c_int,
-                                          ctypes.c_uint, ctypes.c_int]
-        hb.hb_buffer_guess_segment_properties.restype = None
-        hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
-        hb.hb_shape.restype = None
-        hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                ctypes.c_void_p, ctypes.c_uint]
-        hb.hb_buffer_get_length.restype = ctypes.c_uint
-        hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
-        hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
-            _HBPosition)
-        hb.hb_buffer_get_glyph_positions.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
-        _HB = hb
-    except Exception:
-        _HB = None
-    return _HB
-
-
+# HarfBuzz shaped-text measurement lives in srt.py (v1.46.1, R1):
+# measure_text_width() there is the single implementation (moved
+# from here so the wrapper and the validator can measure with the
+# real render font). _measure_text_width stays as a thin delegate
+# so existing callers and tests keep importing it from render.
 def _measure_text_width(text, font, size, cache=None):
-    """Shaped text width (px) at one size/font (v1.45.0, R2).
-
-    Replaces _measure_word_ink (two FFmpeg subprocesses per word):
-    in-process, exact, and subprocess-free. Measured against the
-    old cropdetect ink width on 12 Arabic+Latin words (sizes
-    48-60): the shaped width is always >= the ink width (ratio
-    1.020-1.208), so a bar or pill sized by this width always
-    covers its text, with at most ~21% slack on short words
-    (absorbed by the 12px padding). The direction does not matter
-    for the total: advances sum the same in logical or display
-    order, so the logical text is shaped directly. Returns the
-    0.6 x size per-character estimate (never None) when HarfBuzz
-    or the font file is unavailable, so callers need no fallback
-    of their own. Results are cached by (text, font, size) when a
-    cache dict is passed.
-    """
-    text = str(text)
-    key = (text, font, size)
-    if cache is not None and key in cache:
-        return cache[key]
-    fallback = max(10.0, len(text) * float(size) * 0.6)
-    width = fallback
-    hb = _load_harfbuzz()
-    if hb is not None and font and os.path.isfile(font):
-        blob = face = hbfont = buf = None
-        try:
-            import ctypes
-            with open(font, "rb") as fh:
-                data = fh.read()
-            # READONLY blob: no copy, no ownership — `data` must
-            # stay alive until the face is destroyed (it is a
-            # local, destroyed in the finally below).
-            blob = hb.hb_blob_create(data, len(data), 1, None, None)
-            face = hb.hb_face_create(blob, 0)
-            hbfont = hb.hb_font_create(face)
-            upem = hb.hb_face_get_upem(face)
-            hb.hb_ot_font_set_funcs(hbfont)
-            hb.hb_font_set_scale(hbfont, upem, upem)
-            buf = hb.hb_buffer_create()
-            raw = text.encode("utf-8")
-            hb.hb_buffer_add_utf8(buf, raw, len(raw), 0, -1)
-            hb.hb_buffer_guess_segment_properties(buf)
-            hb.hb_shape(hbfont, buf, None, 0)
-            count = ctypes.c_uint(0)
-            pos = hb.hb_buffer_get_glyph_positions(buf,
-                                                   ctypes.byref(count))
-            total = 0
-            for i in range(count.value):
-                total += pos[i].x_advance
-            width = total * float(size) / upem
-        except Exception:
-            width = fallback
-        finally:
-            if buf is not None:
-                hb.hb_buffer_destroy(buf)
-            if hbfont is not None:
-                hb.hb_font_destroy(hbfont)
-            if face is not None:
-                hb.hb_face_destroy(face)
-            if blob is not None:
-                hb.hb_blob_destroy(blob)
-    if cache is not None:
-        cache[key] = width
-    return width
+    """Shaped text width (px) at one size/font — delegates to
+    srt.measure_text_width (same behaviour, same fallback)."""
+    return measure_text_width(text, font, size, cache)
 
 
 def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
@@ -2279,9 +2300,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                       f"fps={fps},format={_fmt}")
             elif clip.get("camera"):
                 # Camera path on video (v1.40.0): 2x pre-scale
-                # + zoompan (the spec's minimum for video clips;
-                # stills supersample 4x, see below), but the crop
-                # follows the multi-stop path.
+                # + zoompan at output size (the spec's minimum
+                # for video clips; stills use a 1x cover
+                # pre-scale since v1.46.0, see below), but the
+                # crop follows the multi-stop path.
                 # zoompan d=1 emits one frame per input frame
                 # and `in` counts the fps-normalised stream,
                 # so in/fps is clip-local seconds. Validation
@@ -2337,18 +2359,30 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # over default motion; the input loop above skips
             # -loop for camera images for the same reason.
             frames = max(1, int(round(dur * fps)))
-            # v1.41.0 Fix 4: 4x supersampling before camera
-            # motion — zoompan crops at 4x precision (0.25
-            # output px after the 2x downscale) instead of
-            # integer-pixel crop rounding, then lanczos
-            # downscales 2x -> output. Framing is unchanged:
-            # crop fractions are relative to iw/ih.
-            pre = (f"{downscale}scale={4 * width}:{4 * height}:"
+            # v1.46.0: zoompan runs at OUTPUT resolution
+            # (s=WxH) with a 1x cover pre-scale and no
+            # lanczos downscale. The 4x pre-scale / 2x
+            # zoompan of v1.41.0 Fix 4 cost ~8.5s/150f vs
+            # ~2.0s at output res (board.png, medium/crf
+            # 17), and the pixel difference is mean 0.14
+            # levels on flat sources (max 20), mean ~1.5
+            # at max zoom on a worst-case detailed test
+            # pattern. The 4x supersampling bought
+            # sharpness on detailed stills, not motion
+            # smoothness — zoompan interpolates sub-pixel,
+            # and video camera clips already use output-res
+            # zoompan. The 1x cover pre-scale is kept: it
+            # normalises the source aspect to the output
+            # aspect (zoompan would otherwise stretch a
+            # mismatched source), and it is a no-op when
+            # the source already matches. Framing is
+            # unchanged: crop fractions are relative to
+            # iw/ih.
+            pre = (f"{downscale}scale={width}:{height}:"
                    f"force_original_aspect_ratio=increase,"
-                   f"crop={4 * width}:{4 * height}")
+                   f"crop={width}:{height}")
             vf = (f"[{i}:v]{pre},"
-                  f"{_camera_zoompan_filter(clip['camera'], f'(on/{fps})', 2 * width, 2 * height, frames, fps)},"
-                  f"scale={width}:{height}:flags=lanczos+accurate_rnd,"
+                  f"{_camera_zoompan_filter(clip['camera'], f'(on/{fps})', width, height, frames, fps)},"
                   f"setpts=PTS-STARTPTS,format={_fmt}")
         elif effective_ken_burns(clip, i, project) not in (None, "none"):
             # v1.37.2: the branch is driven by the EFFECTIVE motion
@@ -2358,12 +2392,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # punch post-scale is its only motion — never stacked.
             kb = effective_ken_burns(clip, i, project)
             frames = max(1, int(round(dur * fps)))
-            # Pre-scale to 4x output (cropped to a centred 4x frame)
-            # so zoompan crops at supersampled precision (v1.41.0
-            # Fix 4); a lanczos downscale to output follows zoompan.
-            pre = (f"{downscale}scale={4 * width}:{4 * height}:"
+            # v1.46.0: zoompan at OUTPUT resolution (see the
+            # camera branch above for the measurement note).
+            # 1x cover pre-scale only (aspect normalisation,
+            # no-op when the source already matches); no 4x
+            # pre-scale, no lanczos downscale.
+            pre = (f"{downscale}scale={width}:{height}:"
                    f"force_original_aspect_ratio=increase,"
-                   f"crop={4 * width}:{4 * height}")
+                   f"crop={width}:{height}")
             # Gentle drift (v1.37.2, intentional change): the old
             # 1.0->1.5 zoom (50%) read as vibration and grotesque
             # zoom in the 1.37.0 rhythm proof, especially stacked
@@ -2397,8 +2433,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 z = f"{_cs!r}" if _cs is not None else "1.12"
                 x_expr, y_expr = f"(iw-iw/zoom)*(1-{_s})", "(ih-ih/zoom)/2"
             vf = (f"[{i}:v]{pre},zoompan=z='{z}':x='{x_expr}':y='{y_expr}':"
-                  f"d={frames}:s={2 * width}x{2 * height}:fps={fps},"
-                  f"scale={width}:{height}:flags=lanczos+accurate_rnd,"
+                  f"d={frames}:s={width}x{height}:fps={fps},"
                   f"setpts=PTS-STARTPTS,format={_fmt}")
         elif clip.get("fit") in ("blur", "blur_pad"):
             filters.append(f"[{i}:v]{downscale}split=2[ba{i}][bb{i}]")
@@ -2477,8 +2512,22 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # General image treatment (v1.40.0): after colour
         # (grade/LUT), before fades, so fades operate on the
         # treated image. All default off, so old clips render
-        # identically.
+        # identically. Since v1.46.0 (R3) _treatment_filters
+        # returns only the grain; vignette/shadow ride on a
+        # pre-rendered 1-frame mask overlaid after the chain
+        # closes (below, before vlabels.append) — all three
+        # are multiplicative, so the order vs fades does not
+        # change the pixels. If mask generation fails, the
+        # inline vignette/shadow filters run instead.
         _tr = _treatment_filters(clip.get("treatment"), _fmt, _afmt)
+        _tmask = _treatment_mask_path(clip.get("treatment"),
+                                      width, height)
+        if _tmask is None and _treatment_has_shadow(
+                clip.get("treatment")):
+            _inline = _treatment_shadow_inline(
+                clip.get("treatment"), _fmt, _afmt)
+            if _inline:
+                _tr = f"{_tr},{_inline}" if _tr else _inline
         if _tr:
             vf += "," + _tr
         fades = []
@@ -2540,6 +2589,25 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             filters.append(
                 f"[bgc{i}][{keyed_label}]overlay=0:0,format={_fmt}[vout{i}]")
             vlabel = f"vout{i}"
+        if _tmask is not None:
+            # v1.46.0 (R3): vignette/shadow as a pre-rendered
+            # 1-frame mask + overlay. The mask is a black RGBA
+            # frame whose alpha is the combined darkening, so
+            # overlaying it multiplies the video by exactly the
+            # factor the per-frame vignette filter + shadow geq
+            # would apply. Looped for the clip duration; applied
+            # to the final clip output (after fades/mask/chroma
+            # key — all multiplicative, so the order does not
+            # change the pixels). Punch-in below reads vlabel,
+            # so it correctly operates on the masked stream.
+            _midx = _input_count(argv)
+            argv += ["-i", _tmask]
+            filters.append(
+                f"[{_midx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+                f"trim=end={dur},setpts=PTS-STARTPTS,format=rgba[trm{i}]")
+            filters.append(
+                f"[{vlabel}][trm{i}]overlay=0:0:eof_action=pass[vt{i}]")
+            vlabel = f"vt{i}"
         vlabels.append(vlabel)
         if clip.get("punch_at") is not None:
             # Punch-in (v1.37.0, redefined v1.37.2): a
@@ -2810,10 +2878,32 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # General image treatment, project level (v1.40.0): on the
     # joined timeline after scrims, before overlays/texts, so
     # graphics stay clean and grain covers the whole picture.
+    # Since v1.46.0 (R3) _treatment_filters returns only the
+    # grain; vignette/shadow ride on a pre-rendered 1-frame
+    # mask overlaid on the joined timeline (same factor, one
+    # overlay instead of a per-frame filter/geq). If mask
+    # generation fails, the inline filters run instead.
     _ptr = _treatment_filters(project.get("treatment"), _fmt, _afmt)
     if _ptr:
         filters.append(f"[{vcur_chain}]{_ptr}[vtr]")
         vcur_chain = "vtr"
+    _ptmask = _treatment_mask_path(project.get("treatment"),
+                                   width, height)
+    if _ptmask is not None:
+        _pmidx = _input_count(argv)
+        argv += ["-i", _ptmask]
+        filters.append(
+            f"[{_pmidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
+            f"trim=end={total},setpts=PTS-STARTPTS,format=rgba[ptrm]")
+        filters.append(
+            f"[{vcur_chain}][ptrm]overlay=0:0:eof_action=pass[vptr]")
+        vcur_chain = "vptr"
+    elif _treatment_has_shadow(project.get("treatment")):
+        _pinline = _treatment_shadow_inline(
+            project.get("treatment"), _fmt, _afmt)
+        if _pinline:
+            filters.append(f"[{vcur_chain}]{_pinline}[vtr]")
+            vcur_chain = "vtr"
     # Adjustment layers (v1.44.0, F6b): grade/effects windows
     # over the composited base video only (overlays/texts/motion
     # sit above, unaffected). Split/trim/overlay: the window is
@@ -3506,9 +3596,15 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 # line count, so line 0 never moves.
                 _full_lines = []
                 if _is_cap:
+                    # v1.46.1, R1: wrap with the real render font
+                    # (find_font_for_text resolves the same font
+                    # the drawtext loop uses), so the wrap packs
+                    # what the renderer lays out.
                     _full_lines = wrap_caption_lines(
                         str(_item["text"]), float(_item.get("size", 36)),
-                        width * cap_maxw)
+                        width * cap_maxw,
+                        font_path=find_font_for_text(
+                            str(_item["text"])))
                 if len(_full_lines) > 1:
                     _rsize = float(_item.get("size", 36))
                     _rlh = _rsize * cap_spacing
@@ -3627,7 +3723,13 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             wrapped_items.append((_item, _is_cap))
             continue
         _size = float(_item.get("size", 36))
-        _lines = wrap_caption_lines(str(_item["text"]), _size, width * cap_maxw)
+        # v1.46.1, R1: wrap with the real render font
+        # (find_font_for_text resolves the same font the drawtext
+        # loop uses), so the wrap packs what the renderer lays out.
+        _lines = wrap_caption_lines(str(_item["text"]), _size,
+                                    width * cap_maxw,
+                                    font_path=find_font_for_text(
+                                        str(_item["text"])))
         if len(_lines) <= 1:
             wrapped_items.append((_item, _is_cap))
             continue
@@ -3890,7 +3992,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     _cbw, _cbh, _crad,
                     item.get("box_color", "black"),
                     float(item.get("box_opacity", 0.5)),
-                    fps, _afmt, start, end)
+                    fps, _afmt, start, end, argv)
             filters.append(
                 f"[{vcur}]drawtext=fontfile={item_font}:"
                 f"text='{item['_counter_expr']}':"
@@ -3972,7 +4074,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 filters, vcur, overlay_index, _bbx, _bby,
                 _bbw, _bbh, _bbr, item.get("box_color", "black"),
                 float(item.get("box_opacity", 0.5)),
-                fps, _afmt, start, end)
+                fps, _afmt, start, end, argv)
         # Rounded text background (v1.36.0 pill, v1.45.0 R5
         # default): a generated rounded-rect colour source
         # overlaid UNDER the text, in place of drawtext's
@@ -4058,7 +4160,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 filters, vcur, overlay_index, bx, by, bw, bh,
                 _brad, item.get("box_color", "black"),
                 float(item.get("box_opacity", 0.5)),
-                fps, _afmt, start, end)
+                fps, _afmt, start, end, argv)
         # Highlight sweep / underline swipe (v1.44.0, F4): a bar
         # behind (highlight) or under (underline) the line that
         # sweeps in over the first 0.6s, then holds. The bar hugs
@@ -4802,16 +4904,20 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
                 # into the background.
                 continue
             if clip.get("camera") or effective_ken_burns(clip, ci, project) not in (None, "none"):
-                # Camera paths (v1.40.0) need the same 2x cover
-                # prescale as Ken Burns: their main-graph chain
-                # zooms from a 2x frame, and a contain prescale
-                # would bake black bars into that frame (caught
-                # by the round-1 camera render: letterboxed
-                # frames with a dark mean instead of the cover
-                # crop). The main-graph 2x scale is then a no-op
-                # on the already-2x frame, so framing is identical
-                # to rendering from the original.
-                pw, ph = 2 * tw, 2 * th
+                # Camera paths (v1.40.0) need a COVER prescale
+                # like Ken Burns: their main-graph chain zooms
+                # from the prescaled frame, and a contain
+                # prescale would bake black bars into that frame
+                # (caught by the round-1 camera render:
+                # letterboxed frames with a dark mean instead
+                # of the cover crop). Since v1.46.0 the
+                # main-graph chain zooms at output resolution
+                # (1x), so the prescale is 1x too — the same
+                # as the cover branch below. The main-graph 1x
+                # cover scale is then a no-op on the already-1x
+                # frame, so framing is identical to rendering
+                # from the original.
+                pw, ph = tw, th
                 vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
                       f"crop={pw}:{ph}")
             elif clip.get("fit") == "cover":

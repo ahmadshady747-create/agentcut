@@ -10,6 +10,8 @@ validation turns that into a structured INVALID_SCHEMA error.
 """
 from __future__ import annotations
 
+import ctypes
+import os
 import re
 
 _TIME_RE = re.compile(
@@ -66,7 +68,148 @@ def _word_width(word, size):
     return max(10.0, sum(_char_weight(ch) for ch in word) * float(size))
 
 
-def wrap_lines(text, size, max_width_px):
+# HarfBuzz (ctypes) shaped-text measurement (v1.46.1, R1).
+# Moved here from render.py (v1.45.0, R2) so the wrapper and the
+# validator can measure with the real render font: HarfBuzz shapes
+# the text with the same engine FFmpeg's drawtext uses (same font,
+# same shaping), and the shaped-advance sum is the width drawtext
+# lays out. The 5-int32 hb_glyph_position_t (20-byte stride,
+# HarfBuzz 8.x) is load-bearing: a 4-int32 struct reads garbage
+# advances (probed empirically). The library is loaded lazily
+# once; when it (or the font file) is missing, measure_text_width
+# falls back to the 0.6 x size estimate. render.py keeps
+# _measure_text_width as a thin delegate to this function.
+_HB = None
+_HB_TRIED = False
+
+
+class _HBPosition(ctypes.Structure):
+    _fields_ = [("x_advance", ctypes.c_int32),
+                ("y_advance", ctypes.c_int32),
+                ("x_offset", ctypes.c_int32),
+                ("y_offset", ctypes.c_int32),
+                ("var", ctypes.c_int32)]
+
+
+def _load_harfbuzz():
+    """Load libharfbuzz.so.0 once (ctypes); None when unavailable."""
+    global _HB, _HB_TRIED
+    if _HB_TRIED:
+        return _HB
+    _HB_TRIED = True
+    try:
+        hb = ctypes.CDLL("libharfbuzz.so.0")
+        hb.hb_blob_create.restype = ctypes.c_void_p
+        hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
+                                      ctypes.c_int, ctypes.c_void_p,
+                                      ctypes.c_void_p]
+        hb.hb_blob_destroy.restype = None
+        hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_face_create.restype = ctypes.c_void_p
+        hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        hb.hb_face_destroy.restype = None
+        hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_face_get_upem.restype = ctypes.c_uint
+        hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
+        hb.hb_font_create.restype = ctypes.c_void_p
+        hb.hb_font_create.argtypes = [ctypes.c_void_p]
+        hb.hb_font_destroy.restype = None
+        hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_ot_font_set_funcs.restype = None
+        hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
+        hb.hb_font_set_scale.restype = None
+        hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                         ctypes.c_int]
+        hb.hb_buffer_create.restype = ctypes.c_void_p
+        hb.hb_buffer_create.argtypes = []
+        hb.hb_buffer_destroy.restype = None
+        hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
+        hb.hb_buffer_add_utf8.restype = None
+        hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
+                                          ctypes.c_char_p, ctypes.c_int,
+                                          ctypes.c_uint, ctypes.c_int]
+        hb.hb_buffer_guess_segment_properties.restype = None
+        hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
+        hb.hb_shape.restype = None
+        hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_uint]
+        hb.hb_buffer_get_length.restype = ctypes.c_uint
+        hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
+        hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
+            _HBPosition)
+        hb.hb_buffer_get_glyph_positions.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        _HB = hb
+    except Exception:
+        _HB = None
+    return _HB
+
+
+def measure_text_width(text, font, size, cache=None):
+    """Shaped text width (px) at one size/font.
+
+    Measured against the old cropdetect ink width on 12 Arabic+Latin
+    words (sizes 48-60): the shaped width is always >= the ink width
+    (ratio 1.020-1.208), so a bar or pill sized by this width always
+    covers its text, with at most ~21% slack on short words
+    (absorbed by the 12px padding). The direction does not matter
+    for the total: advances sum the same in logical or display
+    order, so the logical text is shaped directly. Returns the
+    0.6 x size per-character estimate (never None) when HarfBuzz
+    or the font file is unavailable, so callers need no fallback
+    of their own. Results are cached by (text, font, size) when a
+    cache dict is passed.
+    """
+    text = str(text)
+    key = (text, font, size)
+    if cache is not None and key in cache:
+        return cache[key]
+    fallback = max(10.0, len(text) * float(size) * 0.6)
+    width = fallback
+    hb = _load_harfbuzz()
+    if hb is not None and font and os.path.isfile(font):
+        blob = face = hbfont = buf = None
+        try:
+            with open(font, "rb") as fh:
+                data = fh.read()
+            # READONLY blob: no copy, no ownership — `data` must
+            # stay alive until the face is destroyed (it is a
+            # local, destroyed in the finally below).
+            blob = hb.hb_blob_create(data, len(data), 1, None, None)
+            face = hb.hb_face_create(blob, 0)
+            hbfont = hb.hb_font_create(face)
+            upem = hb.hb_face_get_upem(face)
+            hb.hb_ot_font_set_funcs(hbfont)
+            hb.hb_font_set_scale(hbfont, upem, upem)
+            buf = hb.hb_buffer_create()
+            raw = text.encode("utf-8")
+            hb.hb_buffer_add_utf8(buf, raw, len(raw), 0, -1)
+            hb.hb_buffer_guess_segment_properties(buf)
+            hb.hb_shape(hbfont, buf, None, 0)
+            count = ctypes.c_uint(0)
+            pos = hb.hb_buffer_get_glyph_positions(buf,
+                                                   ctypes.byref(count))
+            total = 0
+            for i in range(count.value):
+                total += pos[i].x_advance
+            width = total * float(size) / upem
+        except Exception:
+            width = fallback
+        finally:
+            if buf is not None:
+                hb.hb_buffer_destroy(buf)
+            if hbfont is not None:
+                hb.hb_font_destroy(hbfont)
+            if face is not None:
+                hb.hb_face_destroy(face)
+            if blob is not None:
+                hb.hb_blob_destroy(blob)
+    if cache is not None:
+        cache[key] = width
+    return width
+
+
+def wrap_lines(text, size, max_width_px, measure=None):
     """Greedy word-wrap of LOGICAL text into lines fitting
     max_width_px. Words are never split, so Arabic words stay
     whole and joined (BiDi is applied per line later, at render
@@ -74,17 +217,25 @@ def wrap_lines(text, size, max_width_px):
     order correct). A single word wider than max_width_px stays
     on its own line (it will still clip; the overflow warning
     still fires for it). Width uses the relative-weight table
-    above (v1.41.0, Fix 2), so the estimator and the renderer
-    agree. Returns at least one line. This is the single source
-    of truth for wrapping; see wrap_subtitle_text for the
-    video-width-based wrapper."""
+    above (v1.41.0, Fix 2) by default; pass measure=(word, size)
+    -> px (e.g. HarfBuzz on the real render font) and the wrap
+    packs exactly what the renderer lays out — the table was
+    tuned for Noto Naskh Arabic and underestimates Noto Sans
+    Arabic Bold by ~30% (v1.46.1, R0: the table packs a 785px
+    line as 558px, which clipped at 720x1280). Returns at least
+    one line. This is the single source of truth for wrapping;
+    see wrap_subtitle_text for the video-width-based wrapper.
+    """
     words = str(text).split()
     if not words:
         return [str(text)]
+    if measure is None:
+        def measure(word, size=size):
+            return _word_width(word, size)
     lines, cur, cur_w = [], "", 0.0
-    space_w = float(size) * 0.30
+    space_w = measure(" ", size)
     for word in words:
-        word_w = _word_width(word, size)
+        word_w = measure(word, size)
         new_w = word_w if not cur else cur_w + space_w + word_w
         if cur and new_w > max_width_px:
             lines.append(cur)
@@ -97,7 +248,8 @@ def wrap_lines(text, size, max_width_px):
     return lines
 
 
-def wrap_subtitle_text(text, width, font_size, max_width_frac=0.8):
+def wrap_subtitle_text(text, width, font_size, max_width_frac=0.8,
+                       measure=None):
     """Wrap subtitle/caption text for a video of `width` pixels.
 
     The text block spans at most max_width_frac of the video
@@ -106,9 +258,12 @@ def wrap_subtitle_text(text, width, font_size, max_width_frac=0.8):
     font_size is the caption font size in pixels. Words are
     measured with the relative-weight table and never split, so
     a long Arabic sentence wraps at word boundaries and a long
-    English word stays whole. Returns a list of logical lines
-    (BiDi is applied per line at render time, never here)."""
-    return wrap_lines(text, font_size, float(width) * float(max_width_frac))
+    English word stays whole. Pass measure=(word, size) -> px to
+    wrap with the real render font instead of the table (see
+    wrap_lines). Returns a list of logical lines (BiDi is applied
+    per line at render time, never here)."""
+    return wrap_lines(text, font_size, float(width) * float(max_width_frac),
+                      measure=measure)
 
 
 def batch_captions_by_window(cues, window_seconds=60.0):

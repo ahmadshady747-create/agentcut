@@ -1243,7 +1243,7 @@ def _validate_word_timings(item, start, end, errors, label):
                           fix="remove fade_in/fade_out from this text; the word timings drive its display"))
 
 
-def wrap_caption_lines(text, size, max_width_px):
+def wrap_caption_lines(text, size, max_width_px, font_path=None):
     """Word-wrap a caption's LOGICAL text into lines fitting
     max_width_px (v1.36.0, the headline caption fix).
 
@@ -1251,9 +1251,20 @@ def wrap_caption_lines(text, size, max_width_px):
     wrapping (refactoring: never duplicate the algorithm). See
     srt.wrap_lines for the greedy word-packing rules (words never
     split, Arabic words stay whole and joined, BiDi per line at
-    render time). Returns at least one line.
+    render time). font_path (v1.46.1, R1): when given, lines are
+    measured with HarfBuzz on that font, so the wrap packs what
+    the renderer lays out; when None, the relative-weight table
+    estimates — which underestimates Noto Sans Arabic Bold by
+    ~30%, so pass the render font whenever it is known. Returns
+    at least one line.
     """
-    from .srt import wrap_lines
+    from .srt import measure_text_width, wrap_lines
+    if font_path:
+        _cache = {}
+
+        def _measure(word, size=size, _c=_cache, _f=font_path):
+            return measure_text_width(word, _f, size, _c)
+        return wrap_lines(text, size, max_width_px, measure=_measure)
     return wrap_lines(text, size, max_width_px)
 
 
@@ -1264,9 +1275,9 @@ def _text_box(item, is_caption, width, height, total,
     APPROXIMATION, documented honestly: the true drawtext box
     depends on the font's glyph advances, which validation does not
     measure. Caption width is the widest wrapped line measured
-    with the same weight estimator the wrapper uses (v1.41.0,
-    Fix 2 — so the box can never exceed the wrap width it was
-    wrapped at); non-caption text width keeps the flat
+    with the same HarfBuzz measure the wrapper uses (v1.46.1, R1 —
+    so the box can never exceed the wrap width it was wrapped at);
+    non-caption text width keeps the flat
     len(text) x size x 0.6 overestimate (safe direction for
     collision warnings and pill backdrops). Height is size x
     1.4; positions mirror render.py (numeric x/y, the POS_MAP
@@ -1282,13 +1293,21 @@ def _text_box(item, is_caption, width, height, total,
     render.py applies to the real caption anchor, so the
     estimated box and the rendered caption agree.
     """
-    from .srt import _word_width
+    from .srt import _word_width, measure_text_width
     text = str(item.get("text", ""))
     size = float(item.get("size", 36 if is_caption else 48))
-    cap_lines = wrap_caption_lines(text, size, width * max_width_frac) \
+    # v1.46.1, R1: measure with the real render font, so the box
+    # matches the wrapped lines the renderer lays out.
+    _cap_font = find_font_for_text(text) if is_caption else None
+    cap_lines = wrap_caption_lines(text, size, width * max_width_frac,
+                                   font_path=_cap_font) \
         if is_caption else [text]
     if is_caption:
-        est_w = max(10.0, max(_word_width(ln, size) for ln in cap_lines))
+        if _cap_font:
+            est_w = max(10.0, max(measure_text_width(ln, _cap_font, size)
+                                  for ln in cap_lines))
+        else:
+            est_w = max(10.0, max(_word_width(ln, size) for ln in cap_lines))
         if len(cap_lines) > 1:
             est_h = (len(cap_lines) - 1) * size * line_spacing + size * 1.4
         else:

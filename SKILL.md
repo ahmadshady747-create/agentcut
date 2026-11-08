@@ -822,3 +822,17 @@ AgentCut does NO analysis and NO AI. These features consume local JSON files pro
 - `render_contact_sheet` (23rd MCP tool) + CLI `contact-sheet <video> <out.png> [project.json]`: 12 key frames in a 4x3 grid PNG with MM:SS labels (smart timestamps from the project timeline when given).
 - `reveal_mask` stays dropped (dynamic crop re-proven infeasible: crop w/h frozen at the first frame's value on FFmpeg 8.1). `_mask_geq` is kept for explicit mask projects (the explainer uses none); the glass geq was the bottleneck and is replaced.
 - Byte-identity: projects without new fields render byte-identically to 1.44.0, EXCEPT boxed texts (see above) and the phone preset (docs only).
+
+## Performance (1.46.0)
+
+- Ken Burns and image-camera paths zoompan at OUTPUT resolution (1x cover pre-scale, no lanczos downscale). The video-camera branch is unchanged. Pixel-equivalence vs the 4x path: board.png mean 0.147 / max 20; detailed testsrc2 mean 0.71–1.62 / max 189 (sub-visible sharpness loss on detailed stills at max zoom; motion/framing unchanged).
+- Shadow geq replaced by a cached 1-frame PNG mask + overlay (`/tmp/agentcut-treatment-masks`, inline geq fallback on failure). Pill geq replaced by a cached pill PNG (`/tmp/agentcut-pill-masks`, per-frame geq fallback when argv is unavailable). The vignette mask was investigated and REJECTED (the vignette filter's direct-Y multiply cannot be reproduced by a blend overlay — measured systematic error). Explicit enable-gating of glass boxblur / `_mask_geq` / overlay shadow gblur was measured and NOT implemented (~0s — pull-based scheduling already skips them).
+- Grain (default temporal alls=10, unchanged): measured on the real 30s benchmark — alls=10 costs ~53s (46%, encoder-side), alls=3 ~33s, static (frozen) 40.1s, off 61.8s. Static being faster than off is a single-run measurement, reported as such. No `treatment.grain_mode` option exists yet.
+- Baseline corrected: the 1.45.0 R12 figure of 533.8s was a contended outlier; the true 1.45.0 30s time is ~235.5s. 1.46.0: 235.5s → 114.5s (2.06x); the full 233s extrapolates to ~15 min. <60s for a full render is not achievable with the current filter-graph architecture.
+- Byte-identity: projects without the changed features render byte-identically (no-feature project md5 3a8cc46a… on both trees). `examples/basic.json` (boxed text → pill) has a different bitstream but pixel-identical decoded frames (mean 0 / max 0).
+
+## Caption wrap (1.46.1)
+
+- SRT captions clipped at 720x1280 in 1.45.0/1.46.0 because the wrap used the static weight table (tuned for Noto Naskh Arabic) while the renderer uses Noto Sans Arabic Bold, 1.305x wider at the same size. The wrap now measures with HarfBuzz on the real render font: `srt.measure_text_width()` is the single implementation (moved from render.py; render keeps `_measure_text_width` as a delegate), `wrap_lines`/`wrap_subtitle_text` take `measure=(word, size) -> px`, `validate.wrap_caption_lines` takes `font_path`, and render.py's wrapping stage + reveal expansion pass the drawtext font. The Bold unification stays.
+- Proven margins on the reference cue (fresh frames): 38/40px at 360p, 116/118px at 720p (beats 1.44.0's 62px), 149/150px at 1080p. The ASS karaoke path is unaffected (no Python wrap; libass lays out the line). `examples/basic.json` (no captions) is byte-identical across 1.46.0/1.46.1 (md5 0843b0f3…).
+- Regression test class TestLoop1461 (wrap-measured-matches-render + SRT caption fits at 360p/720p/1080p, incl. the inline caption at 720p).

@@ -2735,13 +2735,23 @@ class TestAgentCut(unittest.TestCase):
         # logical text, words never split, single long words stay
         # whole (they clip with a warning — the documented
         # fallback — rather than crashing or splitting mid-word).
-        from agentcut.validate import _text_box, wrap_caption_lines
+        from agentcut.validate import _text_box, wrap_caption_lines, \
+            find_font_for_text
         long_ar = ("هذا نص عربي طويل جدا يحتاج إلى الالتفاف على عدة "
                    "أسطر لكي يظهر كاملا داخل الإطار")
-        lines = wrap_caption_lines(long_ar, 36, 324)
+        # v1.46.1, R1: the wrap is measured with the real render
+        # font (Noto Sans Arabic Bold), so the same text wraps
+        # into more lines than the table estimate did — the box
+        # below is computed from these same measured lines.
+        lines = wrap_caption_lines(
+            long_ar, 36, 324,
+            font_path=find_font_for_text(long_ar))
         self.assertGreater(len(lines), 1)
-        from agentcut.srt import _word_width
+        from agentcut.srt import _word_width, measure_text_width
+        _font = find_font_for_text(long_ar)
         for ln in lines:
+            self.assertLessEqual(measure_text_width(ln, _font, 36),
+                                 324 + 1e-6)
             self.assertLessEqual(_word_width(ln, 36), 324 + 1e-6)
         self.assertEqual(" ".join(lines), long_ar)
         self.assertEqual(len(wrap_caption_lines(
@@ -5215,11 +5225,18 @@ class TestDelta(unittest.TestCase):
         g = self._graph(p)
         self.assertIn("zoompan", g)
         self.assertIn("(3-2*(", g)  # smoothstep form, not linear
-        # v1.41.0 Fix 4: 4x pre-scale, zoompan at 2x output,
-        # lanczos downscale to output (was 2x pre-scale, s=WxH).
-        self.assertIn("scale=2880:5120", g)
-        self.assertIn("s=1440x2560", g)
-        self.assertIn("scale=720:1280:flags=lanczos+accurate_rnd", g)
+        # v1.46.0: zoompan at OUTPUT resolution — 1x cover
+        # pre-scale, s=WxH, no 4x pre-scale, no lanczos
+        # downscale (v1.41.0 Fix 4 removed: ~4x slower for
+        # a sub-visible sharpness gain).
+        self.assertIn("scale=720:1280:force_original_aspect_ratio=increase", g)
+        self.assertIn("s=720x1280", g)
+        self.assertNotIn("scale=2880:5120", g)
+        self.assertNotIn("s=1440x2560", g)
+        # (the final output colour scale still uses
+        # lanczos+accurate_rnd — that is the master
+        # conversion, not a per-clip downscale.)
+        self.assertNotIn("scale=720:1280:flags=lanczos+accurate_rnd", g)
         self.assertIn("fps=30", g)
 
     def test_delta_kb_even_output_dims(self):
@@ -5726,8 +5743,15 @@ class TestVisualLoop(unittest.TestCase):
                                       "shadow": 0.5}
         graph = self._graph(p)
         self.assertIn("noise=alls=8:allf=t", graph)
+        # v1.46.0 (R3): the vignette stays the built-in
+        # per-frame filter (a mask cannot reproduce its
+        # direct-Y multiply exactly — see
+        # _treatment_mask_path), while the shadow rides on a
+        # pre-rendered 1-frame mask + overlay, not a per-frame
+        # geq.
         self.assertIn("vignette=angle=", graph)
-        self.assertIn("geq=", graph)
+        self.assertIn("agentcut-treatment-masks", graph)
+        self.assertNotIn("geq=", graph)
         p2 = self._img_project(treatment={"grain": 8})
         graph2 = self._graph(p2)
         self.assertIn("noise=alls=8:allf=t", graph2)
@@ -6683,7 +6707,9 @@ class TestLoop141(unittest.TestCase):
         if _td:
             _shutil.rmtree(_td, ignore_errors=True)
         graph = " ".join(argv)
-        self.assertIn("geq", graph)
+        # v1.46.0 (R4): the rounded backdrop is a pre-rendered
+        # pill PNG, not a per-frame geq.
+        self.assertIn("agentcut-pill-masks", graph)
         self.assertIn("box0", graph)
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, "c.mp4")
@@ -7145,15 +7171,19 @@ class TestLoop141(unittest.TestCase):
                          (255, 255, 255), 6, 0.95)
         self.assertGreater(cv.opaque_pixel_count(), 0)
 
-    def test_camera_image_supersamples_4x(self):
-        # v1.41.0 Fix 4: image camera pre-scales 4x, zoompan
-        # outputs 2x, lanczos downscales to output. Video
-        # camera keeps 2x (spec minimum) — covered by the
-        # existing camera graph test, which asserts zoompan
-        # terms but no output size.
+    def test_camera_image_output_res_zoompan(self):
+        # v1.46.0: image camera zooms at OUTPUT resolution
+        # (1x cover pre-scale, zoompan s=WxH, no lanczos
+        # downscale). Replaces the v1.41.0 Fix 4 4x
+        # supersampling test (test_camera_image_supersamples_4x):
+        # the 4x path was ~4x slower for a sub-visible
+        # sharpness gain. Video camera already used output
+        # size directly — covered by the existing camera
+        # graph test, which asserts zoompan terms but no
+        # output size.
         from agentcut.render import build_ffmpeg_args
         import shutil as _shutil
-        p = {"id": "cam4x", "version": 1,
+        p = {"id": "cam1x", "version": 1,
              "output": {"width": 360, "height": 640, "fps": 30},
              "clips": [{"id": "a", "kind": "image",
                         "src": os.path.join(BASE, "data", "test_media",
@@ -7169,10 +7199,16 @@ class TestLoop141(unittest.TestCase):
         argv, _, td = build_ffmpeg_args(p, info, "/tmp/x.mp4")
         try:
             graph = " ".join(argv)
-            self.assertIn("scale=1440:2560", graph)
-            self.assertIn("s=720x1280", graph)
-            self.assertIn("scale=360:640:flags=lanczos+accurate_rnd",
+            self.assertIn("scale=360:640:force_original_aspect_ratio=increase",
                           graph)
+            self.assertIn("s=360x640", graph)
+            self.assertNotIn("scale=1440:2560", graph)
+            self.assertNotIn("s=720x1280", graph)
+            # (the final output colour scale still uses
+            # lanczos+accurate_rnd — that is the master
+            # conversion, not a per-clip downscale.)
+            self.assertNotIn("scale=360:640:flags=lanczos+accurate_rnd",
+                             graph)
         finally:
             if td:
                 _shutil.rmtree(td, ignore_errors=True)
@@ -8041,11 +8077,14 @@ class TestLoop142(unittest.TestCase):
         self.assertIn("y='1160.0'", graph)
 
     def test_fix3_caption_anchor_clamped(self):
-        # With the clamp on, the 2-line caption block tops at
-        # 1078.6 (bottom exactly 1177.6 = 0.92*1280); with it
-        # off, the old anchor tops at 1111.4 / 1160.0.
+        # With the clamp on, the 3-line caption block tops at
+        # 1030.0 (bottom exactly 1177.6 = 0.92*1280); with it
+        # off, the old anchor tops at 1062.8 / 1111.4 / 1160.0.
+        # (v1.46.1: the font-aware wrap splits this caption into
+        # 3 lines, not 2 — the old 2-line packing was wider than
+        # the frame in Noto Sans Arabic Bold.)
         from agentcut.render import build_ffmpeg_args
-        for resolve, expect in ((True, "1078.6"), (False, "1111.4")):
+        for resolve, expect in ((True, "1030.0"), (False, "1062.8")):
             ok, info = validate_project(self._zone_project(
                 resolve=resolve))
             self.assertEqual(ok, [], ok)
@@ -8565,11 +8604,11 @@ class TestLoop142(unittest.TestCase):
         self.assertIn("-b:a 192k", graph)
         self.assertIn("-ar 48000", graph)
 
-    def test_fix6_version_is_1_45_0(self):
+    def test_fix6_version_is_1_46_1(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "1.45.0")
+        self.assertEqual(agentcut.__version__, "1.46.1")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.45.0")
+            self.assertEqual(f.read().strip(), "1.46.1")
 
 
 class TestLoop143(unittest.TestCase):
@@ -11297,8 +11336,11 @@ class TestLoop145(unittest.TestCase):
         self.assertLess(px(500, 1210)[1], 40,
                         f"right of line 1 {px(500, 1210)[:3]}")
         # The glyphs are still there (line 0 white at its row).
-        self.assertGreater(sum(px(200, 1160)[:3]), 600,
-                           f"line 0 glyph {px(200, 1160)[:3]}")
+        # (v1.46.1: the font-aware wrap moved "هو" to line 1, so
+        # the old probe (200, 1160) now lands in a glyph gap;
+        # (500, 1170) is solidly on a line-0 glyph.)
+        self.assertGreater(sum(px(500, 1170)[:3]), 600,
+                           f"line 0 glyph {px(500, 1170)[:3]}")
 
     def test_145_lower_third_auto_width(self):
         # R4c-4 (Defect 4), validation: w is optional now;
@@ -11505,7 +11547,9 @@ class TestLoop145(unittest.TestCase):
             shutil.rmtree(_td, ignore_errors=True)
         joined = " ".join(argv)
         self.assertNotIn("box=1", joined)
-        self.assertIn("geq=", joined)
+        # v1.46.0 (R4): the rounded pill is a pre-rendered
+        # PNG, not a per-frame geq.
+        self.assertIn("agentcut-pill-masks", joined)
         out = os.path.join(self.tmp, "r5.mp4")
         ok, info = render_project(p, out)
         self.assertTrue(ok, info)
@@ -12005,6 +12049,121 @@ class TestLoop145(unittest.TestCase):
                     capture_output=True, text=True, cwd=BASE, env=_env)
         self.assertEqual(r.returncode, 1)
         self.assertIn("FILE_NOT_FOUND", r.stdout)
+
+
+class TestLoop1461(unittest.TestCase):
+    """SRT caption scaling regression (v1.46.1, R0-R3).
+
+    R0: SRT captions rendered ~1.8x too large and clipped at both
+    edges at 720x1280 in 1.45.0/1.46.0 (bright-pixel x-range
+    0..719), while 1.44.0 framed the same cue 62..657. Root cause:
+    the caption wrap used the static weight table (tuned for Noto
+    Naskh Arabic) while the renderer uses Noto Sans Arabic Bold,
+    1.305x wider at the same size — the wrap packed a 785px line
+    as 558px. The fix measures the wrap with HarfBuzz on the real
+    render font. These tests render the reference cue and assert
+    real margins, so the suite catches this class of bug (it
+    rendered at small sizes only before, where the bug hides).
+    """
+
+    CUE = "نفس السوق، نفس المحل، بس الفلوس ما عادتش تكفي."
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _bg(self, width, height):
+        # Solid dark background with no frame or border, so the
+        # bbox measurement below sees only the caption glyphs.
+        path = os.path.join(self.tmp, f"bg_{width}x{height}.png")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", f"color=c=0x1c2b26:s={width}x{height}:d=1",
+                        "-frames:v", "1", path], check=True)
+        return path
+
+    def _srt(self):
+        path = os.path.join(self.tmp, "cap.srt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("1\n00:00:01,000 --> 00:00:05,000\n" + self.CUE + "\n")
+        return path
+
+    def _project(self, width, height, fps=30):
+        return {"id": "loop1461", "version": 1,
+                "output": {"width": width, "height": height, "fps": fps},
+                "clips": [{"id": "c1", "kind": "image",
+                           "src": self._bg(width, height), "duration": 8}],
+                "captions": [{"text": "A real clip, made by an agent.",
+                              "start": 3.5, "end": 6.5}],
+                "captions_file": self._srt()}
+
+    def _caption_bbox(self, path, t):
+        # Bright-pixel bbox of the caption band (bottom 260 rows):
+        # white glyphs pass R,G,B > 180/180/150; the dark pill and
+        # the solid dark background never do.
+        _w, _h, px = _frame_png(path, t, os.path.join(self.tmp, "f.png"))
+        xs = []
+        for y in range(_h - 260, _h):
+            for x in range(_w):
+                r, g, b = px(x, y)[:3]
+                if r > 180 and g > 180 and b > 150:
+                    xs.append(x)
+        self.assertTrue(xs, "no caption pixels found")
+        return min(xs), max(xs)
+
+    def test_1461_wrap_measured_matches_render(self):
+        # R0: the table packs the reference line as 558px; the
+        # renderer lays out 785px in Noto Sans Arabic Bold at
+        # size 36. With the real font every wrapped line must fit
+        # inside the 80% cap it was wrapped at.
+        from agentcut.srt import measure_text_width
+        from agentcut.validate import find_font_for_text, wrap_caption_lines
+        font = find_font_for_text(self.CUE)
+        self.assertTrue(font and font.endswith("NotoSansArabic-Bold.ttf"),
+                        font)
+        for width in (360, 720, 1080):
+            lines = wrap_caption_lines(self.CUE, 36, width * 0.8,
+                                       font_path=font)
+            for ln in lines:
+                w = measure_text_width(ln, font, 36)
+                self.assertLessEqual(w, width * 0.8 + 1, (width, ln, w))
+
+    def test_1461_srt_caption_fits_720p(self):
+        # The regression: at 720x1280 the reference cue rendered
+        # 0..719 (clipped both edges) in 1.45.0/1.46.0; 1.44.0
+        # framed it 62..657. The fix must leave real margins.
+        # The same render also proves the inline caption fits
+        # (t=5.5, after the SRT cue ends, so only it is visible).
+        p = self._project(720, 1280)
+        out = os.path.join(self.tmp, "cap720.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        lo, hi = self._caption_bbox(out, 3.0)
+        self.assertGreaterEqual(lo, 20, (lo, hi))
+        self.assertLessEqual(hi, 720 - 20, (lo, hi))
+        lo, hi = self._caption_bbox(out, 5.5)
+        self.assertGreaterEqual(lo, 20, (lo, hi))
+        self.assertLessEqual(hi, 720 - 20, (lo, hi))
+
+    def test_1461_srt_caption_fits_1080p(self):
+        p = self._project(1080, 1920)
+        out = os.path.join(self.tmp, "cap1080.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        lo, hi = self._caption_bbox(out, 3.0)
+        self.assertGreaterEqual(lo, 20, (lo, hi))
+        self.assertLessEqual(hi, 1080 - 20, (lo, hi))
+
+    def test_1461_srt_caption_fits_360p(self):
+        p = self._project(360, 640)
+        out = os.path.join(self.tmp, "cap360.mp4")
+        ok, info = render_project(p, out)
+        self.assertTrue(ok, info)
+        lo, hi = self._caption_bbox(out, 3.0)
+        self.assertGreaterEqual(lo, 20, (lo, hi))
+        self.assertLessEqual(hi, 360 - 20, (lo, hi))
 
 
 if __name__ == "__main__":
