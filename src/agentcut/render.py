@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-from .srt import build_karaoke_ass, measure_text_width
+from .srt import build_karaoke_ass, measure_text_width, wrap_subtitle_text
 from .validate import (CUSTOM_TRANSITIONS, GRADE_PRESETS,
                        SFX_NAMES, TEXT_PRESETS, TEXT_STYLES,
                        XFADE_TRANSITIONS,
@@ -508,6 +508,8 @@ def bidi_display_text(text):
     form out). Arabic lines get RLE...PDF with RLM before trailing
     punctuation; every other line is returned unchanged."""
     s = str(text)
+    if "\n" in s:
+        return "\n".join(bidi_display_text(line) for line in s.split("\n"))
     if not _ARABIC_RE.search(s):
         return s
     if s.startswith(_RLE) and s.endswith(_PDF):
@@ -2033,7 +2035,8 @@ def _motion_derived_texts(info, width, height):
                 # No background box (box_ov=False): the pill
                 # would overlap the line below the label (same
                 # R5 overlap as the bars value label).
-                _label(_fmt_value(el["values"][i]), px, py - size - 12,
+                _chart_lbl_y = max(float(el["y"]) + 10, py - size - 12)
+                _label(_fmt_value(el["values"][i]), px, _chart_lbl_y,
                        start + (acc / total_len) * eff_window,
                        box_ov=False)
                 if i < len(seg_lens):
@@ -2054,10 +2057,15 @@ def _motion_derived_texts(info, width, height):
                 # the box (a drawtext box inside a card would be
                 # a nested sharp box — the thing this package
                 # removes).
-                _label(card["label"], card["cx"],
-                       card["y0"] + card["h"] * 0.16, when,
-                       box_ov=False)
-                if card["value"] is not None:
+                if card["value"] is None:
+                    _label(card["label"], card["cx"],
+                           card["y0"] + card["h"] * 0.45, when,
+                           size_ov=36,
+                           box_ov=False)
+                else:
+                    _label(card["label"], card["cx"],
+                           card["y0"] + card["h"] * 0.16, when,
+                           box_ov=False)
                     vtext = (_fmt_value(card["value"])
                              if isinstance(card["value"], (int, float))
                              else str(card["value"]))
@@ -3829,6 +3837,19 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     _bg_rects = _background_rects(info, width, height)
     for item, is_caption in render_items:
         size = item.get("size", 36 if is_caption else 48)
+        if not is_caption and not item.get("_counter") and item.get("text"):
+            _txt = str(item["text"])
+            _item_f = find_bundled_font(item["font"]) if item.get("font") else find_font_for_text(_txt)
+            if _item_f:
+                _mw = _measure_text_width(_txt, _item_f, size, _width_cache)
+                if _mw > width * 0.86:
+                    size = max(28, int(size * (width * 0.86) / _mw))
+                    item["size"] = size
+                    _mw2 = _measure_text_width(_txt, _item_f, size, _width_cache)
+                    if _mw2 > width * 0.88 and "\n" not in _txt:
+                        _lines = wrap_subtitle_text(_txt, width, size, max_width_frac=0.86)
+                        if len(_lines) > 1:
+                            item["text"] = "\n".join(_lines)
         if is_caption:
             if "_wrap_y" in item:
                 if item.get("position"):
@@ -4433,11 +4454,20 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # chain guarantees the mix is `total` long and -t
         # truncates any track that runs past it. afade windows
         # still align: after adelay, frame pts are timeline pts.
+        voice_chain = ""
+        if track.get("kind") == "voice":
+            voice_chain = (
+                ",highpass=f=80,"
+                "equalizer=f=220:t=q:w=1.2:g=-2.5,"
+                "equalizer=f=3800:t=q:w=1.0:g=3.0,"
+                "treble=g=2.0:f=8000,"
+                "acompressor=threshold=-18dB:ratio=3:attack=15:release=180:makeup=2.5dB"
+            )
         filters.append(
             f"[{base + j}:a]aresample=48000,"
             f"aformat=sample_rates=48000:channel_layouts=stereo,"
             f"adelay={start_ms}|{start_ms},"
-            f"volume={vol}{fade_parts}{loudnorm_part}{dn_part}[t{j}]")
+            f"volume={vol}{voice_chain}{fade_parts}{loudnorm_part}{dn_part}[t{j}]")
     if duck:
         # Deterministic ducking: one volume-automation filter per
         # music track. Gain is 1 outside every voice window, the
@@ -6738,7 +6768,7 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 chunk_proj = {
                     "id": f"{project.get('id', 'proj')}_chunk_{si}",
                     "version": 1,
-                    "output": project["output"],
+                    "output": dict(project["output"]),
                     "clips": [clip_i],
                     "audio": [{"src": scene["narration"], "kind": "voice", "volume": 1.0, "start": 0.0}],
                     "captions": sc_captions,
@@ -6748,6 +6778,8 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     "scrims": project.get("scrims", {}),
                     "default_image_motion": project.get("default_image_motion", False),
                 }
+                chunk_proj["output"]["master_loudnorm"] = True
+                chunk_proj["output"]["loudnorm_i"] = -14.0
 
                 chunk_out = os.path.join(tmp_dir, f"chunk_{si:03d}.mp4")
                 chunk_files.append(chunk_out)
@@ -6787,6 +6819,95 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         if proc.returncode != 0 or not os.path.isfile(joined_path):
             return False, {"code": "CONCAT_FAILED", "message": f"FFmpeg concat demuxer failed: {proc.stderr}"}
 
+        # Apply scene transitions if specified (Bug 5 fix)
+        cuts_to_apply = []
+        cur_time = 0.0
+        for si, scene in enumerate(scenes):
+            s_dur = scene["duration"]
+            if si > 0:
+                clip_trans = project["clips"][si].get("transition")
+                if clip_trans and clip_trans != "none":
+                    td = float(project["clips"][si].get("transition_duration", 0.5))
+                    cuts_to_apply.append((cur_time, clip_trans, td, si))
+            cur_time += s_dur
+
+        if cuts_to_apply:
+            trans_filters = []
+            vcur_chain = "0:v"
+            p_out = project.get("output", {})
+            width = int(p_out.get("width", 720))
+            height = int(p_out.get("height", 1280))
+            fps = int(p_out.get("fps", 30))
+            total = cur_time
+            _afmt = "rgba"
+            _fmt = "yuv420p"
+
+            for _cut, _kind, _td, _ci in cuts_to_apply:
+                _w0 = _cut - _td / 2.0
+                _w1 = _cut + _td / 2.0
+                _u = f"(t-{_w0:.3f})/{_td:.3f}"
+                _win = f"between(t,{_w0:.3f},{_w1:.3f})"
+                if _kind == "zoom_out":
+                    _s = f"if({_win},1-0.25*sin(3.14159265*{_u}),1)"
+                    trans_filters.append(
+                        f"[{vcur_chain}]scale=w='trunc(iw*({_s})/2)*2':"
+                        f"h='trunc(ih*({_s})/2)*2':eval=frame[zsc{_ci}]")
+                    trans_filters.append(
+                        f"color=c=black:s={width}x{height}:r={fps}:"
+                        f"d={total:.3f}[zbg{_ci}]")
+                    trans_filters.append(
+                        f"[zbg{_ci}][zsc{_ci}]overlay=x='(main_w-overlay_w)/2':"
+                        f"y='(main_h-overlay_h)/2':eof_action=pass,"
+                        f"fps={fps},format={_fmt}[cz{_ci}]")
+                    vcur_chain = f"cz{_ci}"
+                elif _kind == "whip_pan":
+                    _x = f"if({_win},{width}*(1-abs(2*{_u}-1)),0)"
+                    trans_filters.append(
+                        f"[{vcur_chain}]pad={2 * width}:{height}:0:0:black,"
+                        f"crop={width}:{height}:x='{_x}':y=0,"
+                        f"gblur=sigma=8:enable='{_win}'[cw{_ci}]")
+                    vcur_chain = f"cw{_ci}"
+                elif _kind == "glitch":
+                    trans_filters.append(
+                        f"[{vcur_chain}]rgbashift=rh=10:rv=0:gh=0:gv=0:bh=-10:bv=0:"
+                        f"enable='between(t,{_w0:.3f},{_w0 + 0.4 * _td:.3f})',"
+                        f"rgbashift=rh=-8:rv=2:gh=0:gv=0:bh=8:bv=-2:"
+                        f"enable='between(t,{_w0 + 0.4 * _td:.3f},{_w0 + 0.7 * _td:.3f})',"
+                        f"noise=alls=25:allf=t:enable='{_win}'[cg{_ci}]")
+                    vcur_chain = f"cg{_ci}"
+                elif _kind == "light_leak":
+                    _lx = f"if({_win},{-0.35 * width:.3f}+{0.7 * width:.3f}*{_u},0)"
+                    _a = (f"255*0.6*clip(1-sqrt(pow(X-{width / 2:.3f},2)"
+                          f"+pow(Y-{height / 2:.3f},2))/({0.7 * width:.3f}),0,1)")
+                    trans_filters.append(
+                        f"color=c=0xff9500:s={width}x{height}:r={fps},"
+                        f"format={_afmt},geq=r='255':g='150':b='0':a='{_a}'[leak{_ci}]")
+                    trans_filters.append(
+                        f"[{vcur_chain}][leak{_ci}]overlay=x='{_lx}':y=0:"
+                        f"enable='{_win}':eof_action=pass[cl{_ci}]")
+                    vcur_chain = f"cl{_ci}"
+                else:
+                    _s = f"if({_win},abs(2*{_u}-1),1)"
+                    trans_filters.append(f"[{vcur_chain}]colorlevels=rimax='{_s}':gimax='{_s}':bimax='{_s}'[cf{_ci}]")
+                    vcur_chain = f"cf{_ci}"
+
+            trans_out = os.path.join(tmp_dir, "transitioned.mp4")
+            fc_str = ";".join(trans_filters)
+            t_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", joined_path,
+                "-filter_complex", fc_str,
+                "-map", f"[{vcur_chain}]",
+                "-map", "0:a?",
+                "-c:v", video_codec,
+                "-preset", video_preset or "fast",
+                "-c:a", "copy",
+                trans_out,
+            ]
+            t_proc = subprocess.run(t_cmd, capture_output=True, text=True)
+            if t_proc.returncode == 0 and os.path.isfile(trans_out):
+                joined_path = trans_out
+
         music_tracks = [a for a in project.get("audio", []) if a.get("kind") == "music"]
         if music_tracks:
             music_src = music_tracks[0]["src"]
@@ -6796,11 +6917,13 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 "-i", joined_path,
                 "-i", music_src,
                 "-filter_complex",
-                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first[a]",
+                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14.0:TP=-1.0:LRA=11[a]",
                 "-map", "0:v",
                 "-map", "[a]",
                 "-c:v", "copy",
                 "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "48000",
                 final_tmp,
             ]
             proc = subprocess.run(mix_cmd, capture_output=True, text=True)
@@ -7155,13 +7278,28 @@ def produce_explainer(brief, output_path, review_dir=None):
             motion_els.extend(_explainer_pacing_beats(
                 start, dur, stitle, si, len(scenes_in), width, height))
         if isinstance(stitle, str) and stitle.strip() and not _long_paced:
+            st_text = stitle.strip()
+            st_size = _scene_title_size if look.get("title_style") else 52
+            st_font = find_font_for_text(st_text)
+            if st_font:
+                _smw = _measure_text_width(st_text, st_font, st_size)
+                if _smw > width * 0.86:
+                    st_size = max(28, int(st_size * (width * 0.86) / _smw))
+                    _smw2 = _measure_text_width(st_text, st_font, st_size)
+                    if _smw2 > width * 0.88 and "\n" not in st_text:
+                        _slines = wrap_subtitle_text(st_text, width, st_size, max_width_frac=0.86)
+                        if len(_slines) > 1:
+                            st_text = "\n".join(_slines)
             if look.get("title_style"):
-                texts.append({"text": stitle, "start": start, "end": end,
-                              "x": "center", "y": _scene_y,
-                              "style": look["title_style"]})
+                st_entry = {"text": st_text, "start": start, "end": end,
+                            "x": "center", "y": _scene_y,
+                            "style": look["title_style"]}
+                if st_size < _scene_title_size:
+                    st_entry["size"] = st_size
+                texts.append(st_entry)
             else:
-                texts.append({"text": stitle, "start": start, "end": end,
-                              "size": 52, "x": "center", "y": _scene_y,
+                texts.append({"text": st_text, "start": start, "end": end,
+                              "size": st_size, "x": "center", "y": _scene_y,
                               "color": "yellow", "box": False})
         # v1.41.0 Fix 6: this scene's content-stack bottom —
         # scene title if present, else the fixed title — and
@@ -7267,8 +7405,20 @@ def produce_explainer(brief, output_path, review_dir=None):
                 return False, {"code": "CLIP_OUT_OF_RANGE",
                                "message": f"scene {sid} keyword window {ks}..{ke}s is outside its scene (0..{dur:.2f}s)",
                                "fix": f"keep scene {sid} keyword start/end inside 0..{dur:.2f} with end after start"}
-            ktext = {"text": kw["text"], "start": round(start + ks, 3),
-                     "end": round(start + ke, 3), "size": 56,
+            kw_text = str(kw["text"])
+            kw_size = int(kw.get("size", 56))
+            kw_font = find_font_for_text(kw_text)
+            if kw_font:
+                _kmw = _measure_text_width(kw_text, kw_font, kw_size)
+                if _kmw > width * 0.86:
+                    kw_size = max(28, int(kw_size * (width * 0.86) / _kmw))
+                    _kmw2 = _measure_text_width(kw_text, kw_font, kw_size)
+                    if _kmw2 > width * 0.88 and "\n" not in kw_text:
+                        _klines = wrap_subtitle_text(kw_text, width, kw_size, max_width_frac=0.86)
+                        if len(_klines) > 1:
+                            kw_text = "\n".join(_klines)
+            ktext = {"text": kw_text, "start": round(start + ks, 3),
+                     "end": round(start + ke, 3), "size": kw_size,
                      "x": "center", "y": _kw_y, "color": "yellow",
                      "box": False}
             # Optional placement overrides (validated with the
@@ -7289,14 +7439,27 @@ def produce_explainer(brief, output_path, review_dir=None):
                        "narration": narration, "captions": srt_path})
         total = end
     if title:
-        texts.insert(0, {"text": title, "start": 0.0, "end": round(total, 3),
-                         "size": 60, "x": "center", "y": _fixed_y,
+        t_text = str(title).strip()
+        t_size = 60
+        t_font = find_font_for_text(t_text)
+        if t_font:
+            _tmw = _measure_text_width(t_text, t_font, t_size)
+            if _tmw > width * 0.86:
+                t_size = max(28, int(t_size * (width * 0.86) / _tmw))
+                _tmw2 = _measure_text_width(t_text, t_font, t_size)
+                if _tmw2 > width * 0.88 and "\n" not in t_text:
+                    _tlines = wrap_subtitle_text(t_text, width, t_size, max_width_frac=0.86)
+                    if len(_tlines) > 1:
+                        t_text = "\n".join(_tlines)
+        texts.insert(0, {"text": t_text, "start": 0.0, "end": round(total, 3),
+                         "size": t_size, "x": "center", "y": _fixed_y,
                          "color": "white", "box": False})
     project = {
         "id": brief.get("id", "explainer"),
         "title": title or "Explainer",
         "version": 1,
-        "output": {"width": width, "height": height, "fps": fps},
+        "output": {"width": width, "height": height, "fps": fps,
+                   "master_loudnorm": True, "loudnorm_i": -14.0},
         "clips": clips,
         "texts": texts,
         "captions": captions,

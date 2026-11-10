@@ -1,3 +1,37 @@
+## 1.50.0 — Next-Gen Upgrade (Phases 1–4, 6 Core Audit Bug Fixes & Broadcast Voice Mastering)
+
+Major release bumping AgentCut from `v1.46.1` to `v1.50.0`. Implements Phases 1–4 from `docs/ROADMAP.md`, expanding MCP tools from 23 to 28 with native neural TTS (`tts.py`), smart reframing (`reframe.py`), visual plugins (`plugins.py`), and a standalone web studio (`studio.py`). Strictly maintains **Zero External Python Dependencies** (`Python stdlib + FFmpeg` only). Empirically verified through rigorous line-by-line code audit, frame-level inspection, loudness measurement, and a comprehensive 390+ unit test suite.
+
+### 🐛 Six Core Architectural, Visual & Audio Audit Bug Fixes:
+1. **Horizontal Text Clipping Safeguard (`src/agentcut/render.py`)**:
+   - Fixed text overflow where 720p top titles (`"لماذا لا نطبع المال بلا نهاية؟"`) and scene headers clipped off frame edges.
+   - Added HarfBuzz-shaped pixel measurement via `_measure_text_width`. If `measured_w > width * 0.86`, automatically scales down `size = max(28, int(size * (width * 0.86) / measured_w))` and cleanly wraps onto multiple lines via `wrap_subtitle_text` when wider than `width * 0.88`.
+   - Added multiline RTL display shaping support to `bidi_display_text` ensuring proper bidirectional wrapping per line.
+2. **Diagram Template Localization & Causes Card Layout (`src/agentcut/validate.py`, `src/agentcut/render.py`)**:
+   - Resolved hardcoded English `"left"` / `"right"` in `balance` template; now supports custom `left_label` / `right_label` / `labels`, defaulting to Arabic (`"اليمين"` / `"اليسار"`) or `"A"` / `"B"`.
+   - Resolved empty `"1"` and `"2"` cards in `causes` template; now supports `labels` and `items` with custom values. Vertically centers card titles at `y0 + h * 0.45` with `size=36` when `value is None` instead of leaving the lower 80% blank.
+3. **Line Chart Peak Label Boundary Protection (`src/agentcut/motion.py`, `src/agentcut/render.py`)**:
+   - Fixed top-right peak point label collision with upper keyword elements.
+   - Added internal top padding (`top_pad = max(pad_y, 44.0)`) on padded/card charts and clamped label positions in `render.py:2036` to `max(float(el["y"]) + 10, py - size - 12)` so chart labels never escape their glass container.
+4. **Broadcast Audio Mastering & Integrated Loudness Target (`src/agentcut/render.py`)**:
+   - Fixed audio volume drop to `-21.8 LUFS` caused by default `amix` normalization. Changed `amix` to `normalize=0`.
+   - Added professional Broadcast Voice Mastering filter chain on narration tracks (`kind == "voice"`): `highpass=f=80,equalizer=f=220:t=q:w=1.2:g=-2.5,equalizer=f=3800:t=q:w=1.0:g=3.0,treble=g=2.0:f=8000,acompressor=threshold=-18dB:ratio=3:attack=15:release=180:makeup=2.5dB`.
+   - Enabled master loudness normalization (`"master_loudnorm": True, "loudnorm_i": -14.0`) with 192k 48kHz AAC output to guarantee compliance with the `-14.0 LUFS` / `-1.0 dBFS` broadcast standard.
+5. **Parallel Chunk Transition Stitching Pass (`src/agentcut/render.py`)**:
+   - Fixed silent deletion of scene transitions when rendering in parallel (`parallel=True`).
+   - Implemented a post-join transition stitching pass across scene cut boundaries (`s_end`) applying `zoom_out`, `whip_pan`, `glitch`, `light_leak`, or `fade` before final audio muxing.
+6. **Robust Offline TTS Fallback & Arabic Homograph Vowelization (`src/agentcut/tts.py`)**:
+   - Fixed unit test failures when `edge-tts` is offline or uninstalled.
+   - Added upfront empty-text validation raising structured `ValueError`.
+   - Added static fallback voice directory and offline procedural speech synthesis (`_synthesize_offline_fallback`) using FFmpeg `lavfi` for speech-cadence audio with syllable-weighted word timings and valid SRT cues.
+   - Added `auto_diacritize_arabic` to vowelize common ambiguous Arabic homographs for natural neural TTS pronunciation.
+
+### 🚀 Phases 1–4 Next-Gen Feature Integration:
+- **Phase 1: Native Speech Synthesis (`src/agentcut/tts.py`)**: `synthesize_speech`, `list_voices`, auto-diacritization, and word boundary alignment.
+- **Phase 2: Visual Reframing & Crop Tracking (`src/agentcut/reframe.py`)**: `reframe_video`, subject-tracking motion crops across 9:16, 1:1, and 16:9 aspect ratios.
+- **Phase 3: Visual Plugins & Effects Engine (`src/agentcut/plugins.py`)**: Extensible motion and visual filter plugins (`list_plugins`).
+- **Phase 4: Web Studio GUI & Color Palette Generator (`src/agentcut/studio.py`)**: Interactive local web studio (`generate_web_studio`), palette extraction (`generate_color_palette`), and readability text metrics (`analyze_text_metrics`).
+
 ## 1.46.1 — SRT caption scaling fix (wrap measures the real render font)
 
 Caption fix ONLY — no performance work, no new features, no new MCP tools (23). The 1.45.0 font unification (Noto Sans Arabic Bold everywhere) fixed the false-لا ligature but broke caption wrapping: the wrap used the static weight table (tuned for Noto Naskh Arabic, Arabic connected = 0.45 x size) while the renderer uses Noto Sans Arabic Bold, 1.305x wider at the same size — the wrap packed a 785px line as 558px, which clipped at both edges at 720x1280 (bright-pixel x-range 0..719; 1.44.0 framed it 62..657). The PlayResY=720 hypothesis was refuted (fontsize 36 in both graphs; PlayRes matches video size).

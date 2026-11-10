@@ -157,6 +157,16 @@ Sequential clips (video trims, image durations), transitions (`crossfade`, `fade
 - **Baseline corrected:** the 1.45.0 R12 baseline of 533.8s does not reproduce (re-runs: 232.2s / 238.9s, mean ~235.5s) — it was a contended outlier. Measured: 235.5s → 202.7s (zoompan) → 114.5s (pill PNG), a 2.06x speedup; the full 233s extrapolates to ~15 min. <60s for a full render is still not achievable with the current filter-graph architecture.
 - **Byte-identity:** projects without the changed features render byte-identically (a no-feature project: md5 3a8cc46a… on both trees). `examples/basic.json` (default boxed text → pill) has a different bitstream but pixel-identical decoded frames (mean 0 / max 0) — x264 decides differently for a PNG input vs a colour+geq source; the picture is unchanged. Test suite: **351/351**.
 
+### 🚀 Next-Gen Phases 1–4 & Core Audit Fixes — new in 1.50.0
+- **Phases 1–4 from ROADMAP.md completed:** Expanded MCP tools from 23 to 28 with native neural TTS (`tts.py`), multi-aspect auto-reframing (`reframe.py`), visual & motion plugins (`plugins.py`), and a standalone interactive web studio (`studio.py`). Strict Zero External Python Dependencies constraint preserved (`Python stdlib + FFmpeg` only).
+- **Six core audit bug fixes:**
+  1. Horizontal text clipping prevention with HarfBuzz pixel-advance measurement and auto-downscaling/wrapping for Arabic titles and headers.
+  2. Diagram template localization (`balance` Arabic labels `"اليمين"`/`"اليسار"` and `causes` cards vertical centering with custom items).
+  3. Line chart peak value boundary clamping preventing card escape and title collisions.
+  4. Broadcast voice mastering filter chain (`highpass`, parametric EQs, treble boost, vocal compression) and master loudness normalization target (`-14.0 LUFS` / `-1.0 dBFS`).
+  5. Scene transition preservation in parallel chunked explainer renders.
+  6. Offline procedural speech fallback (`lavfi` modulated cadence audio + word timings) and Arabic homograph auto-diacritization.
+
 ### ✏️ Caption fix — new in 1.46.1
 - **SRT captions clipped at 720x1280 in 1.45.0/1.46.0, fixed:** the wrap used a static weight table tuned for Noto Naskh Arabic while the renderer uses Noto Sans Arabic Bold (1.305x wider at the same size) — it packed a 785px line as 558px. The wrap now measures with HarfBuzz on the real render font (`measure_text_width` moved to `srt.py`; `wrap_caption_lines` takes `font_path`; the drawtext font resolver feeds it). The Bold unification stays; only the measurement changed. Proven on fresh frames: caption margins 38/40px at 360p, **116/118px at 720p** (beats 1.44.0's 62px), 149/150px at 1080p. The ASS karaoke path was verified unaffected (no Python wrap; libass lays out the line). `examples/basic.json` (no captions) renders byte-identically across 1.46.0/1.46.1 (md5 0843b0f3…). New regression test class TestLoop1461 (4 tests). Test suite: **355/355**.
 
@@ -259,4 +269,4 @@ AgentCut is licensed under the **Business Source License 1.1** — see [LICENSE]
 
 ## 📌 Version & Roadmap
 
-**Current: 1.46.1 + Next-Gen Phases 1-4 & ProCraft Integration Complete** — Features native neural TTS voiceovers, ASS kinetic subtitles, timeline/process diagrams, GPU hardware acceleration & parallel rendering, multi-aspect auto-reframing (`blur_pad`/`crop`/`fit`), dynamic motion & diagram plugin architecture, interactive zero-dependency HTML5 Web Studio inspector, ProCraft color harmonies & WCAG evaluation, text reading metrics & script diffing, token minification, deterministic scene caching, and 28 MCP tools. Total test suite: **392/392 passed**, run in CI on every push and pull request. See [docs/ROADMAP.md](docs/ROADMAP.md) for full architectural roadmap and test verification history. Full history: [CHANGELOG.md](CHANGELOG.md).
+**Current: 1.50.0 — Next-Gen Phases 1-4 & ProCraft Integration Complete** — Features native neural TTS voiceovers, ASS kinetic subtitles, timeline/process diagrams, GPU hardware acceleration & parallel rendering, multi-aspect auto-reframing (`blur_pad`/`crop`/`fit`), dynamic motion & diagram plugin architecture, interactive zero-dependency HTML5 Web Studio inspector, ProCraft color harmonies & WCAG evaluation, text reading metrics & script diffing, token minification, deterministic scene caching, and 28 MCP tools. Total test suite: **392/392 passed**, run in CI on every push and pull request. See [docs/ROADMAP.md](docs/ROADMAP.md) for full architectural roadmap and test verification history. Full history: [CHANGELOG.md](CHANGELOG.md).

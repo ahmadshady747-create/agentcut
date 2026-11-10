@@ -749,6 +749,18 @@ def line_chart_points(el):
     n = len(values)
     min_v, max_v = min(values), max(values)
     span = (max_v - min_v) if max_v > min_v else 1.0
+    pad_y = float(el.get("pad_y", 0.0))
+    if pad_y > 0:
+        top_pad = max(pad_y, 44.0)
+        bot_pad = max(float(el.get("pad_bottom", 12.0)), 12.0)
+        usable_h = max(10.0, float(el["h"]) - top_pad - bot_pad)
+        pts = []
+        for i, v in enumerate(values):
+            x = float(el["x"]) + (i * float(el["w"]) / (n - 1) if n > 1 else 0.0)
+            y = float(el["y"]) + float(el["h"]) - bot_pad - \
+                (float(v) - min_v) / span * usable_h
+            pts.append((x, y))
+        return pts
     pts = []
     for i, v in enumerate(values):
         x = float(el["x"]) + (i * float(el["w"]) / (n - 1) if n > 1 else 0.0)

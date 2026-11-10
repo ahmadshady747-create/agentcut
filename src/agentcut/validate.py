@@ -1313,8 +1313,17 @@ def _text_box(item, is_caption, width, height, total,
         else:
             est_h = size * 1.4
     else:
-        est_w = max(10.0, len(text) * size * 0.6)
-        est_h = size * 1.4
+        if "\n" in text:
+            lines = text.split("\n")
+            _font = find_bundled_font(item["font"]) if item.get("font") else find_font_for_text(text)
+            if _font:
+                est_w = max(10.0, max(measure_text_width(ln, _font, size) for ln in lines))
+            else:
+                est_w = max(10.0, max(len(ln) * size * 0.6 for ln in lines))
+            est_h = (len(lines) - 1) * size * line_spacing + size * 1.4
+        else:
+            est_w = max(10.0, len(text) * size * 0.6)
+            est_h = size * 1.4
     pos = item.get("position")
     if pos:
         presets = {
@@ -2128,7 +2137,7 @@ def _validate_stroke(st, cw, ch, errors, did):
     return out
 
 
-def _adapt_template_diagram(tname, params, rdg, width, height):
+def _adapt_template_diagram(tname, params, rdg, width, height, project=None):
     """Build the motion element for a legacy template diagram
     (v1.45.0, R4b-3).
 
@@ -2222,19 +2231,60 @@ def _adapt_template_diagram(tname, params, rdg, width, height):
                         "labels": [str(i + 1) for i in range(coins)]})
             n = coins
     elif tname == "balance":
+        left_lbl = params.get("left_label")
+        right_lbl = params.get("right_label")
+        labels = params.get("labels")
+        if labels and isinstance(labels, (list, tuple)) and len(labels) >= 2:
+            if not left_lbl:
+                left_lbl = str(labels[0])
+            if not right_lbl:
+                right_lbl = str(labels[1])
+        if not left_lbl or not right_lbl:
+            is_ar = False
+            if project:
+                proj_title = str(project.get("title", ""))
+                if any("\u0600" <= ch <= "\u06ff" for ch in proj_title):
+                    is_ar = True
+                else:
+                    for txt in project.get("texts", []):
+                        if any("\u0600" <= ch <= "\u06ff" for ch in str(txt.get("text", ""))):
+                            is_ar = True
+                            break
+            if not is_ar:
+                for s in (rdg.get("title", ""), params.get("title", "")):
+                    if any("\u0600" <= ch <= "\u06ff" for ch in str(s)):
+                        is_ar = True
+                        break
+            if not left_lbl:
+                left_lbl = "اليمين" if is_ar else "A"
+            if not right_lbl:
+                right_lbl = "اليسار" if is_ar else "B"
+
         mel.update({"kind": "comparison_cards", "x": px, "y": py,
                     "w": dw, "h": dh, "draw": draw,
-                    "cards": [{"label": "left",
+                    "cards": [{"label": str(left_lbl),
                                "value": float(params.get("left", 1))},
-                              {"label": "right",
+                              {"label": str(right_lbl),
                                "value": float(params.get("right", 1))}]})
         n = 2
     else:  # causes
-        rows = int(params.get("rows", 3))
+        items = params.get("items") or params.get("labels")
+        if items and isinstance(items, (list, tuple)):
+            cards = []
+            for i, itm in enumerate(items):
+                if isinstance(itm, dict):
+                    cards.append({"label": str(itm.get("label", i + 1)),
+                                  "value": itm.get("value")})
+                else:
+                    cards.append({"label": str(itm), "value": None})
+            rows = len(cards)
+        else:
+            rows = int(params.get("rows", 3))
+            cards = [{"label": str(i + 1), "value": None}
+                      for i in range(rows)]
         mel.update({"kind": "comparison_cards", "x": px, "y": py,
                     "w": dw, "h": dh, "draw": draw,
-                    "cards": [{"label": str(i + 1), "value": None}
-                              for i in range(rows)]})
+                    "cards": cards})
         n = rows
     # Stagger/grow: grow 0.5, stagger scaled so the last item
     # finishes inside the draw ((n-1)*stagger + grow <= 1).
@@ -2577,7 +2627,7 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                 # (the card PNG is generated at that size). The
                 # motion element renders the chart instead.
                 _mel, _dw, _dh = _adapt_template_diagram(
-                    tname, params, rdg, width, height)
+                    tname, params, rdg, width, height, project=project)
                 rdg.update({"source": "template", "template": tname,
                             "params": params, "canvas_w": _dw,
                             "canvas_h": _dh, "adapted_to_motion": True})
