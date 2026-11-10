@@ -1,9 +1,12 @@
-"""AgentCut Interactive Web Studio (Phase 4).
+"""AgentCut Interactive Web Studio (Enhanced with ProCraft UI & Analytics).
 
 Generates a standalone, self-contained interactive HTML5/CSS3/JS Web Studio
 for inspecting, scrubbing, and visualizing AgentCut video timelines, scenes,
-narration audio, kinetic typography, and motion diagrams.
+narration audio, kinetic typography, harmonious color palettes, and text metrics.
+Zero external dependencies.
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -12,9 +15,13 @@ import sys
 import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
 
+from .colors import generate_palette
+from .json_tools import format_json, minify_json
+from .text_metrics import analyze_text, estimate_reading_duration
+
 
 def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Optional[str] = None) -> Dict[str, Any]:
-    """Parse brief or project dictionary into a unified timeline model."""
+    """Parse brief or project dictionary into a unified timeline model with analytics."""
     data = project_or_brief
     title = data.get("title") or data.get("id") or "AgentCut Project"
 
@@ -24,6 +31,7 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
 
     scenes = []
     current_time = 0.0
+    all_narrations = []
 
     if is_explainer:
         for idx, sc in enumerate(scenes_raw):
@@ -34,6 +42,9 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
 
             diagram = sc.get("diagram")
             diag_type = diagram.get("template") or diagram.get("type") if diagram else None
+            ntxt = sc.get("narration_text") or sc.get("text") or ""
+            if ntxt:
+                all_narrations.append(ntxt)
 
             scenes.append({
                 "id": sc.get("id", f"scene_{idx + 1}"),
@@ -41,7 +52,7 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
                 "start": round(start, 2),
                 "end": round(end, 2),
                 "duration": round(dur, 2),
-                "narration_text": sc.get("narration_text") or sc.get("text") or "",
+                "narration_text": ntxt,
                 "kinetic": bool(sc.get("kinetic") or data.get("captions_style") == "karaoke"),
                 "transition": sc.get("transition", "none"),
                 "diagram_type": diag_type,
@@ -60,13 +71,16 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
             start = current_time
             end = start + dur
             current_time = end
+            ntxt = cl.get("label") or ""
+            if ntxt:
+                all_narrations.append(ntxt)
             scenes.append({
                 "id": cl.get("id", f"clip_{idx + 1}"),
                 "title": cl.get("id", f"Clip {idx + 1}"),
                 "start": round(start, 2),
                 "end": round(end, 2),
                 "duration": round(dur, 2),
-                "narration_text": cl.get("label") or "",
+                "narration_text": ntxt,
                 "kinetic": False,
                 "transition": cl.get("transition", "none"),
                 "diagram_type": None,
@@ -83,9 +97,29 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
     if video_path and os.path.isfile(video_path):
         video_rel_path = os.path.basename(video_path)
 
+    # Palette derivation (ProCraft color tools integration)
+    brand_color = data.get("brand_color")
+    if not brand_color and isinstance(data.get("theme"), dict):
+        brand_color = data["theme"].get("brand_color")
+    elif not brand_color and isinstance(data.get("theme"), str) and data["theme"].startswith("#"):
+        brand_color = data["theme"]
+    if not brand_color:
+        brand_color = "#00e5ff"
+
+    palette = generate_palette(brand_color, harmony="analogous", dark_mode=True)
+
+    # Text metrics (ProCraft text tools integration)
+    joined_script = "\n".join(all_narrations)
+    text_metrics = analyze_text(joined_script)
+    text_metrics["estimated_reading_duration"] = estimate_reading_duration(joined_script)
+    effective_dur = max(1.0, round(total_duration, 2))
+    pacing_diff = round(effective_dur - text_metrics["estimated_reading_duration"], 2)
+    text_metrics["pacing_diff"] = pacing_diff
+    text_metrics["pacing_status"] = "Optimal" if abs(pacing_diff) <= 3.0 else ("Fast" if pacing_diff < -3.0 else "Relaxed")
+
     return {
         "title": title,
-        "total_duration": max(1.0, round(total_duration, 2)),
+        "total_duration": effective_dur,
         "width": width,
         "height": height,
         "aspect_ratio": f"{width}x{height}",
@@ -94,6 +128,10 @@ def _extract_timeline_model(project_or_brief: Dict[str, Any], video_path: Option
         "music": data.get("music", "ambient"),
         "video_filename": video_rel_path,
         "is_explainer": is_explainer,
+        "palette": palette,
+        "text_metrics": text_metrics,
+        "minified_json": minify_json(data),
+        "formatted_json": format_json(data),
     }
 
 
@@ -102,16 +140,7 @@ def generate_studio_html(
     video_path: Optional[str] = None,
     output_html_path: Optional[str] = None,
 ) -> str:
-    """Generate interactive single-page HTML Web Studio for a project or brief.
-
-    Args:
-        project_or_brief: Dict or file path to JSON brief/project.
-        video_path: Optional rendered MP4 video path.
-        output_html_path: Destination HTML file path. If None, writes alongside video or brief.
-
-    Returns:
-        Absolute path to the created HTML file.
-    """
+    """Generate interactive single-page HTML Web Studio for a project or brief."""
     if isinstance(project_or_brief, str):
         if not os.path.isfile(project_or_brief):
             raise FileNotFoundError(f"Project/brief file not found: {project_or_brief}")
@@ -130,7 +159,6 @@ def generate_studio_html(
     model = _extract_timeline_model(data, video_path)
     model_json = json.dumps(model, ensure_ascii=False, indent=2)
 
-    # If video_path is provided, determine relative path to HTML
     video_src = ""
     if video_path and os.path.isfile(video_path):
         try:
@@ -138,6 +166,9 @@ def generate_studio_html(
             video_src = rel.replace("\\", "/")
         except ValueError:
             video_src = video_path.replace("\\", "/")
+
+    palette = model["palette"]
+    metrics = model["text_metrics"]
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -151,9 +182,9 @@ def generate_studio_html(
       --bg-panel: #161922;
       --bg-card: #1e2230;
       --border-color: #2a3144;
-      --accent-cyan: #00e5ff;
-      --accent-purple: #7928ca;
-      --accent-gold: #ffb703;
+      --accent-cyan: {palette['primary']};
+      --accent-purple: {palette['secondary']};
+      --accent-gold: {palette['accent']};
       --accent-green: #00f59b;
       --text-main: #f0f3f8;
       --text-muted: #8e99b0;
@@ -263,16 +294,42 @@ def generate_studio_html(
 
     /* Inspector Sidebar */
     .inspector {{
-      width: 380px;
+      width: 400px;
       background: var(--bg-panel);
       border-left: 1px solid var(--border-color);
       display: flex;
       flex-direction: column;
-      padding: 20px;
-      gap: 16px;
-      overflow-y: auto;
+      overflow: hidden;
     }}
-    .inspector h3 {{ font-size: 15px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }}
+    .tabs-header {{
+      display: flex;
+      border-bottom: 1px solid var(--border-color);
+      background: #11131a;
+    }}
+    .tab-btn {{
+      flex: 1;
+      padding: 12px 6px;
+      font-size: 12px;
+      font-weight: 600;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }}
+    .tab-btn:hover {{ color: var(--text-main); }}
+    .tab-btn.active {{ color: var(--accent-cyan); border-bottom-color: var(--accent-cyan); background: rgba(0,229,255,0.05); }}
+    .tab-content {{
+      flex: 1;
+      padding: 20px;
+      overflow-y: auto;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }}
+    .tab-content.active {{ display: flex; }}
+
     .prop-card {{
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -282,7 +339,7 @@ def generate_studio_html(
       flex-direction: column;
       gap: 10px;
     }}
-    .prop-row {{ display: flex; justify-content: space-between; font-size: 13px; }}
+    .prop-row {{ display: flex; justify-content: space-between; font-size: 13px; align-items: center; }}
     .prop-row span:first-child {{ color: var(--text-muted); }}
     .prop-script {{
       background: #12141c;
@@ -294,6 +351,17 @@ def generate_studio_html(
       direction: rtl;
       text-align: right;
     }}
+
+    /* Color Swatches (ProCraft Integration) */
+    .swatch-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+    .swatch-card {{ background: #12141c; border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; display: flex; align-items: center; gap: 10px; }}
+    .swatch-box {{ width: 28px; height: 28px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); }}
+    .swatch-info {{ display: flex; flex-direction: column; font-size: 11px; }}
+    .wcag-badge {{ padding: 2px 8px; border-radius: 12px; font-weight: 700; font-size: 11px; }}
+    .wcag-pass {{ background: rgba(0, 245, 155, 0.2); color: #00f59b; border: 1px solid #00f59b; }}
+
+    /* JSON Viewer */
+    .json-code {{ background: #0c0e14; border: 1px solid var(--border-color); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; color: #a5d6ff; max-height: 350px; overflow-y: auto; white-space: pre-wrap; }}
 
     /* Bottom Timeline */
     .timeline-container {{
@@ -448,23 +516,87 @@ def generate_studio_html(
       </div>
     </div>
 
-    <!-- Inspector Sidebar -->
+    <!-- Inspector Sidebar with ProCraft Tabs -->
     <div class="inspector">
-      <h3>Scene Inspector</h3>
-      <div class="prop-card">
-        <div class="prop-row"><span>Scene ID:</span><b id="insId">-</b></div>
-        <div class="prop-row"><span>Title:</span><b id="insTitle">-</b></div>
-        <div class="prop-row"><span>Time Window:</span><b id="insTime">-</b></div>
-        <div class="prop-row"><span>Transition:</span><b id="insTransition">-</b></div>
-        <div class="prop-row"><span>Kinetic Subtitles:</span><b id="insKinetic">-</b></div>
-        <div class="prop-row"><span>Diagram:</span><b id="insDiagram">-</b></div>
+      <div class="tabs-header">
+        <button id="tabBtn-scene" class="tab-btn active" onclick="switchTab('scene')">🎬 Scene</button>
+        <button id="tabBtn-palette" class="tab-btn" onclick="switchTab('palette')">🎨 Palette</button>
+        <button id="tabBtn-metrics" class="tab-btn" onclick="switchTab('metrics')">📊 Metrics</button>
+        <button id="tabBtn-json" class="tab-btn" onclick="switchTab('json')">📦 JSON</button>
       </div>
 
-      <h3>Narration Script</h3>
-      <div id="insScript" class="prop-script">Select a scene to view speech script</div>
+      <!-- Tab 1: Scene Inspector -->
+      <div id="tabContent-scene" class="tab-content active">
+        <div class="prop-card">
+          <div class="prop-row"><span>Scene ID:</span><b id="insId">-</b></div>
+          <div class="prop-row"><span>Title:</span><b id="insTitle">-</b></div>
+          <div class="prop-row"><span>Time Window:</span><b id="insTime">-</b></div>
+          <div class="prop-row"><span>Transition:</span><b id="insTransition">-</b></div>
+          <div class="prop-row"><span>Kinetic Subtitles:</span><b id="insKinetic">-</b></div>
+          <div class="prop-row"><span>Diagram:</span><b id="insDiagram">-</b></div>
+        </div>
 
-      <h3>Quick Actions</h3>
-      <button class="btn" onclick="copyReframeCommand()">📋 Copy 9:16 Reframe Command</button>
+        <h4 style="font-size: 13px; color: var(--text-muted); text-transform: uppercase;">Narration Script</h4>
+        <div id="insScript" class="prop-script">Select a scene to view speech script</div>
+
+        <button class="btn" style="margin-top: 10px;" onclick="copyReframeCommand()">📋 Copy 9:16 Reframe Command</button>
+      </div>
+
+      <!-- Tab 2: Color Palette & WCAG Readability -->
+      <div id="tabContent-palette" class="tab-content">
+        <div class="prop-card">
+          <div class="prop-row"><span>Color Harmony:</span><b>{palette['harmony'].capitalize()}</b></div>
+          <div class="prop-row"><span>WCAG Contrast:</span><b class="wcag-badge wcag-pass">{palette['contrast_ratio']}:1 ({palette['wcag_level']})</b></div>
+        </div>
+
+        <div class="swatch-grid">
+          <div class="swatch-card">
+            <div class="swatch-box" style="background: {palette['primary']};"></div>
+            <div class="swatch-info"><span>Primary</span><b>{palette['primary']}</b></div>
+          </div>
+          <div class="swatch-card">
+            <div class="swatch-box" style="background: {palette['secondary']};"></div>
+            <div class="swatch-info"><span>Secondary</span><b>{palette['secondary']}</b></div>
+          </div>
+          <div class="swatch-card">
+            <div class="swatch-box" style="background: {palette['accent']};"></div>
+            <div class="swatch-info"><span>Accent</span><b>{palette['accent']}</b></div>
+          </div>
+          <div class="swatch-card">
+            <div class="swatch-box" style="background: {palette['background']};"></div>
+            <div class="swatch-info"><span>Background</span><b>{palette['background']}</b></div>
+          </div>
+        </div>
+
+        <div class="prop-card" style="margin-top: 10px;">
+          <div class="prop-row"><span>Text Primary:</span><span style="color: {palette['text_primary']}; font-weight:700;">{palette['text_primary']}</span></div>
+          <div class="prop-row"><span>Text Muted:</span><span style="color: {palette['text_muted']}; font-weight:700;">{palette['text_muted']}</span></div>
+          <div class="prop-row"><span>Surface Glass:</span><span style="font-size:11px;">{palette['surface']}</span></div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Text & Reading Pacing Metrics -->
+      <div id="tabContent-metrics" class="tab-content">
+        <div class="prop-card">
+          <div class="prop-row"><span>Total Words:</span><b>{metrics['words']}</b></div>
+          <div class="prop-row"><span>Total Characters:</span><b>{metrics['characters']}</b></div>
+          <div class="prop-row"><span>Arabic Words:</span><b>{metrics['arabic_words']}</b></div>
+          <div class="prop-row"><span>Latin Words:</span><b>{metrics['latin_words']}</b></div>
+        </div>
+
+        <div class="prop-card">
+          <div class="prop-row"><span>Estimated Reading Time:</span><b>{metrics['estimated_reading_duration']}s</b></div>
+          <div class="prop-row"><span>Total Video Duration:</span><b>{model['total_duration']}s</b></div>
+          <div class="prop-row"><span>Pacing Delta:</span><b>{metrics['pacing_diff']}s</b></div>
+          <div class="prop-row"><span>Pacing Health:</span><b style="color: #00f59b;">{metrics['pacing_status']}</b></div>
+        </div>
+      </div>
+
+      <!-- Tab 4: JSON Spec & Token Tools -->
+      <div id="tabContent-json" class="tab-content">
+        <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="copyMinifiedJson()">⚡ Copy Minified JSON (Tokens Saved)</button>
+        <pre class="json-code" id="rawJsonBlock">{model['formatted_json']}</pre>
+      </div>
     </div>
   </div>
 
@@ -477,37 +609,31 @@ def generate_studio_html(
         <button class="btn" onclick="seekRelative(1)">+1s</button>
         <div id="timecode" class="timecode">00:00.00 / 00:{int(model['total_duration']):02d}.00</div>
       </div>
-      <div>
-        <span style="font-size: 12px; color: var(--text-muted);">Click anywhere on timeline to scrub</span>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 12px; color: var(--text-muted);">Volume:</span>
+        <input type="range" min="0" max="1" step="0.05" value="1" style="cursor:pointer;" oninput="setVolume(this.value)">
       </div>
     </div>
 
     <div class="timeline-tracks" id="timelineBody" onclick="handleTimelineClick(event)">
-      <!-- Ruler -->
       <div class="ruler" id="ruler"></div>
-
-      <!-- Playhead -->
       <div id="playhead" class="playhead" style="left: 90px;"></div>
 
-      <!-- Track 1: Scenes -->
       <div class="track">
         <div class="track-label">SCENES</div>
         <div class="track-body" id="sceneTrack"></div>
       </div>
 
-      <!-- Track 2: Narration -->
       <div class="track">
         <div class="track-label">NARRATION</div>
         <div class="track-body" id="narrationTrack"></div>
       </div>
 
-      <!-- Track 3: Diagrams -->
       <div class="track">
         <div class="track-label">MOTION</div>
         <div class="track-body" id="diagramTrack"></div>
       </div>
 
-      <!-- Track 4: Audio Bed -->
       <div class="track">
         <div class="track-label">AUDIO</div>
         <div class="track-body" id="audioTrack"></div>
@@ -520,7 +646,18 @@ def generate_studio_html(
     const TOTAL_DUR = MODEL.total_duration;
     let currentTime = 0.0;
     let selectedSceneIdx = 0;
+    let isPlaying = false;
+    let playInterval = null;
     const video = document.getElementById('videoPlayer');
+
+    function switchTab(tabName) {{
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      const btn = document.getElementById('tabBtn-' + tabName);
+      const content = document.getElementById('tabContent-' + tabName);
+      if (btn) btn.classList.add('active');
+      if (content) content.classList.add('active');
+    }}
 
     function initTimeline() {{
       const ruler = document.getElementById('ruler');
@@ -529,7 +666,6 @@ def generate_studio_html(
       const diagramTrack = document.getElementById('diagramTrack');
       const audioTrack = document.getElementById('audioTrack');
 
-      // Build ruler ticks
       const step = TOTAL_DUR > 30 ? 5 : 2;
       for (let t = 0; t <= TOTAL_DUR; t += step) {{
         const pct = (t / TOTAL_DUR) * 100;
@@ -540,12 +676,10 @@ def generate_studio_html(
         ruler.appendChild(tick);
       }}
 
-      // Build blocks
       MODEL.scenes.forEach((sc, idx) => {{
         const leftPct = (sc.start / TOTAL_DUR) * 100;
         const widthPct = (sc.duration / TOTAL_DUR) * 100;
 
-        // Scene block
         const sb = document.createElement('div');
         sb.className = 'block block-scene' + (idx === 0 ? ' selected' : '');
         sb.style.left = leftPct + '%';
@@ -554,7 +688,6 @@ def generate_studio_html(
         sb.onclick = (e) => {{ e.stopPropagation(); selectScene(idx); seekTo(sc.start); }};
         sceneTrack.appendChild(sb);
 
-        // Narration block
         if (sc.narration_text) {{
           const nb = document.createElement('div');
           nb.className = 'block block-narration';
@@ -564,7 +697,6 @@ def generate_studio_html(
           narrationTrack.appendChild(nb);
         }}
 
-        // Diagram block
         if (sc.diagram_type) {{
           const db = document.createElement('div');
           db.className = 'block block-diagram';
@@ -575,7 +707,6 @@ def generate_studio_html(
         }}
       }});
 
-      // Audio bed block
       const ab = document.createElement('div');
       ab.className = 'block block-audio';
       ab.style.left = '0%';
@@ -599,37 +730,56 @@ def generate_studio_html(
       vp.className = 'viewport-box';
       if (ar === '9:16') vp.classList.add('aspect-9-16');
       if (ar === '1:1') vp.classList.add('aspect-1-1');
-
-      document.querySelectorAll('.viewport-controls .btn').forEach(b => {{
-        b.classList.toggle('active', b.innerText.includes(ar));
-      }});
+      document.querySelectorAll('.viewport-controls .btn').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
     }}
 
     function selectScene(idx) {{
+      if (idx < 0 || idx >= MODEL.scenes.length) return;
       selectedSceneIdx = idx;
       const sc = MODEL.scenes[idx];
+
+      document.querySelectorAll('#sceneTrack .block').forEach((el, i) => {{
+        if (i === idx) el.classList.add('selected');
+        else el.classList.remove('selected');
+      }});
+
       document.getElementById('insId').innerText = sc.id;
       document.getElementById('insTitle').innerText = sc.title;
       document.getElementById('insTime').innerText = sc.start + 's - ' + sc.end + 's (' + sc.duration + 's)';
       document.getElementById('insTransition').innerText = sc.transition;
-      document.getElementById('insKinetic').innerText = sc.kinetic ? 'Yes (Karaoke)' : 'No';
-      document.getElementById('insDiagram').innerText = sc.diagram_type || 'None';
-      document.getElementById('insScript').innerText = sc.narration_text || '(No narration text)';
+      document.getElementById('insKinetic').innerText = sc.kinetic ? '✅ Karaoke Active' : 'Plain';
+      document.getElementById('insDiagram').innerText = sc.diagram_type ? ('📊 ' + sc.diagram_type) : 'None';
+      document.getElementById('insScript').innerText = sc.narration_text || 'No narration for this scene';
 
-      const simTitle = document.getElementById('simTitle');
-      if (simTitle) {{
-        simTitle.innerText = sc.title;
-        document.getElementById('simBadge').innerText = sc.id;
-        document.getElementById('simText').innerText = sc.narration_text || '';
-      }}
-
-      document.querySelectorAll('.block-scene').forEach((b, i) => {{
-        b.classList.toggle('selected', i === idx);
-      }});
+      const badge = document.getElementById('simBadge');
+      const title = document.getElementById('simTitle');
+      const text = document.getElementById('simText');
+      if (badge) badge.innerText = sc.title;
+      if (title) title.innerText = sc.title;
+      if (text) text.innerText = sc.narration_text || 'Scene ' + (idx + 1);
     }}
 
-    function seekTo(t) {{
-      currentTime = Math.max(0, Math.min(TOTAL_DUR, t));
+    function checkActiveScene() {{
+      const foundIdx = MODEL.scenes.findIndex(s => currentTime >= s.start && currentTime < s.end);
+      if (foundIdx !== -1 && foundIdx !== selectedSceneIdx) {{
+        selectScene(foundIdx);
+      }}
+    }}
+
+    function updatePlayhead() {{
+      const pct = Math.min(100, Math.max(0, (currentTime / TOTAL_DUR) * 100));
+      const ph = document.getElementById('playhead');
+      ph.style.left = `calc(90px + (100% - 90px) * ${{pct / 100}})`;
+
+      const m = Math.floor(currentTime / 60);
+      const s = (currentTime % 60).toFixed(2);
+      document.getElementById('timecode').innerText =
+        (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s + ' / 00:' + Math.floor(TOTAL_DUR).toString().padStart(2, '0') + '.00';
+    }}
+
+    function seekTo(sec) {{
+      currentTime = Math.max(0, Math.min(TOTAL_DUR, sec));
       if (video) video.currentTime = currentTime;
       updatePlayhead();
       checkActiveScene();
@@ -639,46 +789,51 @@ def generate_studio_html(
       seekTo(currentTime + delta);
     }}
 
+    function handleTimelineClick(e) {{
+      const rect = document.getElementById('timelineBody').getBoundingClientRect();
+      const trackX = e.clientX - rect.left - 90;
+      const trackW = rect.width - 90;
+      if (trackX >= 0 && trackW > 0) {{
+        const targetSec = (trackX / trackW) * TOTAL_DUR;
+        seekTo(targetSec);
+      }}
+    }}
+
     function togglePlay() {{
       if (video) {{
         if (video.paused) video.play();
         else video.pause();
+        return;
+      }}
+      isPlaying = !isPlaying;
+      if (isPlaying) {{
+        playInterval = setInterval(() => {{
+          currentTime += 0.1;
+          if (currentTime >= TOTAL_DUR) {{
+            currentTime = 0.0;
+            togglePlay();
+          }}
+          updatePlayhead();
+          checkActiveScene();
+        }}, 100);
+      }} else {{
+        clearInterval(playInterval);
       }}
     }}
 
-    function updatePlayhead() {{
-      const pct = (currentTime / TOTAL_DUR);
-      const trackWidth = document.getElementById('timelineBody').clientWidth - 90;
-      const x = 90 + pct * trackWidth;
-      document.getElementById('playhead').style.left = x + 'px';
-
-      const mins = Math.floor(currentTime / 60);
-      const secs = (currentTime % 60).toFixed(2);
-      document.getElementById('timecode').innerText = 
-        String(mins).padStart(2, '0') + ':' + String(secs).padStart(5, '0') + ' / 00:' + String(Math.floor(TOTAL_DUR)).padStart(2, '0') + '.00';
-    }}
-
-    function checkActiveScene() {{
-      const cur = MODEL.scenes.findIndex(s => currentTime >= s.start && currentTime <= s.end);
-      if (cur !== -1 && cur !== selectedSceneIdx) {{
-        selectScene(cur);
-      }}
-    }}
-
-    function handleTimelineClick(e) {{
-      const rect = document.getElementById('timelineBody').getBoundingClientRect();
-      const clickX = e.clientX - rect.left - 90;
-      const trackWidth = rect.width - 90;
-      if (clickX >= 0) {{
-        const t = (clickX / trackWidth) * TOTAL_DUR;
-        seekTo(t);
-      }}
+    function setVolume(v) {{
+      if (video) video.volume = parseFloat(v);
     }}
 
     function copyReframeCommand() {{
-      const cmd = `python -m agentcut reframe "${{MODEL.title}}.mp4" "${{MODEL.title}}_vertical.mp4" --aspect 9:16 --mode blur_pad`;
+      const cmd = `python -m agentcut reframe "${{MODEL.video_filename || 'input.mp4'}}" "vertical_916.mp4" --aspect 9:16 --mode blur_pad`;
       navigator.clipboard.writeText(cmd);
-      alert('Copied to clipboard:\\n' + cmd);
+      alert('Copied 9:16 reframe command to clipboard!');
+    }}
+
+    function copyMinifiedJson() {{
+      navigator.clipboard.writeText(MODEL.minified_json);
+      alert('Copied token-minified JSON to clipboard!');
     }}
 
     window.onload = initTimeline;
@@ -686,6 +841,7 @@ def generate_studio_html(
 </body>
 </html>
 """
+
     with open(output_html_path, "w", encoding="utf-8") as fh:
         fh.write(html_content)
 

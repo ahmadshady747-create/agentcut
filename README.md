@@ -24,7 +24,10 @@ cd agentcut
 ./run.sh tts "نص الشرح الصوتي" voice.mp3 --srt out.srt # native neural TTS narration
 ./run.sh reframe out.mp4 9:16 vertical.mp4            # smart multi-aspect reframing
 ./run.sh studio examples/basic.json studio.html       # visual timeline inspector
-./run.sh serve                                         # MCP server on stdio (26 tools)
+./run.sh palette "#3B82F6" --harmony triadic          # harmonious palette & WCAG contrast
+./run.sh text-metrics "نص السيناريو"                  # reading pacing & text composition
+./run.sh minify-json examples/basic.json              # token-minified compact JSON
+./run.sh serve                                         # MCP server on stdio (28 tools)
 ```
 
 **Requirements:** Python 3.10+, `ffmpeg` and `ffprobe` on PATH. Optional: `edge-tts` for neural speech synthesis. **Zero network calls for media rendering.** All sources are local files.
@@ -192,10 +195,12 @@ The agent can't run code on your phone, so it builds a self-contained render pac
 
 ---
 
-## 🧰 MCP tools (26)
+## 🧰 MCP tools (28)
 
 **Projects:** `create_project`, `get_project`, `list_projects`, `patch_project`, `validate_project`, `preview_project`, `render_project`, `poster_frame`, `render_contact_sheet`, `generate_web_studio`
 **Produce:** `produce_video`, `produce_explainer`, `produce_variants`, `split_clip`, `timeline_summary`, `check_brief`, `reframe_video`
+**Speech & Audio:** `synthesize_speech`, `list_voices`
+**Design & Analytics:** `generate_color_palette`, `analyze_text_metrics`
 **Snapshots:** `snapshot_project`, `rollback_project`, `list_snapshots`
 **Jobs:** `get_job` (detached jobs that survive the client closing stdio), `start_render_job`, `get_job_status`, `cancel_job` (in-process `bg_` jobs)
 **Media:** `probe_media`
@@ -254,4 +259,4 @@ AgentCut is licensed under the **Business Source License 1.1** — see [LICENSE]
 
 ## 📌 Version & Roadmap
 
-**Current: 1.46.1 + Next-Gen Phases 1-4 Complete** — Features native neural TTS voiceovers, ASS kinetic subtitles, timeline/process diagrams, GPU hardware acceleration & parallel rendering, multi-aspect auto-reframing (`blur_pad`/`crop`/`fit`), dynamic motion & diagram plugin architecture, interactive zero-dependency HTML5 Web Studio inspector, and 26 MCP tools. Total test suite: **380/380 passed**, run in CI on every push and pull request. See [docs/ROADMAP.md](docs/ROADMAP.md) for full architectural roadmap and test verification history. Full history: [CHANGELOG.md](CHANGELOG.md).
+**Current: 1.46.1 + Next-Gen Phases 1-4 & ProCraft Integration Complete** — Features native neural TTS voiceovers, ASS kinetic subtitles, timeline/process diagrams, GPU hardware acceleration & parallel rendering, multi-aspect auto-reframing (`blur_pad`/`crop`/`fit`), dynamic motion & diagram plugin architecture, interactive zero-dependency HTML5 Web Studio inspector, ProCraft color harmonies & WCAG evaluation, text reading metrics & script diffing, token minification, deterministic scene caching, and 28 MCP tools. Total test suite: **392/392 passed**, run in CI on every push and pull request. See [docs/ROADMAP.md](docs/ROADMAP.md) for full architectural roadmap and test verification history. Full history: [CHANGELOG.md](CHANGELOG.md).

@@ -368,6 +368,20 @@ TOOLS = [
      "description": "List all registered motion element plugins and diagram templates, and optionally discover plugins in workspace or user directories.",
      "inputSchema": {"type": "object", "properties": {
          "discover": {"type": "boolean", "description": "Whether to auto-discover and load plugins from directories."}}}},
+    {"name": "generate_color_palette",
+     "description": "Generate harmonious color palettes and evaluate WCAG contrast ratios for video theming, diagram cards, and kinetic subtitles.",
+     "inputSchema": {"type": "object", "properties": {
+         "base_color": {"type": "string", "description": "Base color in HEX (#RRGGBB). Default '#3B82F6'."},
+         "harmony": {"type": "string", "description": "Color harmony ('analogous', 'complementary', 'triadic', 'monochromatic'). Default 'analogous'."},
+         "dark_mode": {"type": "boolean", "description": "Whether to optimize palette for dark video backgrounds. Default true."}},
+         "required": ["base_color"]}},
+    {"name": "analyze_text_metrics",
+     "description": "Analyze text composition, count words/characters, estimate on-screen reading duration, and optionally diff against an original script.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Script or subtitle text to analyze."},
+         "original_text": {"type": "string", "description": "Optional original script to diff against."},
+         "wpm": {"type": "integer", "description": "Optional reading speed words-per-minute target (default 140 for Arabic, 160 for English)."}},
+         "required": ["text"]}},
 ]
 
 
@@ -651,6 +665,26 @@ def call_tool(name, args):
             "diagram_plugins": list_diagram_plugins(),
             "discovered_files": discovered,
         })
+    if name == "generate_color_palette":
+        from .colors import generate_palette
+        base = args.get("base_color", "#3B82F6")
+        harmony = args.get("harmony", "analogous")
+        dark_mode = bool(args.get("dark_mode", True))
+        try:
+            pal = generate_palette(base, harmony=harmony, dark_mode=dark_mode)
+            return _text(pal)
+        except Exception as exc:
+            return _tool_error({"code": "PALETTE_ERROR", "message": str(exc)})
+    if name == "analyze_text_metrics":
+        from .text_metrics import analyze_text, diff_texts, estimate_reading_duration
+        text = args.get("text", "")
+        orig = args.get("original_text")
+        wpm = args.get("wpm")
+        metrics = analyze_text(text)
+        metrics["estimated_reading_duration"] = estimate_reading_duration(text, wpm=wpm)
+        if orig:
+            metrics["diff"] = diff_texts(orig, text)
+        return _text(metrics)
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

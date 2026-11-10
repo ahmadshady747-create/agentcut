@@ -145,6 +145,31 @@ def _main(argv):
         else:
             print(json.dumps({"motion_plugins": list_motion_plugins(), "diagram_plugins": list_diagram_plugins()}, indent=2))
         return 0
+    if argv[0] == "palette" and len(argv) >= 2:
+        from .colors import generate_palette
+        base_color = argv[1]
+        harmony = "analogous"
+        if len(argv) >= 4 and argv[2] == "--harmony":
+            harmony = argv[3]
+        pal = generate_palette(base_color, harmony=harmony)
+        print(json.dumps(pal, indent=2))
+        return 0
+    if argv[0] == "text-metrics" and len(argv) >= 2:
+        from .text_metrics import analyze_text, estimate_reading_duration
+        import os
+        arg = argv[1]
+        raw_text = open(arg, encoding="utf-8").read() if os.path.isfile(arg) else arg
+        metrics = analyze_text(raw_text)
+        metrics["estimated_reading_duration"] = estimate_reading_duration(raw_text)
+        print(json.dumps(metrics, indent=2))
+        return 0
+    if argv[0] == "minify-json" and len(argv) == 2:
+        from .json_tools import minify_json
+        import os
+        arg = argv[1]
+        raw = open(arg, encoding="utf-8").read() if os.path.isfile(arg) else arg
+        print(minify_json(raw))
+        return 0
     if argv[0] == "probe" and len(argv) == 2:
         info = probe_media(argv[1])
         print(json.dumps(info, indent=2, default=str) if info else "cannot probe")
