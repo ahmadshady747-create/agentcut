@@ -233,7 +233,10 @@ ARABIC_FONT_FILES = ["NotoSansArabic-Bold.ttf",
 # beside the fonts.
 BUNDLED_FONTS = {"noto-naskh": "NotoNaskhArabic-Regular.ttf",
                  "noto-sans-bold": "NotoSansArabic-Bold.ttf",
-                 "dejavu": "DejaVuSans.ttf"}
+                 "dejavu": "DejaVuSans.ttf",
+                 "segoe-ui": "SegoeUI.ttf",
+                 "arial": "Arial.ttf",
+                 "cairo": "Cairo.ttf"}
 
 
 def find_bundled_font(name):
@@ -280,6 +283,10 @@ def _font_dirs():
     dirs.append("/usr/share/fonts/truetype/dejavu")
     dirs.append("/usr/share/fonts/truetype/noto")
     dirs.append("/usr/share/fonts")
+    windir = os.environ.get("WINDIR") or "C:\\Windows"
+    win_fonts = os.path.join(windir, "Fonts")
+    if os.path.isdir(win_fonts):
+        dirs.append(win_fonts)
     return dirs
 
 
@@ -303,14 +310,33 @@ def contains_arabic(text):
     return False
 
 
+def contains_latin(text):
+    """True when text contains any Latin ASCII character (A-Z or a-z)."""
+    for ch in str(text):
+        if 'a' <= ch <= 'z' or 'A' <= ch <= 'Z':
+            return True
+    return False
+
+
+DUAL_SCRIPT_FONT_FILES = ["SegoeUI.ttf", "segoeui.ttf", "Arial.ttf", "arial.ttf", "tahoma.ttf", "Cairo.ttf"]
+
+
 def find_font_for_text(text):
-    """Font for one text: an Arabic font for Arabic text, else the
-    Latin font. Deliberately NO fallback from Arabic to Latin (v1.35.0):
+    """Font for one text: dual-script font for mixed Arabic+Latin text,
+    an Arabic font for Arabic text, else the Latin font.
+    Deliberately NO fallback from Arabic to Latin (v1.35.0):
     the old code fell back to DejaVu when no Arabic font existed, and
     DejaVu has no Arabic glyphs, so Arabic text rendered as silent
     tofu boxes. Returning None here lets validation fail loudly with
     FONT_NOT_FOUND instead."""
-    if contains_arabic(text):
+    s = str(text)
+    has_ar = contains_arabic(s)
+    has_lat = contains_latin(s)
+    if has_ar and has_lat:
+        dual = _find_font_file(DUAL_SCRIPT_FONT_FILES)
+        if dual:
+            return dual
+    if has_ar:
         return _find_font_file(ARABIC_FONT_FILES)
     return find_font()
 
@@ -2256,9 +2282,9 @@ def _adapt_template_diagram(tname, params, rdg, width, height, project=None):
                         is_ar = True
                         break
             if not left_lbl:
-                left_lbl = "اليمين" if is_ar else "A"
+                left_lbl = "اليمين" if is_ar else "left"
             if not right_lbl:
-                right_lbl = "اليسار" if is_ar else "B"
+                right_lbl = "اليسار" if is_ar else "right"
 
         mel.update({"kind": "comparison_cards", "x": px, "y": py,
                     "w": dw, "h": dh, "draw": draw,
@@ -2448,14 +2474,21 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                            "basket": {"coins"},
                            "balance": {"left", "right"}, "causes": {"rows"},
                            "primitives": {"strokes", "canvas"},
-                           "timeline": {"steps", "direction", "color", "accent_color", "arrow"},
-                           "process_flow": {"steps", "color", "accent_color"}}[tname]
+                           "timeline": {"steps", "direction", "color", "accent_color", "arrow", "labels"},
+                           "process_flow": {"steps", "color", "accent_color", "labels"}}[tname]
                 unknown = sorted(set(params) - allowed)
                 if unknown:
                     errors.append(err("INVALID_SCHEMA", f"template '{tname}' does not take params: " + ", ".join(unknown), field="diagrams.params", clip_id=did,
                                       fix=f"template '{tname}' takes only: " + ", ".join(sorted(allowed))))
                     continue
                 ok = True
+            if tname in ("timeline", "process_flow") and "labels" in params:
+                lbls = params.get("labels")
+                if not isinstance(lbls, list) or not all(isinstance(x, str) for x in lbls):
+                    errors.append(err("INVALID_SCHEMA", f"{tname} labels must be a list of strings",
+                                      field="diagrams.params.labels", clip_id=did,
+                                      fix="give labels as a list of strings, e.g. ['Step 1', 'Step 2']"))
+                    ok = False
             if tname == "chart":
                 vals = params.get("values")
                 if not isinstance(vals, list) or not 2 <= len(vals) <= 8:

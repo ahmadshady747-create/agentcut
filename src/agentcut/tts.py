@@ -58,6 +58,59 @@ ARABIC_HOMOGRAPHS = {
     "شراء": "شِرَاء",
     "قوة": "قُوَّة",
     "القوة": "القُوَّة",
+    # AI, Tech & Narrative Homographs & Diacritics
+    "وكلاء": "وُكَلَاء",
+    "الوكلاء": "الوُكَلَاء",
+    "وكيل": "وَكِيل",
+    "الوكيل": "الوَكِيل",
+    "مستقلين": "مُسْتَقِلِّين",
+    "مستقلة": "مُسْتَقِلَّة",
+    "مستقل": "مُسْتَقِلّ",
+    "ذكاء": "ذَكَاء",
+    "الذكاء": "الذَّكَاء",
+    "اصطناعي": "اصْطِنَاعِيّ",
+    "الاصطناعي": "الاصْطِنَاعِيّ",
+    "جوجل": "جُوجِلْ",
+    "جيميناي": "جِيمِينَايْ",
+    "أوبن": "أُوبِنْ",
+    "أنثروبيك": "أَنْثُرُوبِيكْ",
+    "كلود": "كْلُودْ",
+    "ديب": "دِيبْ",
+    "سيك": "سِيكْ",
+    "نماذج": "نَمَاذِج",
+    "النماذج": "النَّمَاذِج",
+    "نموذج": "نَمُوذَج",
+    "تطور": "تَطَوُّر",
+    "التطور": "التَّطَوُّر",
+    "حوسبة": "حَوْسَبَة",
+    "الحوسبة": "الحَوْسَبَة",
+    "استدلال": "اسْتِدْلَال",
+    "الاستدلال": "الاسْتِدْلَال",
+    "سيليكون": "سِيلِيكُون",
+    "السيليكون": "السِّيلِيكُون",
+    "روبوتات": "رُوبُوتَات",
+    "الروبوتات": "الرُّوبُوتَات",
+    "روبوتية": "رُوبُوتِيَّة",
+    "برمجة": "بَرْمَجَة",
+    "البرمجة": "البَرْمَجَة",
+    "برمجي": "بَرْمَجِيّ",
+    "تفكير": "تَفْكِير",
+    "عميق": "عَمِيق",
+    "العميق": "العَمِيق",
+    "شهد": "شَهِدَ",
+    "أطلقت": "أَطْلَقَتْ",
+    "أعلنت": "أَعْلَنَتْ",
+    "كشفت": "كَشَفَتْ",
+    "قفزت": "قَفَزَتْ",
+    "تجاوز": "تَجَاوَزَ",
+    "تحول": "تَحَوُّل",
+    "التحول": "التَّحَوُّل",
+    "تريليون": "تِرِيلْيُون",
+    "تريليوني": "تِرِيلْيُونَيْ",
+    "مليار": "مِلْيَار",
+    "صراع": "صِرَاع",
+    "الصراع": "الصِّرَاع",
+    "العمالقة": "العَمَالِقَة",
 }
 
 
@@ -67,14 +120,30 @@ def auto_diacritize_arabic(text: str) -> str:
         return text
     words = text.split()
     processed = []
+    
+    def _lookup(c: str) -> str:
+        if c in ARABIC_HOMOGRAPHS:
+            return ARABIC_HOMOGRAPHS[c]
+        # Common proclitics (waw, fa, ba, lam)
+        if len(c) > 2:
+            if c.startswith("و") and c[1:] in ARABIC_HOMOGRAPHS:
+                return "وَ" + ARABIC_HOMOGRAPHS[c[1:]]
+            if c.startswith("ف") and c[1:] in ARABIC_HOMOGRAPHS:
+                return "فَ" + ARABIC_HOMOGRAPHS[c[1:]]
+            if c.startswith("ب") and c[1:] in ARABIC_HOMOGRAPHS:
+                return "بِ" + ARABIC_HOMOGRAPHS[c[1:]]
+            if c.startswith("ل") and c[1:] in ARABIC_HOMOGRAPHS:
+                return "لِ" + ARABIC_HOMOGRAPHS[c[1:]]
+        return c
+
     for w in words:
         m = re.match(r"^([^\w]*)([\w\u0600-\u06ff]+)([^\w]*)$", w)
         if m:
             prefix, core, suffix = m.groups()
-            vowelized = ARABIC_HOMOGRAPHS.get(core, core)
+            vowelized = _lookup(core)
             processed.append(f"{prefix}{vowelized}{suffix}")
         else:
-            processed.append(ARABIC_HOMOGRAPHS.get(w, w))
+            processed.append(_lookup(w))
     return " ".join(processed)
 
 
@@ -95,6 +164,7 @@ def _synthesize_offline_fallback(
     output_audio: str,
     output_srt: Optional[str] = None,
     voice: Optional[str] = None,
+    clean_captions: bool = True,
 ) -> Dict[str, Any]:
     """Offline procedural speech fallback using FFmpeg lavfi.
 
@@ -107,7 +177,8 @@ def _synthesize_offline_fallback(
     if abs_srt:
         os.makedirs(os.path.dirname(abs_srt), exist_ok=True)
 
-    tokens = text.strip().split()
+    raw_tokens = text.strip().split()
+    tokens = [re.sub(r'[\u064B-\u065F\u0670]', '', tok) if clean_captions else tok for tok in raw_tokens]
     duration = max(1.8, round(len(tokens) * 0.42, 3))
 
     cmd = [
@@ -174,13 +245,14 @@ async def _synthesize_async(
     rate: str = "+0%",
     volume: str = "+0%",
     pitch: str = "+0Hz",
+    clean_captions: bool = True,
 ) -> Dict[str, Any]:
     """Internal async implementation of edge-tts synthesis."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Text to synthesize cannot be empty.")
 
     if not _HAS_EDGE_TTS or edge_tts is None:
-        return _synthesize_offline_fallback(text, output_audio, output_srt, voice)
+        return _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)
 
     selected_voice = detect_voice(text, voice)
     abs_audio = os.path.abspath(output_audio)
@@ -221,14 +293,14 @@ async def _synthesize_async(
                     })
 
         if not audio_data:
-            return _synthesize_offline_fallback(text, output_audio, output_srt, voice)
+            return _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)
 
         with open(abs_audio, "wb") as f_audio:
             f_audio.write(audio_data)
 
         duration = _probe_audio_duration(abs_audio)
         if duration <= 0:
-            duration = _synthesize_offline_fallback(text, output_audio, output_srt, voice)["duration"]
+            duration = _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)["duration"]
 
         tokens = text.strip().split()
         word_timings = []
@@ -237,6 +309,8 @@ async def _synthesize_async(
             ws = max(prev_end, round(chunk_w["offset"] / 10_000_000, 3))
             we = max(ws + 0.05, round((chunk_w["offset"] + chunk_w["duration"]) / 10_000_000, 3))
             w_token = tokens[wi] if wi < len(tokens) else chunk_w["text"]
+            if clean_captions:
+                w_token = re.sub(r'[\u064B-\u065F\u0670]', '', w_token)
             word_timings.append({"word": w_token, "start": ws, "end": we})
             prev_end = we
 
@@ -246,7 +320,10 @@ async def _synthesize_async(
             for rem_i in range(len(word_timings), len(tokens)):
                 ws = round(last_end, 3)
                 we = round(last_end + step, 3)
-                word_timings.append({"word": tokens[rem_i], "start": ws, "end": we})
+                w_token = tokens[rem_i]
+                if clean_captions:
+                    w_token = re.sub(r'[\u064B-\u065F\u0670]', '', w_token)
+                word_timings.append({"word": w_token, "start": ws, "end": we})
                 last_end = we
 
         if duration > 0:
@@ -259,9 +336,14 @@ async def _synthesize_async(
             srt_content = sub_maker.get_srt()
             if not srt_content.strip():
                 dur_srt = duration if duration > 0 else 5.0
-                srt_content = f"1\n00:00:00,100 --> {_format_srt_time(dur_srt)}\n{text.strip()}\n"
+                disp_text = text.strip()
+                if clean_captions:
+                    disp_text = re.sub(r'[\u064B-\u065F\u0670]', '', disp_text)
+                srt_content = f"1\n00:00:00,100 --> {_format_srt_time(dur_srt)}\n{disp_text}\n"
                 cues_count = 1
             else:
+                if clean_captions:
+                    srt_content = re.sub(r'[\u064B-\u065F\u0670]', '', srt_content)
                 cues_count = len(sub_maker.cues)
 
             with open(abs_srt, "w", encoding="utf-8") as f_srt:
@@ -277,7 +359,7 @@ async def _synthesize_async(
             "word_timings": word_timings,
         }
     except Exception:
-        return _synthesize_offline_fallback(text, output_audio, output_srt, voice)
+        return _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)
 
 
 def synthesize_speech(
@@ -288,13 +370,18 @@ def synthesize_speech(
     rate: str = "+0%",
     volume: str = "+0%",
     pitch: str = "+0Hz",
+    clean_captions: bool = True,
 ) -> Dict[str, Any]:
-    """Synchronous speech synthesis from text to audio (and optional SRT captions)."""
+    """Synchronous speech synthesis from text to audio (and optional SRT captions).
+    
+    clean_captions=True strips Arabic diacritics (tashkeel) from on-screen subtitles and
+    karaoke word timings for clean viewing, while the audio is synthesized with full tashkeel.
+    """
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Text to synthesize cannot be empty.")
 
     if not _HAS_EDGE_TTS or edge_tts is None:
-        return _synthesize_offline_fallback(text, output_audio, output_srt, voice)
+        return _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)
 
     try:
         return asyncio.run(
@@ -306,10 +393,11 @@ def synthesize_speech(
                 rate=rate,
                 volume=volume,
                 pitch=pitch,
+                clean_captions=clean_captions,
             )
         )
     except Exception:
-        return _synthesize_offline_fallback(text, output_audio, output_srt, voice)
+        return _synthesize_offline_fallback(text, output_audio, output_srt, voice, clean_captions=clean_captions)
 
 
 async def _list_voices_async(language_prefix: Optional[str] = None) -> List[Dict[str, str]]:
@@ -363,10 +451,12 @@ def generate_ambient_audio(
     output_path: str,
     duration: float = 30.0,
     color: str = "pink",
-    volume: float = 0.15,
+    volume: float = 0.25,
 ) -> str:
-    """Generate subtle procedural ambient background music/drone using FFmpeg lavfi anoisesrc.
+    """Generate subtle procedural ambient background music/drone using FFmpeg lavfi.
 
+    Combines harmonic ambient root & fifth sine tones (110Hz + 164.8Hz) with soft
+    procedural noise texture for a rich, warm, audible cinematic soundbed.
     No external audio files or dependencies needed. Byte-reproducible with fixed seed.
     """
     abs_out = os.path.abspath(output_path)
@@ -375,8 +465,10 @@ def generate_ambient_audio(
     vol_str = f"{max(0.01, min(1.0, float(volume))):.3f}"
 
     filter_chain = (
-        f"anoisesrc=c={color}:r=44100:a=0.04:seed=42,"
-        f"lowpass=f=400,volume={vol_str}"
+        f"sine=f=110:d={dur_str}[s1];"
+        f"sine=f=164.81:d={dur_str}[s2];"
+        f"anoisesrc=c={color}:r=44100:a=0.02:seed=42[n];"
+        f"[s1][s2][n]amix=inputs=3:dropout_transition=2,lowpass=f=550,volume={vol_str}"
     )
 
     cmd = [

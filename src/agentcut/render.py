@@ -1730,6 +1730,82 @@ def _rgb_hex(rgb):
     return "#%02x%02x%02x" % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
 
+def _diagram_derived_texts(info, width, height):
+    """Drawtext items for diagram-template labels (timeline & process_flow)."""
+    items = []
+    for dg in info.get("diagrams", []) or []:
+        template = dg.get("template")
+        params = dg.get("params") or {}
+        labels = params.get("labels")
+        if not labels or not isinstance(labels, list):
+            continue
+        dstart = float(dg["start"])
+        dend = float(dg["end"])
+        draw_dur = float(dg.get("draw", 2.0))
+        label_start = round(dstart + draw_dur, 2)
+        dw = _even(float(dg.get("size", 0.5)) * width)
+        
+        if template == "timeline":
+            cw, ch = 900, 560
+            direction = str(params.get("direction", "horizontal")).lower()
+            if direction != "horizontal":
+                continue
+            bx, by, bw, bh = _diagram_card_rect(dg, width, height, dw)
+            scale = bw / cw
+            steps = min(len(labels), int(params.get("steps", len(labels))))
+            span = 660
+            step_delta = span / (steps - 1) if steps > 1 else span
+            y_axis = 280
+            for i in range(steps):
+                lbl = str(labels[i])
+                cx = 120 + i * step_delta
+                cy = (y_axis - 145 + 32) if (i % 2 == 0) else (y_axis + 80 + 32)
+                screen_x = bx + cx * scale
+                screen_y = by + cy * scale
+                font_sz = max(16, int(round(22 * scale)))
+                items.append({
+                    "text": lbl,
+                    "x": f"({round(screen_x, 1)}-text_w/2)",
+                    "y": round(screen_y - font_sz * 0.7, 1),
+                    "size": font_sz,
+                    "color": "white",
+                    "box": False,
+                    "start": label_start,
+                    "end": dend,
+                    "fade_in": 0.4,
+                })
+        elif template == "process_flow":
+            cw, ch = 900, 500
+            bx, by, bw, bh = _diagram_card_rect(dg, width, height, dw)
+            scale = bw / cw
+            steps = min(len(labels), int(params.get("steps", len(labels))))
+            card_h = 130
+            y_card = (ch - card_h) // 2
+            total_w = 760
+            gap = 40
+            card_w = int((total_w - (steps - 1) * gap) / steps)
+            start_x = (cw - total_w) // 2
+            for i in range(steps):
+                lbl = str(labels[i])
+                cx = start_x + i * (card_w + gap) + card_w / 2
+                cy = y_card + card_h / 2
+                screen_x = bx + cx * scale
+                screen_y = by + cy * scale
+                font_sz = max(16, int(round(24 * scale)))
+                items.append({
+                    "text": lbl,
+                    "x": f"({round(screen_x, 1)}-text_w/2)",
+                    "y": round(screen_y - font_sz * 0.7, 1),
+                    "size": font_sz,
+                    "color": "white",
+                    "box": False,
+                    "start": label_start,
+                    "end": dend,
+                    "fade_in": 0.4,
+                })
+    return items
+
+
 def _motion_derived_texts(info, width, height):
     """Drawtext items for motion-graphics labels (v1.43.0, Round 2).
 
@@ -3380,7 +3456,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # category labels are derived drawtext items (see
     # _motion_derived_texts), so they join the text list below.
     _motion_texts = _motion_derived_texts(info, width, height)
-    all_overlays = (project.get("texts") or []) + (info.get("captions", project.get("captions") or [])) + _motion_texts
+    _diagram_texts = _diagram_derived_texts(info, width, height)
+    all_overlays = (project.get("texts") or []) + (info.get("captions", project.get("captions") or [])) + _motion_texts + _diagram_texts
     text_dir = None
     if all_overlays:
         text_dir = tempfile.mkdtemp(prefix="agentcut-text-")
@@ -3694,6 +3771,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                             _sub["text"] = _ln
                             _sub["start"] = _sstart
                             _sub["end"] = _send
+                            _sub["_is_reveal_sub"] = True
                             _sub.pop("reveal", None)
                             _sub.pop("animation", None)
                             _sub.pop("fade_in", None)
@@ -3730,6 +3808,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     _acc += _weights[_k]
                     _sub["end"] = _end if _k == len(words) - 1 else \
                         _start + _window * (_acc / _total_w)
+                    _sub["_is_reveal_sub"] = True
                     _sub.pop("reveal", None)
                     _sub.pop("animation", None)
                     _sub.pop("fade_in", None)
@@ -3837,7 +3916,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     _bg_rects = _background_rects(info, width, height)
     for item, is_caption in render_items:
         size = item.get("size", 36 if is_caption else 48)
-        if not is_caption and not item.get("_counter") and item.get("text"):
+        if not is_caption and not item.get("_counter") and not item.get("_is_reveal_sub") and not item.get("reveal") and item.get("text"):
             _txt = str(item["text"])
             _item_f = find_bundled_font(item["font"]) if item.get("font") else find_font_for_text(_txt)
             if _item_f:
@@ -6672,20 +6751,23 @@ def _explainer_pacing_beats(start, dur, title, si, nscenes,
             break
         # Beat A (0-5s of the cycle): lower_third scene title.
         a0, a1 = base, min(base + 5.0, start + dur)
-        if a1 > a0 and isinstance(title, str) and title.strip():
+        w_a = a1 - a0
+        if w_a >= 1.5 and isinstance(title, str) and title.strip():
+            ent = min(0.6, round(w_a * 0.25, 2))
+            ext = min(0.6, round(w_a * 0.25, 2))
             beats.append({
                 "id": f"pace-lt-{si + 1}-{cycle + 1}",
                 "kind": "lower_third", "text": title,
                 "x": 60, "y": height - 200, "h": 90,
                 "start": round(a0, 3), "end": round(a1, 3),
-                "enter": 0.6, "exit": 0.6})
+                "enter": ent, "exit": ext})
         # Beat C (13-20s of the cycle): progress counter.
         # The suffix is ٪ (U+066A, Arabic percent sign), NOT
         # % — % is a filter-breaking character in drawtext
         # and validation rejects it (see the fix hint for
         # motion.suffix).
         c0, c1 = base + 13.0, min(base + 20.0, start + dur)
-        if c1 > c0:
+        if (c1 - c0) >= 1.5:
             beats.append({
                 "id": f"pace-ct-{si + 1}-{cycle + 1}",
                 "kind": "counter", "from": 0, "to": pct,
@@ -7241,7 +7323,9 @@ def produce_explainer(brief, output_path, review_dir=None):
                             "start": round(start + wt["start"], 3),
                             "end": round(start + min(wt["end"], dur), 3),
                         })
-                if cue_words and [w["word"] for w in cue_words] == str(cue["text"]).split():
+                _w1 = [re.sub(r'[\u064B-\u065F\u0670]', '', w["word"]).strip(".,!?;:()[]\"'") for w in cue_words]
+                _w2 = [re.sub(r'[\u064B-\u065F\u0670]', '', x).strip(".,!?;:()[]\"'") for x in str(cue["text"]).split()]
+                if cue_words and (_w1 == _w2 or [w["word"] for w in cue_words] == str(cue["text"]).split()):
                     cap_entry["word_timings"] = cue_words
                     cap_entry["highlight_color"] = scene.get("highlight_color") or brief.get("highlight_color", "yellow")
                     cap_entry["highlight_mode"] = scene.get("highlight_mode", "word")
@@ -7345,9 +7429,13 @@ def produce_explainer(brief, output_path, review_dir=None):
             for key in ("template", "params", "strokes", "canvas",
                         "draw", "size", "x", "y", "position",
                         "sfx", "sfx_volume",
-                        "card", "card_color", "card_opacity"):
+                        "card", "card_color", "card_opacity", "hold_seconds"):
                 if key in dg:
                     ndg[key] = dg[key]
+            if "hold_seconds" not in ndg:
+                _diag_span = rel_end - rel_start
+                _diag_draw = float(dg.get("draw", 3.0))
+                ndg["hold_seconds"] = max(8.0, min(60.0, round(_diag_span - _diag_draw - 0.5, 2)))
             if rich and dg.get("sfx") is None:
                 ndg["sfx"] = "ding"
             if look.get("diagram_card") and "card" not in dg:
@@ -7486,7 +7574,8 @@ def produce_explainer(brief, output_path, review_dir=None):
             # with the project (number 0..30, voice+music).
             project["duck_amount_db"] = brief["duck_amount_db"]
         else:
-            project["ducking"] = {"voice_track": 0, "amount_db": 12.0,
+            default_duck = 6.0 if ambient_file is not None else 12.0
+            project["ducking"] = {"voice_track": 0, "amount_db": default_duck,
                                   "fade": 0.25,
                                   "windows": [{"start": s["start"], "end": s["end"]}
                                               for s in scenes]}
