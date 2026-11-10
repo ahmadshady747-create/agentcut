@@ -2183,7 +2183,8 @@ def _adapt_template_diagram(tname, params, rdg, width, height, project=None):
     # Template canvas sizes — the geometry the legacy builders
     # used; the aspect fixes the display height.
     _CANVAS = {"chart": (900, 560), "basket": (700, 560),
-               "balance": (900, 560), "causes": (900, 460)}
+               "balance": (900, 560), "causes": (900, 460),
+               "bars": (900, 560)}
     cw, ch = _CANVAS[tname]
     dw = int(float(rdg["size"]) * width)
     dw = dw if dw % 2 == 0 else dw - 1
@@ -2256,6 +2257,16 @@ def _adapt_template_diagram(tname, params, rdg, width, height, project=None):
                         "values": [1.0] * coins,
                         "labels": [str(i + 1) for i in range(coins)]})
             n = coins
+    elif tname == "bars":
+        values = [float(v) for v in params.get("values", [1.0, 2.0])]
+        labels = params.get("labels")
+        if not labels or len(labels) < len(values):
+            labels = [str(i + 1) for i in range(len(values))]
+        mel.update({"kind": "bars", "x": px, "y": py,
+                    "w": dw, "h": dh, "draw": draw,
+                    "values": values,
+                    "labels": [str(l) for l in labels[:len(values)]]})
+        n = len(values)
     elif tname == "balance":
         left_lbl = params.get("left_label")
         right_lbl = params.get("right_label")
@@ -2472,7 +2483,9 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
             else:
                 allowed = {"chart": {"values", "fill", "y_grid_values"},
                            "basket": {"coins"},
-                           "balance": {"left", "right"}, "causes": {"rows"},
+                           "balance": {"left", "right", "left_label", "right_label", "labels"},
+                           "causes": {"rows", "items", "labels"},
+                           "bars": {"values", "labels"},
                            "primitives": {"strokes", "canvas"},
                            "timeline": {"steps", "direction", "color", "accent_color", "arrow", "labels"},
                            "process_flow": {"steps", "color", "accent_color", "labels"}}[tname]
@@ -2565,6 +2578,24 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                         ok = False
                     else:
                         params = dict(params, rows=rows)
+            elif tname == "bars":
+                if "values" not in params:
+                    errors.append(err("MISSING_FIELD", "bars diagram requires params.values", field="diagrams.params.values", clip_id=did,
+                                      fix="give values as a list of numbers, e.g. [10, 20, 30]"))
+                    ok = False
+                elif not isinstance(params["values"], list) or len(params["values"]) < 2:
+                    errors.append(err("INVALID_SCHEMA", "bars values must be a list of at least 2 numbers", field="diagrams.params.values", clip_id=did,
+                                      fix="give values as a list of at least two numbers, e.g. [10, 20, 30]"))
+                    ok = False
+                else:
+                    try:
+                        vals = [float(v) for v in params["values"]]
+                    except (TypeError, ValueError):
+                        errors.append(err("INVALID_SCHEMA", "bars values must be numbers", field="diagrams.params.values", clip_id=did,
+                                          fix="make every item in values a number"))
+                        ok = False
+                    else:
+                        params = dict(params, values=vals)
             elif tname == "timeline":
                 try:
                     steps = int(params.get("steps", 3))

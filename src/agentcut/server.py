@@ -728,12 +728,17 @@ def call_tool(name, args):
 
 
 def _server_version():
-    """Read VERSION so tools/list callers see the real release."""
+    """Read VERSION or package version so tools/list callers see the real release."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        pass
     try:
         with open(os.path.join(BASE, "VERSION")) as fh:
             return fh.read().strip()
     except Exception:
-        return "1.0.0"
+        return "1.51.0"
 
 
 def _respond(resp):
@@ -820,5 +825,10 @@ def serve():
         sys.stdout.flush()
 
 
-if __name__ == "__main__":
+def main():
+    """Main entrypoint for agentcut-mcp console script."""
     serve()
+
+
+if __name__ == "__main__":
+    main()

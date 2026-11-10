@@ -13,11 +13,13 @@ def _load(path):
         return json.load(fh)
 
 
-def main(argv):
+def main(argv=None):
     """CLI entry point: file/argument errors are reported as
     `error: ...` with a non-zero exit, never as a raw traceback
     (1.34.0 — the MCP path already structured these, the CLI did
     not). Internal bugs still raise, by design."""
+    if argv is None:
+        argv = sys.argv[1:]
     try:
         return _main(argv)
     except (OSError, ValueError) as exc:

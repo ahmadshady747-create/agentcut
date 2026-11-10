@@ -906,13 +906,14 @@ def template_process_flow(params):
 # validate, but they build no strokes — validate.py adapts them
 # to motion elements (see _validate_diagrams). Only `primitives`
 # still maps to a stroke builder.
-ADAPTER_TEMPLATES = {"chart", "basket", "balance", "causes"}
+ADAPTER_TEMPLATES = {"chart", "basket", "balance", "causes", "bars"}
 
 TEMPLATES = {
     "chart": None,
     "basket": None,
     "balance": None,
     "causes": None,
+    "bars": None,
     "primitives": template_primitives,
     "timeline": template_timeline,
     "process_flow": template_process_flow,

@@ -2,7 +2,7 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-1.50.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.51.0-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20Tools-30%20tools-purple.svg)](src/agentcut/server.py)
@@ -20,30 +20,42 @@ An AI agent or developer describes the video in JSON or selects a turnkey genre 
 
 ## ⚡ Quickstart
 
+### Standard Installation (`pip` / `uvx`)
+
 ```sh
+# Clone and install in editable mode (standard packaging with pyproject.toml):
 git clone https://github.com/ahmadshady747-create/agentcut.git
 cd agentcut
+pip install -e .
 
+# Launch anywhere as standard CLI or MCP server:
+agentcut templates
+agentcut-mcp
+```
+
+### Direct CLI Commands
+
+```sh
 # 1. List all 8 turnkey content genres
-python -m agentcut templates
+agentcut templates
 
 # 2. Render directly from a turnkey template (one command)
-python -m agentcut from-template finance_data_story examples/templates/finance_data_story.json out.mp4
+agentcut from-template finance_data_story examples/templates/finance_data_story.json out.mp4
 
 # 3. Autonomous one-button explainer video
-python -m agentcut produce-explainer examples/one-button-explainer.json explainer.mp4
+agentcut produce-explainer examples/one-button-explainer.json explainer.mp4
 
 # 4. Native neural voiceover + microsecond synchronized SRT
-python -m agentcut tts "نص الشرح الصوتي المشكول بدقة" voice.mp3 --srt captions.srt
+agentcut tts "نص الشرح الصوتي المشكول بدقة" voice.mp3 --srt captions.srt
 
 # 5. Smart multi-aspect reframing (16:9 -> 9:16 Shorts/Reels/TikTok)
-python -m agentcut reframe out.mp4 9:16 vertical.mp4 --mode blur_pad
+agentcut reframe out.mp4 9:16 vertical.mp4 --mode blur_pad
 
 # 6. Launch the interactive HTML5 Web Studio & Templates Gallery
-python -m agentcut studio examples/basic.json studio.html
+agentcut studio examples/basic.json studio.html
 
 # 7. Start the stdio Model Context Protocol (MCP) server (30 tools)
-python -m agentcut serve
+agentcut-mcp
 ```
 
 **Requirements:** Python 3.10+, `ffmpeg` and `ffprobe` on `PATH`. Optional: `edge-tts` for neural speech synthesis (comes with built-in procedural audio fallback). **Zero Python dependencies outside the standard library.**

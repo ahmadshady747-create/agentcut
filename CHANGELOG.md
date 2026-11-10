@@ -1,3 +1,28 @@
+## 1.51.0 — Standard Packaging, Lossless Parallel Chunks & Telemetry Verification
+
+Release bumping AgentCut to `v1.51.0`. Adds standard Python packaging via `pyproject.toml`, eliminates generation loss and A/V sync drift in parallel rendering, adds native `bars` diagram template support, and establishes automated audio/video telemetry verification.
+
+### 📦 Standard Packaging (`pyproject.toml`):
+- Added standard `pyproject.toml` with `setuptools.build_meta` build-backend and `requires-python = ">=3.10"`.
+- Strictly maintains **Zero External Python Dependencies** (`dependencies = []` — stdlib + FFmpeg only).
+- Exposes standard console scripts:
+  - `agentcut = "agentcut.__main__:main"`
+  - `agentcut-mcp = "agentcut.server:main"`
+- Allows direct installation via `pip install -e .` and instant launch via `uvx agentcut-mcp` across MCP clients (Claude Desktop, Cursor, etc.).
+
+### ⚡ Near-Lossless Intermediate Chunks & A/V Sync Drift Elimination:
+- **Near-Lossless Parallel Sub-Chunks (`src/agentcut/render.py`)**:
+  - Sub-chunks in parallel explainer rendering now encode with `-crf 10 -preset ultrafast -pix_fmt yuv420p` on CPU (`libx264`) and `-preset p1 -crf 10` on GPU.
+  - Closed GOP enforced at scene boundaries via `-flags +cgop -g <2*fps>` to ensure seamless concat demuxer stitching with zero frame corruption.
+- **Frame-Accurate Duration & Cumulative Drift Compensation**:
+  - Locked exact duration per scene chunk via `t_override=s_dur` to eliminate cumulative time skew across subsequent scenes.
+  - Added `-shortest`, `apad`, and explicit `-t <total>` during final audio mixing to guarantee millisecond-accurate sync between narration, subtitles, and music beds.
+
+### 📊 Diagram Template Enhancements & Telemetry Verification:
+- Added native `"bars"` diagram adapter template in `diagrams.py` and `validate.py` accepting `values` and custom `labels`.
+- Expanded `balance` and `causes` templates to accept custom Arabic labels (`left_label`, `right_label`, `items`, `labels`).
+- Added `tests/test_v151_verification.py` verifying pyproject packaging, parallel intermediate settings, diagram localization, and empirical broadcast loudness compliance (`-14.0 LUFS` target).
+
 ## 1.50.0 — Next-Gen Upgrade (Phases 1–4, 6 Core Audit Bug Fixes & Broadcast Voice Mastering)
 
 Major release bumping AgentCut from `v1.46.1` to `v1.50.0`. Implements Phases 1–4 from `docs/ROADMAP.md`, expanding MCP tools from 23 to 28 with native neural TTS (`tts.py`), smart reframing (`reframe.py`), visual plugins (`plugins.py`), and a standalone web studio (`studio.py`). Strictly maintains **Zero External Python Dependencies** (`Python stdlib + FFmpeg` only). Empirically verified through rigorous line-by-line code audit, frame-level inspection, loudness measurement, and a comprehensive 390+ unit test suite.

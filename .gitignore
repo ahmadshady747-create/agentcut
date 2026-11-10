@@ -6,3 +6,8 @@ backups/
 *.mp4
 out.mp4
 *.dll
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+

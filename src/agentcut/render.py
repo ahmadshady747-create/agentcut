@@ -4853,6 +4853,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     argv += ["-map", "[vfinal]", "-map", f"[{aout}]",
              "-c:v", video_codec, "-preset",
              video_preset if video_preset is not None else "medium"]
+    if video_codec == "libx264" and video_crf == 10 and video_preset == "ultrafast":
+        # Intermediate chunk optimization for parallel rendering (v1.51.0):
+        # Near-lossless CRF 10, ultrafast encoding, closed GOP at boundaries
+        fps_val = int(round(info.get("fps", 30)))
+        argv += ["-flags", "+cgop", "-g", str(max(1, fps_val * 2))]
     # v1.41.0 (Fix 1): quality-first encoding defaults.
     # A preset (or an explicit output.video_bitrate) sets a
     # target bitrate instead of the default constant-quality
@@ -5243,21 +5248,23 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
                                          mix_path=_mix_path)
             if _mix_ok:
                 _mix_argv, _, _mix_td = _mix_built
-                if _mix_td:
-                    shutil.rmtree(_mix_td, ignore_errors=True)
-                _mproc = subprocess.run(_mix_argv, capture_output=True,
-                                        text=True, timeout=timeout)
-                if _mproc.returncode == 0:
-                    _meas, _mok = _run_loudness(_mix_path)
-                    if _mok and _meas:
-                        import math as _math2
-                        _iv = (_meas.get("input_i"),
-                               _meas.get("input_tp"),
-                               _meas.get("input_lra"),
-                               _meas.get("input_thresh"))
-                        if (all(v is not None and _math2.isfinite(v)
-                                for v in _iv) and _iv[0] > -70):
-                            master_measured = _meas
+                try:
+                    _mproc = subprocess.run(_mix_argv, capture_output=True,
+                                            text=True, timeout=timeout)
+                    if _mproc.returncode == 0:
+                        _meas, _mok = _run_loudness(_mix_path)
+                        if _mok and _meas:
+                            import math as _math2
+                            _iv = (_meas.get("input_i"),
+                                   _meas.get("input_tp"),
+                                   _meas.get("input_lra"),
+                                   _meas.get("input_thresh"))
+                            if (all(v is not None and _math2.isfinite(v)
+                                    for v in _iv) and _iv[0] > -70):
+                                master_measured = _meas
+                finally:
+                    if _mix_td:
+                        shutil.rmtree(_mix_td, ignore_errors=True)
         finally:
             _remove_quietly(_mix_path)
         master_skip = master_measured is None
@@ -6866,13 +6873,30 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 chunk_out = os.path.join(tmp_dir, f"chunk_{si:03d}.mp4")
                 chunk_files.append(chunk_out)
 
+                # Near-lossless fast intermediate encoding for sub-chunks (v1.51.0):
+                chunk_codec = choose_video_codec(video_codec)
+                if chunk_codec == "libx264":
+                    chunk_crf = 10
+                    chunk_preset = "ultrafast"
+                elif "nvenc" in chunk_codec:
+                    chunk_crf = 10
+                    chunk_preset = "p1"
+                elif "qsv" in chunk_codec:
+                    chunk_crf = 10
+                    chunk_preset = "veryfast"
+                else:
+                    chunk_crf = 10
+                    chunk_preset = "ultrafast"
+
                 future = executor.submit(
                     render_project,
                     chunk_proj,
                     chunk_out,
                     scale_factor=scale_factor,
-                    video_codec=video_codec,
-                    video_preset=video_preset,
+                    video_codec=chunk_codec,
+                    video_crf=chunk_crf,
+                    video_preset=chunk_preset,
+                    t_override=s_dur,
                     timeout=max(120, int(s_dur * 20)),
                 )
                 futures.append((si, future))
@@ -6973,6 +6997,7 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     trans_filters.append(f"[{vcur_chain}]colorlevels=rimax='{_s}':gimax='{_s}':bimax='{_s}'[cf{_ci}]")
                     vcur_chain = f"cf{_ci}"
 
+            final_vcodec = choose_video_codec(video_codec)
             trans_out = os.path.join(tmp_dir, "transitioned.mp4")
             fc_str = ";".join(trans_filters)
             t_cmd = [
@@ -6981,9 +7006,11 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 "-filter_complex", fc_str,
                 "-map", f"[{vcur_chain}]",
                 "-map", "0:a?",
-                "-c:v", video_codec,
+                "-c:v", final_vcodec,
+                "-crf", "17",
                 "-preset", video_preset or "fast",
                 "-c:a", "copy",
+                "-t", f"{total:.3f}",
                 trans_out,
             ]
             t_proc = subprocess.run(t_cmd, capture_output=True, text=True)
@@ -6999,13 +7026,15 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 "-i", joined_path,
                 "-i", music_src,
                 "-filter_complex",
-                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14.0:TP=-1.0:LRA=11[a]",
+                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14.0:TP=-1.0:LRA=11,apad[a]",
                 "-map", "0:v",
                 "-map", "[a]",
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-ar", "48000",
+                "-shortest",
+                "-t", f"{total:.3f}",
                 final_tmp,
             ]
             proc = subprocess.run(mix_cmd, capture_output=True, text=True)
