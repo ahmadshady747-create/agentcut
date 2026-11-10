@@ -321,10 +321,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 def resolve_path(path):
     """Resolve a media path: absolute, cwd-relative, or agentcut-relative."""
     if os.path.isabs(path):
-        return path
+        return os.path.normpath(path)
     if os.path.isfile(path):
         return path
-    candidate = os.path.join(BASE_DIR, path)
+    candidate = os.path.normpath(os.path.join(BASE_DIR, path))
     if os.path.isfile(candidate):
         return candidate
     return path

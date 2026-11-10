@@ -92,56 +92,81 @@ class _HBPosition(ctypes.Structure):
 
 
 def _load_harfbuzz():
-    """Load libharfbuzz.so.0 once (ctypes); None when unavailable."""
+    """Load HarfBuzz once (ctypes); None when unavailable."""
     global _HB, _HB_TRIED
     if _HB_TRIED:
         return _HB
     _HB_TRIED = True
-    try:
-        hb = ctypes.CDLL("libharfbuzz.so.0")
-        hb.hb_blob_create.restype = ctypes.c_void_p
-        hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
-                                      ctypes.c_int, ctypes.c_void_p,
-                                      ctypes.c_void_p]
-        hb.hb_blob_destroy.restype = None
-        hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_face_create.restype = ctypes.c_void_p
-        hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        hb.hb_face_destroy.restype = None
-        hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_face_get_upem.restype = ctypes.c_uint
-        hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
-        hb.hb_font_create.restype = ctypes.c_void_p
-        hb.hb_font_create.argtypes = [ctypes.c_void_p]
-        hb.hb_font_destroy.restype = None
-        hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_ot_font_set_funcs.restype = None
-        hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
-        hb.hb_font_set_scale.restype = None
-        hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                         ctypes.c_int]
-        hb.hb_buffer_create.restype = ctypes.c_void_p
-        hb.hb_buffer_create.argtypes = []
-        hb.hb_buffer_destroy.restype = None
-        hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
-        hb.hb_buffer_add_utf8.restype = None
-        hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
-                                          ctypes.c_char_p, ctypes.c_int,
-                                          ctypes.c_uint, ctypes.c_int]
-        hb.hb_buffer_guess_segment_properties.restype = None
-        hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
-        hb.hb_shape.restype = None
-        hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                ctypes.c_void_p, ctypes.c_uint]
-        hb.hb_buffer_get_length.restype = ctypes.c_uint
-        hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
-        hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
-            _HBPosition)
-        hb.hb_buffer_get_glyph_positions.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
-        _HB = hb
-    except Exception:
-        _HB = None
+    candidates = [
+        "libharfbuzz.so.0",
+        "libharfbuzz.so",
+        "libharfbuzz.dylib",
+        "libharfbuzz.0.dylib",
+        "harfbuzz.dll",
+        "libharfbuzz-0.dll",
+        "libHarfBuzzSharp.dll",
+    ]
+    if os.name == "nt":
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        prog_files = os.environ.get("ProgramFiles", "")
+        candidates.extend([
+            os.path.join(base_dir, "harfbuzz.dll"),
+            os.path.join(local_app, "agy", "bin", "harfbuzz.dll"),
+            os.path.join(local_app, "Programs", "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
+            os.path.join(prog_files, "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
+            os.path.join(local_app, "Programs", "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
+            os.path.join(prog_files, "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
+        ])
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            hb = ctypes.CDLL(cand)
+            hb.hb_blob_create.restype = ctypes.c_void_p
+            hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
+                                          ctypes.c_int, ctypes.c_void_p,
+                                          ctypes.c_void_p]
+            hb.hb_blob_destroy.restype = None
+            hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
+            hb.hb_face_create.restype = ctypes.c_void_p
+            hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            hb.hb_face_destroy.restype = None
+            hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
+            hb.hb_face_get_upem.restype = ctypes.c_uint
+            hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
+            hb.hb_font_create.restype = ctypes.c_void_p
+            hb.hb_font_create.argtypes = [ctypes.c_void_p]
+            hb.hb_font_destroy.restype = None
+            hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
+            hb.hb_ot_font_set_funcs.restype = None
+            hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
+            hb.hb_font_set_scale.restype = None
+            hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_int]
+            hb.hb_buffer_create.restype = ctypes.c_void_p
+            hb.hb_buffer_create.argtypes = []
+            hb.hb_buffer_destroy.restype = None
+            hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
+            hb.hb_buffer_add_utf8.restype = None
+            hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
+                                              ctypes.c_char_p, ctypes.c_int,
+                                              ctypes.c_uint, ctypes.c_int]
+            hb.hb_buffer_guess_segment_properties.restype = None
+            hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
+            hb.hb_shape.restype = None
+            hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_uint]
+            hb.hb_buffer_get_length.restype = ctypes.c_uint
+            hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
+            hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
+                _HBPosition)
+            hb.hb_buffer_get_glyph_positions.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+            _HB = hb
+            break
+        except Exception:
+            continue
     return _HB
 
 

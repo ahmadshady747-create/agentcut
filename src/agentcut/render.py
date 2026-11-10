@@ -1690,7 +1690,30 @@ def _text_on_background(item, is_caption, width, height, size, bg_rects,
 def _esc_filter_arg(value):
     """Escape a path for embedding in a filter option value."""
     return (str(value).replace("\\", "\\\\").replace(":", "\\:")
-            .replace(",", "\\,"))
+            .replace(",", "\\,").replace("'", "\\'"))
+
+
+_FILTER_SCRIPT_FLAG = None
+
+
+def _filter_script_flag():
+    """Return the filter script CLI flag supported by the host FFmpeg build.
+
+    FFmpeg 7+ / 8+ / 9+ removed -filter_complex_script in favour of -/filter_complex.
+    Older versions support -filter_complex_script.
+    """
+    global _FILTER_SCRIPT_FLAG
+    if _FILTER_SCRIPT_FLAG is None:
+        try:
+            p = subprocess.run(["ffmpeg", "-v", "error", "-/filter_complex"],
+                               capture_output=True, text=True, timeout=2)
+            if "Unrecognized option" not in p.stderr:
+                _FILTER_SCRIPT_FLAG = "-/filter_complex"
+            else:
+                _FILTER_SCRIPT_FLAG = "-filter_complex_script"
+        except Exception:
+            _FILTER_SCRIPT_FLAG = "-filter_complex_script"
+    return _FILTER_SCRIPT_FLAG
 
 
 def _rgb_hex(rgb):
@@ -2323,7 +2346,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 vf = (f"[{i}:v]trim=start={clip['trim_in']}:end={clip['trim_out']},"
                       f"setpts=PTS-STARTPTS,"
                       f"{_scale_part(clip.get('fit'), width, height, chain_scale_out)},"
-                      f"vidstabtransform=input={clip['_stab_trf']},"
+                      f"vidstabtransform=input='{_esc_filter_arg(clip['_stab_trf'])}',"
                       f"fps={fps},format={_fmt}")
             elif clip.get("fit") in ("blur", "blur_pad"):
                 # Blurred background: the same stream twice — once
@@ -2505,8 +2528,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # Backslashes in a LUT path must be doubled inside
             # the filter's single quotes, or FFmpeg reads them as
             # escapes (1.34.0; quote characters are still rejected
-            # in validation).
-            lut_esc = str(lut_path).replace("\\", "\\\\")
+            # in validation). On Windows colons must be escaped too.
+            lut_esc = _esc_filter_arg(lut_path)
             vf += (f",format={_lutfmt},lut3d=file='{lut_esc}',"
                    f"format={_fmt}")
         # General image treatment (v1.40.0): after colour
@@ -3784,10 +3807,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         _ass_path = os.path.join(text_dir, "karaoke.ass")
         with open(_ass_path, "w", encoding="utf-8") as _af:
             _af.write(build_karaoke_ass(ass_events, width, height))
-        _ass_filter = f"ass=filename={_esc_filter_arg(_ass_path)}"
+        _ass_filter = f"ass=filename='{_esc_filter_arg(_ass_path)}'"
         _fonts_dir = bundled_fonts_dir()
         if _fonts_dir:
-            _ass_filter += f":fontsdir={_esc_filter_arg(_fonts_dir)}"
+            _ass_filter += f":fontsdir='{_esc_filter_arg(_fonts_dir)}'"
         filters.append(f"[{vcur}]{_ass_filter}[vass]")
         vcur = "vass"
     # Ink-width cache for sweep bars (v1.44.0, F4): one
@@ -3994,7 +4017,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     float(item.get("box_opacity", 0.5)),
                     fps, _afmt, start, end, argv)
             filters.append(
-                f"[{vcur}]drawtext=fontfile={item_font}:"
+                f"[{vcur}]drawtext=fontfile='{_esc_filter_arg(item_font)}':"
                 f"text='{item['_counter_expr']}':"
                 f"fontsize='{size_out}':fontcolor={color}{box_part}"
                 f"{alpha_part}{stroke_part}{shadow_part}:"
@@ -4287,7 +4310,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 f"[vsw{overlay_index}]")
             vcur = f"vsw{overlay_index}"
         filters.append(
-            f"[{vcur}]drawtext=fontfile={item_font}:textfile={text_path}:"
+            f"[{vcur}]drawtext=fontfile='{_esc_filter_arg(item_font)}':textfile='{_esc_filter_arg(text_path)}':"
             f"fontsize='{size_out}':fontcolor={color}{box_part}{alpha_part}{stroke_part}{shadow_part}:"
             f"x='{x_out}':y='{y_out}':expansion=none:text_shaping=1:"
             f"enable='between(t,{start},{end})'[vout{overlay_index}]")
@@ -4322,7 +4345,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     "FONT_NOT_FOUND: no Latin font for the review timecode "
                     "(bundled fonts/ or $AGENTCUT_FONT_DIR)")
             filters.append(
-                f"[{cur}]drawtext=fontfile={tc_font}:"
+                f"[{cur}]drawtext=fontfile='{_esc_filter_arg(tc_font)}':"
                 f"text='%{{pts\\:hms}}':fontsize=28:fontcolor=yellow:"
                 f"box=1:boxcolor=black@0.5:boxborderw=8:x=20:y=20:"
                 f"text_shaping=1[vtc]")
@@ -4699,7 +4722,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         script_path = os.path.join(filter_script_dir, "filter_complex.txt")
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(filter_complex)
-        argv += ["-filter_complex_script", script_path]
+        argv += [_filter_script_flag(), script_path]
     else:
         argv += ["-filter_complex", filter_complex]
     if audio_mix_path is not None:
@@ -4873,7 +4896,7 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
             vf = (f"trim=start={clip['trim_in']}:end={clip['trim_out']},"
                   f"setpts=PTS-STARTPTS,"
                   f"{_scale_part(clip.get('fit'), tw, th)},"
-                  f"vidstabdetect=result={trf}")
+                  f"vidstabdetect=result='{_esc_filter_arg(trf)}'")
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-v", "error", "-i", clip["src"],
                  "-vf", vf, "-an", "-f", "null", "-"],
@@ -5808,8 +5831,8 @@ def render_contact_sheet(video_path, output_path, project=None,
             with open(lf, "w", encoding="utf-8") as fh:
                 fh.write(f["label"])
             parts.append(
-                f"[{i}:v]scale={tw}:{th},drawtext=fontfile={font}:"
-                f"textfile={lf}:fontsize=28:fontcolor=white:"
+                f"[{i}:v]scale={tw}:{th},drawtext=fontfile='{_esc_filter_arg(font)}':"
+                f"textfile='{_esc_filter_arg(lf)}':fontsize=28:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=8:"
                 f"x=8:y=h-44[v{i}]")
         layout = "|".join(
@@ -7498,6 +7521,26 @@ def split_clip(project, clip_id, at):
 
 def _pid_alive(pid):
     """True if a pid exists (a worker that died leaves no process)."""
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if handle:
+                try:
+                    code = ctypes.c_ulong()
+                    if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        return code.value == STILL_ACTIVE
+                    return True
+                finally:
+                    kernel32.CloseHandle(handle)
+            return kernel32.GetLastError() == 5
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -7573,12 +7616,23 @@ class JobStore:
         src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ)
         env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+        if sys.platform == "win32":
+            flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008) |
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            popen_kwargs = dict(
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=flags,
+                close_fds=True, cwd=os.getcwd(), env=env)
+        else:
+            popen_kwargs = dict(
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+                close_fds=True, cwd=os.getcwd(), env=env)
         proc = subprocess.Popen(
             [sys.executable, "-m", "agentcut", "worker",
              self.directory, job_id, out_dir],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
-            close_fds=True, cwd=os.getcwd(), env=env)
+            **popen_kwargs)
         record["pid"] = proc.pid
         self._write(record)
 

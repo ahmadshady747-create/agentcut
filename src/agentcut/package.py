@@ -56,6 +56,15 @@ PYTHONPATH="$DIR/src" python3 -m agentcut render project.json output.mp4
 echo "done: $DIR/output.mp4"
 """
 
+RENDER_BAT = """@echo off
+set "DIR=%~dp0"
+cd /d "%DIR%"
+if exist "%DIR%fonts" set "AGENTCUT_FONT_DIR=%DIR%fonts"
+set "PYTHONPATH=%DIR%src;%PYTHONPATH%"
+python -m agentcut render project.json output.mp4
+echo done: %DIR%output.mp4
+"""
+
 README_TEXT = """# AgentCut render pack — render on your own device
 
 This directory renders itself. You need only python3 and ffmpeg
@@ -267,8 +276,8 @@ def package_project(project, outdir, trim_clips=False):
         if not os.path.isfile(abspath):
             raise ValueError(f"referenced file not found: {abspath}")
         if canonical not in relpath_for_canonical:
-            relpath_for_canonical[canonical] = os.path.join(
-                PACKAGE_MEDIA_DIR, _unique_name(used, os.path.basename(canonical)))
+            relpath_for_canonical[canonical] = (
+                f"{PACKAGE_MEDIA_DIR}/{_unique_name(used, os.path.basename(canonical))}")
         media_map[abspath] = relpath_for_canonical[canonical]
 
     packed = json.loads(json.dumps(project, ensure_ascii=False))
@@ -289,8 +298,8 @@ def package_project(project, outdir, trim_clips=False):
             if window is None:
                 continue
             ss, _to = window
-            relpath = os.path.join(
-                PACKAGE_MEDIA_DIR, _unique_name(used, os.path.basename(resolved)))
+            relpath = (
+                f"{PACKAGE_MEDIA_DIR}/{_unique_name(used, os.path.basename(resolved))}")
             # Store re-based times now (validated times always
             # exist for video clips); the rewrite below assigns
             # them, so a missing key can never leave a packed
@@ -430,6 +439,9 @@ def package_project(project, outdir, trim_clips=False):
     with open(render_sh, "w", encoding="utf-8") as fh:
         fh.write(RENDER_SH)
     os.chmod(render_sh, 0o755)
+    render_bat = os.path.join(outdir, "render.bat")
+    with open(render_bat, "w", encoding="utf-8") as fh:
+        fh.write(RENDER_BAT)
     with open(os.path.join(outdir, "README.md"), "w", encoding="utf-8") as fh:
         fh.write(README_TEXT)
     return {"outdir": os.path.abspath(outdir), "files_copied": copied,

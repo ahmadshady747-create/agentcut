@@ -5,3 +5,4 @@ data/*
 backups/
 *.mp4
 out.mp4
+*.dll

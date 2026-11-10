@@ -11,7 +11,7 @@ import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agentcut.render import poster_frame, preview_project, render_project
+from agentcut.render import _esc_filter_arg, poster_frame, preview_project, render_project
 from agentcut.validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -704,7 +704,7 @@ class TestAgentCut(unittest.TestCase):
 
         def _fake_run(cmd, **kwargs):
             if cmd and cmd[0] == "ffmpeg" and (
-                    "-filter_complex" in cmd or "-filter_complex_script" in cmd):
+                    "-filter_complex" in cmd or "-filter_complex_script" in cmd or "-/filter_complex" in cmd):
                 return _sp.CompletedProcess(cmd, 1, stdout="", stderr="boom")
             return real_run(cmd, **kwargs)
 
@@ -2355,8 +2355,9 @@ class TestAgentCut(unittest.TestCase):
         # params used to kill serve() with AttributeError. Each
         # malformed line must now get a JSON-RPC error and the
         # server must stay alive for a later ping.
+        run_cmd = os.path.join(BASE, "run.bat" if sys.platform == "win32" else "run.sh")
         proc = subprocess.Popen(
-            [os.path.join(BASE, "run.sh"), "serve"],
+            [run_cmd, "serve"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             cwd=BASE)
         try:
@@ -2687,8 +2688,9 @@ class TestAgentCut(unittest.TestCase):
         tmpdir = os.path.join(tmp, "restricted-tmp")
         os.makedirs(tmpdir, exist_ok=True)
         env = {"PATH": os.environ["PATH"], "HOME": tmp, "TMPDIR": tmpdir}
-        proc = subprocess.run([os.path.join(clean, "render.sh")],
-                              capture_output=True, text=True, cwd="/",
+        run_render = os.path.join(clean, "render.bat" if sys.platform == "win32" else "render.sh")
+        proc = subprocess.run([run_render],
+                              capture_output=True, text=True, cwd=clean if sys.platform == "win32" else "/",
                               env=env, timeout=300)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         out = os.path.join(clean, "output.mp4")
@@ -3078,8 +3080,9 @@ class TestAgentCut(unittest.TestCase):
     def test_loop134_cli_bad_numbers_no_traceback(self):
         # 1.34.0 F7 (CLI): bad numeric CLI arguments print an
         # error and exit non-zero, without a traceback.
+        run_cmd = os.path.join(BASE, "run.bat" if sys.platform == "win32" else "run.sh")
         proc = subprocess.run(
-            [os.path.join(BASE, "run.sh"), "split",
+            [run_cmd, "split",
              os.path.join(BASE, "examples", "basic.json"), "c1", "notanumber"],
             capture_output=True, text=True, cwd=BASE, timeout=60)
         self.assertNotEqual(proc.returncode, 0)
@@ -4566,7 +4569,7 @@ class TestRefactoring(unittest.TestCase):
         try:
             argv_script, _t2, td2 = build_ffmpeg_args(
                 proj, info, "/tmp/x.mp4", filter_script_dir=tmp)
-            self.assertIn("-filter_complex_script", argv_script)
+            self.assertTrue(any(f in argv_script for f in ("-filter_complex_script", "-/filter_complex")))
             with open(os.path.join(tmp, "filter_complex.txt")) as fh:
                 script_graph = fh.read()
             inline_graph = argv_inline[argv_inline.index("-filter_complex") + 1]
@@ -4787,6 +4790,9 @@ class TestRefactoring(unittest.TestCase):
                 os.symlink(outside, link)
                 # The link lives inside the base dir but resolves outside it.
                 self.assertFalse(check_path_sandbox(link))
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
             finally:
                 if os.path.lexists(link):
                     os.unlink(link)
@@ -4866,7 +4872,9 @@ class TestRefactoring(unittest.TestCase):
         self.assertEqual(errors, [])
         collected = _collect_files(proj, info)
         poster = os.path.join(BASE, "data", "test_media", "poster.png")
-        self.assertEqual(collected["/tmp/refactor-poster-copy.png"], poster)
+        from agentcut.validate import resolve_path
+        copy_key = resolve_path("/tmp/refactor-poster-copy.png") if "/tmp/refactor-poster-copy.png" not in collected else "/tmp/refactor-poster-copy.png"
+        self.assertEqual(collected[copy_key], poster)
         tmp = tempfile.mkdtemp(prefix="agentcut-pack-")
         try:
             s = package_project(proj, os.path.join(tmp, "default"))
@@ -7762,8 +7770,8 @@ class TestLoop142(unittest.TestCase):
                 out = os.path.join(tmp, f"s{shaping}.png")
                 _sp.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
                          "-i", "color=c=black:s=800x200",
-                         "-vf", (f"drawtext=fontfile={font}:"
-                                 f"textfile={word_path}:fontsize=60:"
+                         "-vf", (f"drawtext=fontfile='{_esc_filter_arg(font)}':"
+                                 f"textfile='{_esc_filter_arg(word_path)}':fontsize=60:"
                                  f"fontcolor=white:x=20:y=60:"
                                  f"expansion=none:text_shaping={shaping}"),
                          "-frames:v", "1", out],
@@ -11127,8 +11135,8 @@ class TestLoop145(unittest.TestCase):
             subprocess.run(["ffmpeg", "-y", "-v", "error", "-i",
                             os.path.join(BASE, "data", "test_media",
                                          "board.png"),
-                            "-vf", (f"drawtext=fontfile={os.path.join(BASE, 'fonts', fname)}:"
-                                    f"textfile={word_path}:fontsize=44:"
+                            "-vf", (f"drawtext=fontfile='{_esc_filter_arg(os.path.join(BASE, 'fonts', fname))}':"
+                                    f"textfile='{_esc_filter_arg(word_path)}':fontsize=44:"
                                     "fontcolor=white:x=(w-text_w)/2:"
                                     "y=h-text_h-40"),
                             "-frames:v", "1", ref],

@@ -13,6 +13,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,6 +42,9 @@ def _project_path(pid):
     return os.path.join(PROJECTS, f"{pid}.json")
 
 
+_WRITE_LOCK = threading.RLock()
+
+
 def _atomic_write_json(path, data):
     """Write JSON atomically: NamedTemporaryFile in the same
     directory, then os.replace, so a reader never sees a
@@ -56,33 +60,41 @@ def _atomic_write_json(path, data):
     single-writer per project id."""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    lock_fh = None
-    if fcntl is not None:
-        try:
-            lock_fh = open(path + ".lock", "a")
-            fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        except OSError:
-            lock_fh = None
-    try:
-        fd, tmp = tempfile.mkstemp(prefix=".agentcut-tmp-",
-                                   suffix=".json", dir=directory)
-        try:
-            with os.fdopen(fd, "w") as fh:
-                json.dump(data, fh, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
+    with _WRITE_LOCK:
+        lock_fh = None
+        if fcntl is not None:
             try:
-                os.unlink(tmp)
+                lock_fh = open(path + ".lock", "a")
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
             except OSError:
-                pass
-            raise
-    finally:
-        if lock_fh is not None:
+                lock_fh = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".agentcut-tmp-",
+                                       suffix=".json", dir=directory)
             try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(data, fh, indent=2)
+                for _attempt in range(10):
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except PermissionError:
+                        if _attempt == 9:
+                            raise
+                        time.sleep(0.01 * (2 ** _attempt))
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        finally:
+            if lock_fh is not None:
+                try:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_fh.close()
 
 
 def _save_project(project):
