@@ -32,6 +32,26 @@ Major release bumping AgentCut from `v1.46.1` to `v1.50.0`. Implements Phases 1�
 - **Phase 3: Visual Plugins & Effects Engine (`src/agentcut/plugins.py`)**: Extensible motion and visual filter plugins (`list_plugins`).
 - **Phase 4: Web Studio GUI & Color Palette Generator (`src/agentcut/studio.py`)**: Interactive local web studio (`generate_web_studio`), palette extraction (`generate_color_palette`), and readability text metrics (`analyze_text_metrics`).
 
+### 🎨 Turnkey Multi-Genre Content Templates Engine (`src/agentcut/templates.py`):
+- **8 Built-in Production-Ready Content Genres (`CONTENT_TEMPLATES`)**:
+  - `finance_data_story`: Glassmorphism slate palette (`#0F172A`), gold/cyan accents, animated line charts, comparison cards, and counter elements with currency/percentage affixes.
+  - `history_documentary`: Warm cinematic grading, slow Ken Burns camera drift, chronological timelines, quote cards, and light leak transitions.
+  - `tech_code_explainer`: Developer dark mode (`#090D16`, `#10B981`, `#38BDF8`), process flow architecture diagrams, progress bars, and badges.
+  - `top_list_countdown`: Dynamic numbered ranking badges (`#5` -> `#1`), countdown bars, comparison cards, and punchy transitions.
+  - `news_breaking_brief`: High-contrast crimson/navy broadcast palette, persistent progress indicators, lower-third speaker bars, and breaking news badges.
+  - `educational_lesson`: Structured chapter progression, concept-breakdown cards, and automated takeaway/summary conclusion slides.
+  - `podcast_audiogram_quote`: Spotlight backdrop, speaker topic badges, centered kinetic quote typography, and bottom progress bars.
+  - `product_promo_showcase`: 4-stage conversion structure (`Problem` -> `Solution` -> `Metric Proof` -> `CTA Badge`) with triadic color harmony.
+- **WCAG Contrast & Auto-Theming**: Palettes pre-validated for accessibility contrast ratios via `src/agentcut/colors.py`.
+- **Public Template API**: `list_content_templates`, `get_content_template`, `build_brief_from_template`, and `apply_template_to_brief`.
+- **Ready-to-Use Examples**: 8 turnkey sample JSON briefs saved in `examples/templates/<template_id>.json`.
+- **MCP Server & CLI Integration**:
+  - Added MCP tools `list_content_templates` and `produce_from_template` (expanding MCP tools to 30).
+  - Supported direct `"template": "<template_id>"` inheritance inside `produce_explainer` briefs.
+  - Added CLI subcommands `agentcut templates [category]` and `agentcut from-template <template_id> <input.json> <output.mp4>`.
+- **Web Studio Templates Gallery (`src/agentcut/studio.py`)**:
+  - Added interactive "Templates Gallery" tab with visual genre cards, contrast indicators, and one-click JSON generation.
+
 ## 1.46.1 — SRT caption scaling fix (wrap measures the real render font)
 
 Caption fix ONLY — no performance work, no new features, no new MCP tools (23). The 1.45.0 font unification (Noto Sans Arabic Bold everywhere) fixed the false-لا ligature but broke caption wrapping: the wrap used the static weight table (tuned for Noto Naskh Arabic, Arabic connected = 0.45 x size) while the renderer uses Noto Sans Arabic Bold, 1.305x wider at the same size — the wrap packed a 785px line as 558px, which clipped at both edges at 720x1280 (bright-pixel x-range 0..719; 1.44.0 framed it 62..657). The PlayResY=720 hypothesis was refuted (fontsize 36 in both graphs; PlayRes matches video size).

@@ -170,6 +170,35 @@ def generate_studio_html(
     palette = model["palette"]
     metrics = model["text_metrics"]
 
+    from .templates import list_content_templates
+    all_tpls = list_content_templates()
+    templates_json = json.dumps(all_tpls, ensure_ascii=False)
+
+    cards_html_list = []
+    for tpl in all_tpls:
+        c_base = tpl["colors"]["base"]
+        c_acc = tpl["colors"]["accent"]
+        c_sec = tpl["colors"]["secondary"]
+        cards_html_list.append(f"""
+        <div class="tpl-card">
+          <div class="tpl-header">
+            <span class="tpl-title">{tpl['name_ar']}</span>
+            <span class="tpl-badge">{tpl['category'].upper()} • {tpl['default_aspect']}</span>
+          </div>
+          <div class="tpl-desc">{tpl['description']}</div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px;">
+            <div class="tpl-swatches">
+              <div class="tpl-dot" style="background:{c_base};" title="Base: {c_base}"></div>
+              <div class="tpl-dot" style="background:{c_acc};" title="Accent: {c_acc}"></div>
+              <div class="tpl-dot" style="background:{c_sec};" title="Secondary: {c_sec}"></div>
+              <span style="font-size:11px; color:var(--text-muted); margin-left:4px;">WCAG {tpl['colors']['contrast_ratio']}:1</span>
+            </div>
+            <button class="btn" style="font-size:11px; padding:3px 8px;" onclick="copyTemplateBrief('{tpl['id']}')">📋 Copy Brief</button>
+          </div>
+        </div>
+        """)
+    templates_html = "\n".join(cards_html_list)
+
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -358,6 +387,16 @@ def generate_studio_html(
     .swatch-box {{ width: 28px; height: 28px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); }}
     .swatch-info {{ display: flex; flex-direction: column; font-size: 11px; }}
     .wcag-badge {{ padding: 2px 8px; border-radius: 12px; font-weight: 700; font-size: 11px; }}
+
+    /* Templates Gallery */
+    .tpl-card {{ background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; transition: all 0.2s; }}
+    .tpl-card:hover {{ border-color: var(--accent-cyan); }}
+    .tpl-header {{ display: flex; justify-content: space-between; align-items: center; }}
+    .tpl-title {{ font-size: 13px; font-weight: 700; color: #fff; }}
+    .tpl-badge {{ font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: rgba(0,229,255,0.1); color: var(--accent-cyan); }}
+    .tpl-desc {{ font-size: 12px; color: var(--text-muted); line-height: 1.4; direction: rtl; text-align: right; }}
+    .tpl-swatches {{ display: flex; gap: 6px; align-items: center; }}
+    .tpl-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); }}
     .wcag-pass {{ background: rgba(0, 245, 155, 0.2); color: #00f59b; border: 1px solid #00f59b; }}
 
     /* JSON Viewer */
@@ -522,6 +561,7 @@ def generate_studio_html(
         <button id="tabBtn-scene" class="tab-btn active" onclick="switchTab('scene')">🎬 Scene</button>
         <button id="tabBtn-palette" class="tab-btn" onclick="switchTab('palette')">🎨 Palette</button>
         <button id="tabBtn-metrics" class="tab-btn" onclick="switchTab('metrics')">📊 Metrics</button>
+        <button id="tabBtn-templates" class="tab-btn" onclick="switchTab('templates')">📐 Templates</button>
         <button id="tabBtn-json" class="tab-btn" onclick="switchTab('json')">📦 JSON</button>
       </div>
 
@@ -592,7 +632,13 @@ def generate_studio_html(
         </div>
       </div>
 
-      <!-- Tab 4: JSON Spec & Token Tools -->
+      <!-- Tab 4: Templates Gallery -->
+      <div id="tabContent-templates" class="tab-content">
+        <h4 style="font-size: 13px; color: var(--text-muted); text-transform: uppercase;">معرض القوالب الجاهزة / Turnkey Templates</h4>
+        {templates_html}
+      </div>
+
+      <!-- Tab 5: JSON Spec & Token Tools -->
       <div id="tabContent-json" class="tab-content">
         <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="copyMinifiedJson()">⚡ Copy Minified JSON (Tokens Saved)</button>
         <pre class="json-code" id="rawJsonBlock">{model['formatted_json']}</pre>
@@ -834,6 +880,24 @@ def generate_studio_html(
     function copyMinifiedJson() {{
       navigator.clipboard.writeText(MODEL.minified_json);
       alert('Copied token-minified JSON to clipboard!');
+    }}
+
+    const ALL_TEMPLATES = {templates_json};
+
+    function copyTemplateBrief(tid) {{
+      const t = ALL_TEMPLATES.find(x => x.id === tid);
+      if (!t) return;
+      const sample = {{
+        template: t.id,
+        title: t.name_ar,
+        scenes: [
+          {{ title: "المشهد الأول: المدخل", text: "نص المشهد الأول المشكول بدقة...", role: "hook" }},
+          {{ title: "المشهد الثاني: التفاصيل", text: "نص المشهد الثاني مع المخطط التوضيحي...", role: "data_proof" }},
+          {{ title: "المشهد الأخير: الخلاصة", text: "نص الخلاصة والدعوة للتفاعل...", role: "conclusion" }}
+        ]
+      }};
+      navigator.clipboard.writeText(JSON.stringify(sample, null, 2));
+      alert('Copied turnkey brief for ' + t.name_ar + ' to clipboard!');
     }}
 
     window.onload = initTimeline;

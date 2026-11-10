@@ -1,0 +1,58 @@
+{
+  "id": "news_breaking_brief_4ce164",
+  "template": "news_breaking_brief",
+  "style": "blackboard",
+  "look": "cool",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "عاجل: مؤتمر الذكاء الاصطناعي العالمي 2026",
+  "chapters": false,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 10.0,
+  "captions_style": "plain",
+  "highlight_color": "red",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "إعلان الثورة التقنية",
+      "narration_text": "أُعْلِنَ الْيَوْمَ فِي قِمَّةِ التِّكْنُولُوجْيَا عَنْ طَفْرَةٍ كُبْرَى فِي نَمَاذِجِ التَّفْكِيرِ.",
+      "keywords": [
+        {
+          "text": "🔴 عاجل / BREAKING",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "ding"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "title": "تفاصيل الإعلان التاريخي",
+      "transition": "crossfade",
+      "narration_text": "تَشْمَلُ الطَّفْرَةُ نَمَاذِجَ تُفَكِّرُ بِشَكْلٍ مَنْطِقِيٍّ مَوْثُوقٍ بِنِسْبَةِ مِئَةٍ بِالْمِئَةِ.",
+      "diagram": {
+        "template": "causes",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "pop",
+        "params": {
+          "rows": 3
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "title": "ردود الفعل العالمية",
+      "transition": "whip_pan",
+      "narration_text": "تَوَالَتْ رُدُودُ الأَفْعَالِ الإِيجَابِيَّةِ مِنْ كُبْرَيَاتِ شَرِكَاتِ التِّقْنِيَّةِ."
+    }
+  ]
+}

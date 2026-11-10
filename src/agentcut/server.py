@@ -382,6 +382,20 @@ TOOLS = [
          "original_text": {"type": "string", "description": "Optional original script to diff against."},
          "wpm": {"type": "integer", "description": "Optional reading speed words-per-minute target (default 140 for Arabic, 160 for English)."}},
          "required": ["text"]}},
+    {"name": "list_content_templates",
+     "description": "List all 8 turnkey multi-genre content templates with their metadata, WCAG-validated palettes, aspect ratios, and visual styles.",
+     "inputSchema": {"type": "object", "properties": {
+         "category": {"type": "string", "description": "Optional category filter ('finance', 'documentary', 'tech', 'entertainment', 'news', 'education', 'podcast', 'marketing', or 'all')."}}}},
+    {"name": "produce_from_template",
+     "description": "One-call turnkey tool: expand a high-level topic title and minimal scene list using one of the 8 content templates, and render the finished studio MP4 video.",
+     "inputSchema": {"type": "object", "properties": {
+         "template_id": {"type": "string", "description": "One of the 8 content genre templates: 'finance_data_story', 'history_documentary', 'tech_code_explainer', 'top_list_countdown', 'news_breaking_brief', 'educational_lesson', 'podcast_audiogram_quote', 'product_promo_showcase'."},
+         "title": {"type": "string", "description": "Main video topic title."},
+         "scenes": {"type": "array", "description": "List of scenes with title, narration_text, role, data, etc.", "items": {"type": "object"}},
+         "output_path": {"type": "string", "description": "Output path for the rendered MP4 file."},
+         "aspect": {"type": "string", "description": "Target aspect ratio: '9:16', '16:9', '1:1', '4:5'. Default '9:16'."},
+         "parallel": {"type": "boolean", "description": "Whether to render scenes concurrently across CPU cores. Default false."}},
+         "required": ["template_id", "title", "scenes", "output_path"]}},
 ]
 
 
@@ -685,6 +699,31 @@ def call_tool(name, args):
         if orig:
             metrics["diff"] = diff_texts(orig, text)
         return _text(metrics)
+    if name == "list_content_templates":
+        from .templates import list_content_templates as _list_tpls
+        category = args.get("category")
+        return _text({"templates": _list_tpls(category)})
+    if name == "produce_from_template":
+        from .templates import build_brief_from_template as _build_tpl
+        from .render import produce_explainer as _prod_exp
+        tid = args.get("template_id")
+        title = args.get("title")
+        scenes = args.get("scenes")
+        out_p = args.get("output_path")
+        aspect = args.get("aspect", "9:16")
+        parallel = bool(args.get("parallel", False))
+
+        if not tid or not title or not scenes or not out_p:
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "template_id, title, scenes, and output_path are required"})
+        try:
+            brief = _build_tpl(tid, title, scenes, aspect=aspect)
+        except Exception as e:
+            return _tool_error({"code": "TEMPLATE_ERROR", "message": str(e)})
+
+        ok, info = _prod_exp(brief, out_p)
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

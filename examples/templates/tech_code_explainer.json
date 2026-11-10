@@ -1,0 +1,63 @@
+{
+  "id": "tech_code_explainer_00db3c",
+  "template": "tech_code_explainer",
+  "style": "blackboard",
+  "look": "teal_orange",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "هندسة الوكلاء الأذكياء المستقلين",
+  "chapters": true,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 8.0,
+  "captions_style": "karaoke",
+  "highlight_color": "green",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "جيل جديد من الذكاء الاصطناعي",
+      "narration_text": "لَمْ يَعُدِ الذَّكَاءُ الاِصْطِنَاعِيُّ مُجَرَّدَ نَمَاذِجَ لُغَوِيَّةٍ بَلْ وُكَلَاءَ قَادِرِينَ عَلَى التَّنْفِيذِ.",
+      "keywords": [
+        {
+          "text": "Autonomous AI",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "pop"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "title": "المعمارية البرمجية للوكيل",
+      "transition": "glitch",
+      "narration_text": "يَتَكَوَّنُ الْوَكِيلُ مِنْ ثَلاَثِ طَبَقَاتٍ: التَّخْطِيطُ، وَالأَدَوَاتُ، وَالذَّاكِرَةُ.",
+      "diagram": {
+        "template": "process_flow",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "pop",
+        "params": {
+          "steps": 3,
+          "labels": [
+            "Planning",
+            "Tools Execution",
+            "Persistent Memory"
+          ]
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "title": "مستقبل البرمجة المؤتمتة",
+      "transition": "whip_pan",
+      "narration_text": "سَيُعِيدُ هَؤُلاَءِ الْوُكَلَاءُ بِنَاءَ طَرِيقَةِ تَطْوِيرِ التَّطْبِيقَاتِ كُلِّيَّاً."
+    }
+  ]
+}

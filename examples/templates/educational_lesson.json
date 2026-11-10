@@ -1,0 +1,70 @@
+{
+  "id": "educational_lesson_36dcdd",
+  "template": "educational_lesson",
+  "style": "blackboard",
+  "look": "cinematic",
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "مقدمة في نظرية الحوسبة السحابية",
+  "chapters": true,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 8.0,
+  "captions_style": "karaoke",
+  "highlight_color": "cyan",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "ما هي الحوسبة السحابية؟",
+      "narration_text": "الْحَوْسَبَةُ السَّحَابِيَّةُ هِيَ تَوْفِيرُ مَوَارِدِ تِكْنُولُوجْيَا الْمَعْلُومَاتِ حَسَبَ الطَّلَبِ.",
+      "keywords": [
+        {
+          "text": "📌 فكرة اليوم",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "ding"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "title": "نماذج الخدمة الأساسية",
+      "transition": "crossfade",
+      "narration_text": "تَنْقَسِمُ السَّحَابَةُ إِلَى ثَلاَثَةِ نَمَاذِجَ رَئِيسِيَّةٍ: البِنْيَةُ التَّحْتِيَّةُ، وَالْمَنَصَّةُ، وَالْبَرْمَجِيَّاتُ.",
+      "diagram": {
+        "template": "process_flow",
+        "draw": 2.5,
+        "size": 0.55,
+        "card": true,
+        "sfx": "pop",
+        "params": {
+          "steps": 3,
+          "labels": [
+            "IaaS",
+            "PaaS",
+            "SaaS"
+          ]
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "title": "خلاصة الدرس وأهم المفاهيم",
+      "transition": "crossfade",
+      "narration_text": "تُمَكِّنُ السَّحَابَةُ الشَّرِكَاتِ مِنَ التَّوَسُّعِ السَّرِيعِ وَتَقْلِيلِ التَّكَالِيفِ.",
+      "diagram": {
+        "template": "comparison_cards",
+        "draw": 2.5,
+        "size": 0.55,
+        "card": true,
+        "sfx": "ding"
+      }
+    }
+  ]
+}

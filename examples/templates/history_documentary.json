@@ -1,0 +1,80 @@
+{
+  "id": "history_documentary_8a4f27",
+  "template": "history_documentary",
+  "style": "blackboard",
+  "look": "warm",
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "طريق الحرير: شريان التجارة العالمية",
+  "chapters": true,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 14.0,
+  "captions_style": "plain",
+  "highlight_color": "yellow",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "فجر التجارة العالمية",
+      "narration_text": "مُنْذُ آلاَفِ السِّنِينَ، رَبَطَ طَرِيقُ الْحَرِيرِ بَيْنَ الشَّرْقِ وَالْغَرْبِ.",
+      "diagram": {
+        "template": "timeline",
+        "draw": 2.5,
+        "size": 0.55,
+        "card": true,
+        "sfx": "whoosh",
+        "params": {
+          "steps": 3,
+          "labels": [
+            "المرحلة 1",
+            "المرحلة 2",
+            "المرحلة 3"
+          ]
+        }
+      }
+    },
+    {
+      "id": "s2",
+      "title": "محطات القوافل الكبرى",
+      "transition": "light_leak",
+      "narration_text": "تَبَادَلَتِ الْحَضَارَاتُ البَضَائِعَ وَالأَفْكَارَ وَالْعُلُومَ.",
+      "diagram": {
+        "template": "timeline",
+        "draw": 2.5,
+        "size": 0.55,
+        "card": true,
+        "sfx": "ding",
+        "params": {
+          "steps": 3,
+          "labels": [
+            "سمرقند",
+            "بغداد",
+            "دمشق"
+          ]
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "title": "إرث لا يندثر",
+      "transition": "crossfade",
+      "narration_text": "ظَلَّ هَذَا الشِّرْيَانُ خَالِداً فِي ذَاكِرَةِ التَّارِيخِ الإِنْسَانِيِّ.",
+      "diagram": {
+        "template": "causes",
+        "draw": 2.5,
+        "size": 0.55,
+        "card": true,
+        "sfx": "ding",
+        "params": {
+          "rows": 3
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "id": "finance_data_story_2e102e",
+  "template": "finance_data_story",
+  "style": "blackboard",
+  "look": "cinematic",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "صعود العملات الرقمية والأسواق في 2026",
+  "chapters": true,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 10.0,
+  "captions_style": "karaoke",
+  "highlight_color": "yellow",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "مقدمة الصعود المالي",
+      "narration_text": "فِي عَامِ أَلْفَيْنِ وَسِتَّةٍ وَعِشْرِينَ، شَهِدَتِ الأَسْوَاقُ قَفْزَةً تَارِيخِيَّةً."
+    },
+    {
+      "id": "s2",
+      "title": "أزمة التضخم والعملات",
+      "transition": "whip_pan",
+      "narration_text": "ارْتَفَعَتْ مُعَدَّلَاتُ التَّضَخُّمِ لِتَدْفَعَ الْمُسْتَثْمِرِينَ نَحْوَ مَلَاذَاتٍ آمِنَةٍ.",
+      "diagram": {
+        "template": "comparison_cards",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "pop"
+      }
+    },
+    {
+      "id": "s3",
+      "title": "أرقام النمو القياسي",
+      "transition": "crossfade",
+      "narration_text": "قَفَزَتْ قِيمَةُ الأُصُولِ الرَّقْمِيَّةِ إِلَى مُسْتَوَيَاتٍ غَيْرِ مَسْبُوقَةٍ.",
+      "diagram": {
+        "template": "chart",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "ding",
+        "params": {
+          "values": [
+            25.0,
+            45.0,
+            70.0,
+            95.0
+          ]
+        }
+      }
+    },
+    {
+      "id": "s4",
+      "title": "الخلاصة والقرار المالي",
+      "transition": "whip_pan",
+      "narration_text": "الْمُسْتَقْبَلُ لِمَنْ يُدِيرُ الْمَخَاطِرَ بِذَكَاءٍ مَالِيٍّ مُحْكَمٍ.",
+      "keywords": [
+        {
+          "text": "الخلاصة والقرار المالي",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "ding"
+        }
+      ]
+    }
+  ]
+}

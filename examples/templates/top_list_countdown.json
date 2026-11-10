@@ -1,0 +1,56 @@
+{
+  "id": "top_list_countdown_4448c1",
+  "template": "top_list_countdown",
+  "style": "blackboard",
+  "look": "cinematic",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "أفضل 5 أدوات ذكاء اصطناعي للمطورين",
+  "chapters": true,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 8.0,
+  "captions_style": "karaoke",
+  "highlight_color": "yellow",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "العد التنازلي لأقوى الأدوات",
+      "narration_text": "إِلَيْكُمْ أَفْضَلَ خَمْسِ أَدَوَاتٍ غَيَّرَتْ حَيَاةَ الْمُبَرْمِجِينَ."
+    },
+    {
+      "id": "s2",
+      "title": "المرتبة الخامسة: المساعدات اللحظية",
+      "transition": "zoom_out",
+      "narration_text": "فِي الْمَرْتَبَةِ الْخَامِسَةِ نَجِدُ مُسَاعِدَاتِ الإِكْمَالِ التِّلْقَائِيِّ لِلْكُودِ.",
+      "keywords": [
+        {
+          "text": "#5 Code Copilots",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "pop"
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "title": "المرتبة الأولى: الوكلاء المستقلون",
+      "transition": "whip_pan",
+      "narration_text": "وَفِي الصَّدَارَةِ بِجَدَارَةٍ: وُكَلَاءُ التَّطْوِيرِ الْمُسْتَقِلُّونَ كَـ AgentCut.",
+      "keywords": [
+        {
+          "text": "🏆 #1 AgentCut",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "ding"
+        }
+      ]
+    }
+  ]
+}

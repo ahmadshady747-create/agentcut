@@ -308,7 +308,7 @@ async def _synthesize_async(
         for wi, chunk_w in enumerate(raw_words):
             ws = max(prev_end, round(chunk_w["offset"] / 10_000_000, 3))
             we = max(ws + 0.05, round((chunk_w["offset"] + chunk_w["duration"]) / 10_000_000, 3))
-            w_token = tokens[wi] if wi < len(tokens) else chunk_w["text"]
+            w_token = chunk_w["text"] if chunk_w.get("text") else (tokens[wi].strip(".,!?;:()[]\"'") if wi < len(tokens) else "")
             if clean_captions:
                 w_token = re.sub(r'[\u064B-\u065F\u0670]', '', w_token)
             word_timings.append({"word": w_token, "start": ws, "end": we})
@@ -320,7 +320,7 @@ async def _synthesize_async(
             for rem_i in range(len(word_timings), len(tokens)):
                 ws = round(last_end, 3)
                 we = round(last_end + step, 3)
-                w_token = tokens[rem_i]
+                w_token = tokens[rem_i].strip(".,!?;:()[]\"'")
                 if clean_captions:
                     w_token = re.sub(r'[\u064B-\u065F\u0670]', '', w_token)
                 word_timings.append({"word": w_token, "start": ws, "end": we})

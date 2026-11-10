@@ -1,0 +1,76 @@
+{
+  "id": "product_promo_showcase_2a9ec6",
+  "template": "product_promo_showcase",
+  "style": "blackboard",
+  "look": "teal_orange",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "أطلق مشروعك القادم مع AgentCut",
+  "chapters": false,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 8.0,
+  "captions_style": "karaoke",
+  "highlight_color": "cyan",
+  "highlight_mode": "word",
+  "pacing": true,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "المشكلة في مونتاج الفيديو التقليدي",
+      "narration_text": "يَسْتَغْرِقُ مَنْتَجَةُ فِيدْيُو وَاحِدٍ سَاعَاتٍ طَوِيلَةً مِنَ الْجُهْدِ الرَّتِيبِ.",
+      "diagram": {
+        "template": "comparison_cards",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "pop"
+      }
+    },
+    {
+      "id": "s2",
+      "title": "الحل البرمجي مع الوكلاء",
+      "transition": "zoom_out",
+      "narration_text": "مَعَ AgentCut، تُنْتِجُ فِيدْيُوهَاتٍ احْتِرَافِيَّةً بِأَمْرٍ وَاحِدٍ فَقَطْ.",
+      "diagram": {
+        "template": "process_flow",
+        "draw": 2.5,
+        "size": 0.75,
+        "card": true,
+        "sfx": "pop",
+        "params": {
+          "steps": 3,
+          "labels": [
+            "Prompt / Brief",
+            "Automated Edit",
+            "Studio Render"
+          ]
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "title": "السرعة والإنتاجية بالأرقام",
+      "transition": "whip_pan",
+      "narration_text": "سُرْعَةٌ تَفُوقُ الطُّرُقَ التَّقْلِيدِيَّةَ بِعَشَرَةِ أَضْعَافٍ."
+    },
+    {
+      "id": "s4",
+      "title": "ابدأ الآن مجاناً",
+      "transition": "zoom_out",
+      "narration_text": "جَرِّبْ AgentCut الْيَوْمَ وَانْطَلِقْ فِي صِنَاعَةِ الْمُحْتَوَى.",
+      "keywords": [
+        {
+          "text": "👉 Get Started",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "ding"
+        }
+      ]
+    }
+  ]
+}

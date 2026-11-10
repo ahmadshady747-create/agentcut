@@ -7104,6 +7104,9 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_SCHEMA",
                        "message": "explainer brief must be an object",
                        "fix": "pass a brief object with id, background and scenes"}
+    if brief.get("template"):
+        from .templates import apply_template_to_brief
+        brief = apply_template_to_brief(brief)
     punched = _explainer_find_punch_in(brief)
     if punched is not None:
         return False, {"code": "INVALID_SCHEMA",

@@ -1,0 +1,42 @@
+{
+  "id": "podcast_audiogram_quote_f54247",
+  "template": "podcast_audiogram_quote",
+  "style": "blackboard",
+  "look": "warm",
+  "output": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  },
+  "background": "canvas",
+  "title": "كيف تبني شركة ناشئة ناجحة؟",
+  "chapters": false,
+  "motion": "gentle",
+  "music": "ambient",
+  "duck_amount_db": 6.0,
+  "captions_style": "karaoke",
+  "highlight_color": "magenta",
+  "highlight_mode": "word",
+  "pacing": false,
+  "scenes": [
+    {
+      "id": "s1",
+      "title": "نصيحة للمؤسسين الأوائل",
+      "narration_text": "إِذَا لَمْ تَكُنْ تَحُلُّ مُشْكِلَةً حَقِيقِيَّةً تَمَسُّ النَّاسَ، فَلَنْ يَشْتَرِيَ مِنْكَ أَحَدٌ.",
+      "keywords": [
+        {
+          "text": "🎙️ حوار مع رائد أعمال",
+          "start": 1.0,
+          "end": 4.5,
+          "sfx": "whoosh"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "title": "سر الاستمرارية والنمو",
+      "transition": "crossfade",
+      "narration_text": "الاسْتِمْرَارِيَّةُ وَالتَّعَلُّمُ مِنْ فِيدْبَاكِ الْعُمَلَاءِ هُمَا الْفَارِقُ الْحَقِيقِيُّ."
+    }
+  ]
+}
