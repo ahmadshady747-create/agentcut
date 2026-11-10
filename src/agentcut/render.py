@@ -6767,7 +6767,7 @@ def _explainer_pacing_beats(start, dur, title, si, nscenes,
         # and validation rejects it (see the fix hint for
         # motion.suffix).
         c0, c1 = base + 13.0, min(base + 20.0, start + dur)
-        if (c1 - c0) >= 1.5:
+        if c1 > c0:
             beats.append({
                 "id": f"pace-ct-{si + 1}-{cycle + 1}",
                 "kind": "counter", "from": 0, "to": pct,
