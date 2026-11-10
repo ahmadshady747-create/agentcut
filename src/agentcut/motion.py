@@ -609,6 +609,14 @@ def render_element_frame(el, t):
         _draw_cards(canvas, el, t, bx, by)
     elif el["kind"] == "lower_third":
         _draw_lower_third(canvas, el, t, bx, by)
+    else:
+        try:
+            from .plugins import get_motion_plugin
+            plugin = get_motion_plugin(el["kind"])
+            if plugin is not None:
+                plugin.render(canvas, el, t, bx, by)
+        except Exception:
+            pass
     return canvas.bytes()
 
 

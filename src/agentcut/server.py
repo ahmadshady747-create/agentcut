@@ -334,6 +334,40 @@ TOOLS = [
      "description": "Cancel a background render job by its bg_ id. A queued job is cancelled; a running job cannot be interrupted and reports cancelled=False; a finished job reports its final status.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "synthesize_speech",
+     "description": "Synthesize speech audio (.mp3) and matching time-aligned SRT captions (.srt) from text using neural TTS. Allows generating scene voiceovers and subtitles autonomously without human recording.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Text to synthesize into speech."},
+         "output_audio": {"type": "string", "description": "Output path for the audio file (.mp3)."},
+         "output_srt": {"type": "string", "description": "Optional output path for time-aligned captions (.srt)."},
+         "voice": {"type": "string", "description": "Optional neural voice name (e.g. 'ar-SA-HamedNeural', 'en-US-ChristopherNeural'). Automatically detected if omitted."},
+         "rate": {"type": "string", "description": "Speaking rate adjustment (default '+0%')."},
+         "volume": {"type": "string", "description": "Volume adjustment (default '+0%')."}},
+         "required": ["text", "output_audio"]}},
+    {"name": "list_voices",
+     "description": "List available neural TTS voices for speech synthesis. Optionally filter by language prefix (e.g. 'ar' for Arabic, 'en' for English).",
+     "inputSchema": {"type": "object", "properties": {
+         "language": {"type": "string", "description": "Language prefix filter (e.g. 'ar', 'en')."}}}},
+    {"name": "reframe_video",
+     "description": "Intelligently reframe an existing video to a target aspect ratio (9:16 Shorts/Reels/TikTok, 1:1 Square, 16:9 Landscape, 4:5 Portrait) with dynamic blurred padding, cropping, or letterbox fit.",
+     "inputSchema": {"type": "object", "properties": {
+         "input_video": {"type": "string", "description": "Path to input video."},
+         "output_video": {"type": "string", "description": "Destination path for reframed video."},
+         "target_aspect": {"type": "string", "description": "Target aspect ratio ('9:16', '1:1', '16:9', 'shorts', 'reels', etc.). Default '9:16'."},
+         "mode": {"type": "string", "description": "Framing mode: 'blur_pad' (dynamic blurred padding), 'crop', or 'fit'. Default 'blur_pad'."},
+         "draft": {"type": "boolean", "description": "Fast draft mode (half resolution, fastest preset)."}},
+         "required": ["input_video", "output_video"]}},
+    {"name": "generate_web_studio",
+     "description": "Generate an interactive, standalone HTML Web Studio timeline inspector for a project dict or explainer brief. Includes multi-track timeline, synchronized playhead, speech viewer, aspect ratio simulator, and video preview.",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "object", "description": "Project dictionary or brief object."},
+         "video_path": {"type": "string", "description": "Optional path to the rendered video file."},
+         "output_html": {"type": "string", "description": "Optional destination path for the HTML file."}},
+         "required": ["project"]}},
+    {"name": "list_plugins",
+     "description": "List all registered motion element plugins and diagram templates, and optionally discover plugins in workspace or user directories.",
+     "inputSchema": {"type": "object", "properties": {
+         "discover": {"type": "boolean", "description": "Whether to auto-discover and load plugins from directories."}}}},
 ]
 
 
@@ -558,6 +592,65 @@ def call_tool(name, args):
         if rec is None:
             return _tool_error({"code": "JOB_NOT_FOUND", "message": args["id"]})
         return _text(rec)
+    if name == "synthesize_speech":
+        from .tts import synthesize_speech
+        text = args.get("text")
+        out_audio = args.get("output_audio")
+        out_srt = args.get("output_srt")
+        voice = args.get("voice")
+        rate = args.get("rate", "+0%")
+        volume = args.get("volume", "+0%")
+        if not text or not isinstance(text, str):
+            return _tool_error({"code": "INVALID_ARGUMENT", "message": "text must be a non-empty string"})
+        if not out_audio or not isinstance(out_audio, str):
+            return _tool_error({"code": "INVALID_ARGUMENT", "message": "output_audio must be a valid path"})
+        try:
+            res = synthesize_speech(text, out_audio, out_srt, voice=voice, rate=rate, volume=volume)
+            return _text(res)
+        except Exception as exc:
+            return _tool_error({"code": "TTS_FAILED", "message": str(exc)})
+    if name == "list_voices":
+        from .tts import list_voices
+        lang = args.get("language")
+        try:
+            voices = list_voices(language_prefix=lang)
+            return _text({"voices": voices, "count": len(voices)})
+        except Exception as exc:
+            return _tool_error({"code": "TTS_FAILED", "message": str(exc)})
+    if name == "reframe_video":
+        from .reframe import reframe_video
+        in_video = args.get("input_video")
+        out_video = args.get("output_video")
+        aspect = args.get("target_aspect", "9:16")
+        mode = args.get("mode", "blur_pad")
+        draft = bool(args.get("draft", False))
+        if not in_video or not out_video:
+            return _tool_error({"code": "INVALID_ARGUMENT", "message": "input_video and output_video are required"})
+        ok, info = reframe_video(in_video, out_video, target_aspect=aspect, mode=mode, draft=draft)
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "generate_web_studio":
+        from .studio import generate_studio_html
+        proj = args.get("project")
+        vpath = args.get("video_path")
+        out_html = args.get("output_html")
+        if not proj or not isinstance(proj, dict):
+            return _tool_error({"code": "INVALID_ARGUMENT", "message": "project must be an object"})
+        try:
+            out_file = generate_studio_html(proj, video_path=vpath, output_html_path=out_html)
+            return _text({"studio_html": out_file, "title": proj.get("title") or proj.get("id") or "Studio"})
+        except Exception as exc:
+            return _tool_error({"code": "STUDIO_FAILED", "message": str(exc)})
+    if name == "list_plugins":
+        from .plugins import discover_plugins, list_diagram_plugins, list_motion_plugins
+        disc = bool(args.get("discover", False))
+        discovered = discover_plugins() if disc else []
+        return _text({
+            "motion_plugins": list_motion_plugins(),
+            "diagram_plugins": list_diagram_plugins(),
+            "discovered_files": discovered,
+        })
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

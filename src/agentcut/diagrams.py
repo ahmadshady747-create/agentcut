@@ -663,6 +663,244 @@ def template_primitives(params):
     return cw, ch, list(strokes)
 
 
+def template_timeline(params):
+    """Timeline template (Phase 2): animated chronological roadmap/milestones diagram.
+
+    params:
+      steps: int 2..6 (default 3)
+      direction: 'horizontal' (default) or 'vertical'
+      color: stroke color (default 'white')
+      accent_color: milestone accent color (default 'yellow')
+      arrow: bool (default True)
+    """
+    params = params or {}
+    try:
+        steps = int(params.get("steps", 3))
+    except (TypeError, ValueError):
+        raise ValueError("timeline steps must be an integer")
+    if not 2 <= steps <= 6:
+        raise ValueError("timeline steps must be between 2 and 6")
+
+    direction = str(params.get("direction", "horizontal")).lower()
+    if direction not in ("horizontal", "vertical"):
+        raise ValueError("timeline direction must be 'horizontal' or 'vertical'")
+
+    color = params.get("color", "white")
+    accent = params.get("accent_color", "yellow")
+    has_arrow = bool(params.get("arrow", True))
+
+    strokes = []
+    if direction == "horizontal":
+        cw, ch = 900, 560
+        y_axis = 280
+        start_x, end_x = 80, 820
+        if has_arrow:
+            strokes.append({
+                "kind": "arrow",
+                "points": [[start_x, y_axis], [end_x, y_axis]],
+                "color": color,
+                "width": 5,
+                "head_size": 24,
+            })
+        else:
+            strokes.append({
+                "kind": "line",
+                "points": [[start_x, y_axis], [end_x, y_axis]],
+                "color": color,
+                "width": 5,
+            })
+
+        span = 660
+        step_delta = span / (steps - 1) if steps > 1 else span
+        for i in range(steps):
+            cx = int(round(120 + i * step_delta))
+            strokes.append({
+                "kind": "circle",
+                "center": [cx, y_axis],
+                "radius": 16,
+                "color": accent,
+                "width": 4,
+            })
+            strokes.append({
+                "kind": "circle",
+                "center": [cx, y_axis],
+                "radius": 6,
+                "color": color,
+                "width": 3,
+            })
+            if i % 2 == 0:
+                strokes.append({
+                    "kind": "line",
+                    "points": [[cx, y_axis - 20], [cx, y_axis - 75]],
+                    "color": color,
+                    "width": 3,
+                })
+                strokes.append({
+                    "kind": "rect",
+                    "x": cx - 55,
+                    "y": y_axis - 145,
+                    "rect_width": 110,
+                    "rect_height": 65,
+                    "corner_radius": 10,
+                    "color": color,
+                    "width": 3,
+                })
+            else:
+                strokes.append({
+                    "kind": "line",
+                    "points": [[cx, y_axis + 20], [cx, y_axis + 75]],
+                    "color": color,
+                    "width": 3,
+                })
+                strokes.append({
+                    "kind": "rect",
+                    "x": cx - 55,
+                    "y": y_axis + 80,
+                    "rect_width": 110,
+                    "rect_height": 65,
+                    "corner_radius": 10,
+                    "color": color,
+                    "width": 3,
+                })
+    else:  # vertical
+        cw, ch = 600, 800
+        x_axis = 300
+        start_y, end_y = 80, 720
+        if has_arrow:
+            strokes.append({
+                "kind": "arrow",
+                "points": [[x_axis, start_y], [x_axis, end_y]],
+                "color": color,
+                "width": 5,
+                "head_size": 24,
+            })
+        else:
+            strokes.append({
+                "kind": "line",
+                "points": [[x_axis, start_y], [x_axis, end_y]],
+                "color": color,
+                "width": 5,
+            })
+
+        span = 560
+        step_delta = span / (steps - 1) if steps > 1 else span
+        for i in range(steps):
+            cy = int(round(120 + i * step_delta))
+            strokes.append({
+                "kind": "circle",
+                "center": [x_axis, cy],
+                "radius": 16,
+                "color": accent,
+                "width": 4,
+            })
+            strokes.append({
+                "kind": "circle",
+                "center": [x_axis, cy],
+                "radius": 6,
+                "color": color,
+                "width": 3,
+            })
+            if i % 2 == 0:
+                strokes.append({
+                    "kind": "line",
+                    "points": [[x_axis - 20, cy], [x_axis - 65, cy]],
+                    "color": color,
+                    "width": 3,
+                })
+                strokes.append({
+                    "kind": "rect",
+                    "x": x_axis - 190,
+                    "y": cy - 35,
+                    "rect_width": 120,
+                    "rect_height": 70,
+                    "corner_radius": 10,
+                    "color": color,
+                    "width": 3,
+                })
+            else:
+                strokes.append({
+                    "kind": "line",
+                    "points": [[x_axis + 20, cy], [x_axis + 65, cy]],
+                    "color": color,
+                    "width": 3,
+                })
+                strokes.append({
+                    "kind": "rect",
+                    "x": x_axis + 70,
+                    "y": cy - 35,
+                    "rect_width": 120,
+                    "rect_height": 70,
+                    "corner_radius": 10,
+                    "color": color,
+                    "width": 3,
+                })
+
+    return cw, ch, strokes
+
+
+def template_process_flow(params):
+    """Process flow template (Phase 2): animated sequential workflow steps.
+
+    params:
+      steps: int 2..5 (default 3)
+      color: stroke color (default 'white')
+      accent_color: arrow/badge color (default 'yellow')
+    """
+    params = params or {}
+    try:
+        steps = int(params.get("steps", 3))
+    except (TypeError, ValueError):
+        raise ValueError("process_flow steps must be an integer")
+    if not 2 <= steps <= 5:
+        raise ValueError("process_flow steps must be between 2 and 5")
+
+    color = params.get("color", "white")
+    accent = params.get("accent_color", "yellow")
+
+    cw, ch = 900, 500
+    card_h = 130
+    y_card = (ch - card_h) // 2
+
+    total_w = 760
+    gap = 40
+    card_w = int((total_w - (steps - 1) * gap) / steps)
+    start_x = (cw - total_w) // 2
+
+    strokes = []
+    for i in range(steps):
+        x = start_x + i * (card_w + gap)
+        strokes.append({
+            "kind": "rect",
+            "x": x,
+            "y": y_card,
+            "rect_width": card_w,
+            "rect_height": card_h,
+            "corner_radius": 12,
+            "color": color,
+            "width": 4,
+        })
+        strokes.append({
+            "kind": "circle",
+            "center": [x + 32, y_card + 32],
+            "radius": 14,
+            "color": accent,
+            "width": 3,
+        })
+        if i < steps - 1:
+            arr_start_x = x + card_w + 6
+            arr_end_x = arr_start_x + gap - 12
+            y_mid = y_card + card_h // 2
+            strokes.append({
+                "kind": "arrow",
+                "points": [[arr_start_x, y_mid], [arr_end_x, y_mid]],
+                "color": accent,
+                "width": 4,
+                "head_size": 18,
+            })
+
+    return cw, ch, strokes
+
+
 # Legacy templates that are motion adapters now (v1.45.0,
 # R4b-3): their names stay in TEMPLATES so old projects still
 # validate, but they build no strokes — validate.py adapts them
@@ -676,6 +914,8 @@ TEMPLATES = {
     "balance": None,
     "causes": None,
     "primitives": template_primitives,
+    "timeline": template_timeline,
+    "process_flow": template_process_flow,
 }
 
 
@@ -696,6 +936,12 @@ def build_template(name, params):
             "comparison_cards), not as strokes — the diagram "
             "validator builds it")
     fn = TEMPLATES.get(name)
+    if fn is None:
+        try:
+            from .plugins import get_diagram_plugin
+            fn = get_diagram_plugin(name)
+        except Exception:
+            fn = None
     if fn is None:
         raise ValueError(f"unknown diagram template '{name}'")
     return fn(params or {})

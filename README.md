@@ -18,12 +18,16 @@
 ```sh
 git clone https://github.com/ahmadshady747-create/agentcut.git
 cd agentcut
-./run.sh validate examples/basic.json   # validate first, always
-./run.sh render examples/basic.json out.mp4
-./run.sh serve                          # MCP server on stdio
+./run.sh validate examples/basic.json                  # validate first, always
+./run.sh render examples/basic.json out.mp4           # render full video
+./run.sh produce-explainer brief.json out.mp4         # autonomous one-button explainer
+./run.sh tts "نص الشرح الصوتي" voice.mp3 --srt out.srt # native neural TTS narration
+./run.sh reframe out.mp4 9:16 vertical.mp4            # smart multi-aspect reframing
+./run.sh studio examples/basic.json studio.html       # visual timeline inspector
+./run.sh serve                                         # MCP server on stdio (26 tools)
 ```
 
-**Requirements:** Python 3.10+, `ffmpeg` and `ffprobe` on PATH. **Zero Python dependencies. Zero network calls for media.** All sources are local files.
+**Requirements:** Python 3.10+, `ffmpeg` and `ffprobe` on PATH. Optional: `edge-tts` for neural speech synthesis. **Zero network calls for media rendering.** All sources are local files.
 
 ---
 
@@ -74,6 +78,42 @@ For simpler jobs, `produce_video` takes a short brief (format preset + media + t
 ---
 
 ## ✨ What it can do
+
+### 🎙️ Native TTS & Autonomous Voiceovers
+- **Zero-setup neural speech synthesis:** Built-in integration with `edge-tts` (multilingual neural voices, natural Arabic accents `ar-EG-SalmaNeural`, `ar-SA-HamedNeural`, English `en-US-ChristopherNeural`, etc.) with graceful automatic fallback to system SAPI / pyttsx3.
+- **Microsecond SRT & word-level sync:** Every TTS generation exports synchronized SRT captions with word-level and sentence-level timecodes, automatically piped into scene narration and kinetic subtitles without manual timing.
+- **Autonomous scene narration in `produce_explainer`:** When a brief scene provides `narration_text` instead of a pre-recorded audio file, AgentCut synthesizes the voice, measures its exact length to set scene duration, generates cues, and renders the voice track automatically.
+
+### 💥 Kinetic Subtitles & Explainer Diagrams
+- **Modern kinetic karaoke ASS engine:** Multi-theme subtitle styling (`beast`, `neon`, `gold`, `minimal`, `clean`) with dynamic word-by-word highlight synchronization, font scaling, outlines, dropshadows, and full BiDi / HarfBuzz Arabic text shaping.
+- **Timeline & process-flow diagrams:** Two declarative explainer diagram templates:
+  - `timeline`: Milestone nodes connected along a directional progress line with dates, titles, and step highlights.
+  - `process_flow`: Numbered sequential step cards with directional chevron connectors and animated progress indicators.
+- **Cinematic transitions:** Built-in post-join transition effects (`glitch`, `zoom_out`, `whip_pan`, `light_leak`) straddling cuts to elevate storytelling pace.
+
+### ⚡ GPU Acceleration & Parallel Rendering
+- **Automatic hardware encoder detection:** Transparently inspects available encoders and selects GPU-accelerated pipelines — Intel QSV (`h264_qsv`), Windows Media Foundation (`h264_mf`), NVIDIA NVENC (`h264_nvenc`), Apple VideoToolbox (`h264_videotoolbox`), or graceful CPU (`libx264`) fallback.
+- **Parallel scene/chunk rendering:** `render_parallel_chunks` partitions independent timeline scenes into concurrent rendering workers and stitches them via fast FFmpeg concat demuxer, achieving massive speedups on multi-core workstations.
+- **Draft mode:** `draft: true` flag renders instant low-resolution, high-speed preview proxies for immediate agent self-verification loops.
+
+### 📐 Smart Multi-Aspect Auto-Reframe
+- **One video, all platforms:** Convert landscape (16:9) to vertical (9:16 Shorts/Reels/TikTok), square (1:1), or portrait (4:5) in a single call.
+- **Multiple framing modes:**
+  - `blur_pad`: Centers the content over a dynamically scaled, blurred, and darkened version of itself (standard high-end social media look).
+  - `crop`: Centers and crops cleanly to the target aspect ratio without distortion.
+  - `fit`: Preserves full dimensions with cinematic black bars (letterbox/pillarbox).
+- **Batch variant export:** `reframe_to_variants` exports all desired aspect ratios simultaneously with GPU acceleration.
+
+### 🧩 Dynamic Plugin Architecture
+- **Extensible motion graphics:** Subclass `MotionPlugin` in `agentcut.plugins` to create bespoke procedural motion graphic elements (e.g. animated `progress_bar`, `badge`, lower thirds, or tickers).
+- **Custom diagram templates:** Register custom domain-specific diagram generators with `register_diagram_plugin` and use them directly in any brief or timeline JSON.
+- **Zero-configuration auto-discovery:** Plugins placed in `./plugins/` or `~/.agentcut/plugins/` are automatically discovered, registered, and validated on startup.
+
+### 🖥️ Interactive Web Studio
+- **Standalone zero-dependency HTML5 inspector:** Generate a single, fully offline HTML file (`studio.html`) containing an interactive multi-track timeline visualization (Scenes, Narration, Motion graphics, Audio bed).
+- **Synchronized playback & scrubber:** Interactive time scrubber, HTML5 canvas preview, and playhead synced across all tracks.
+- **Aspect ratio simulator:** Switch instant viewport simulation between 16:9, 9:16, and 1:1.
+- **Bilingual & RTL-native:** Full native Arabic RTL layout support, inspector drawer for scene metadata, SRT subtitle cues, and motion element parameters.
 
 ### 🎥 Timeline & editing
 Sequential clips (video trims, image durations), transitions (`crossfade`, `fade`, wipes, slides, `dissolve`, `zoom`, `wipe_tl`, `squeeze_h` and more), split / reverse / freeze / loop, speed and speed curves, overlays with keyframes, masks, chroma key, blurred-background fit (`blur`, `blur_pad`), two-pass stabilization, and outputs up to 3840 wide with timelines up to 600 seconds.
@@ -152,13 +192,14 @@ The agent can't run code on your phone, so it builds a self-contained render pac
 
 ---
 
-## 🧰 MCP tools (23)
+## 🧰 MCP tools (26)
 
-**Projects:** `create_project`, `get_project`, `list_projects`, `patch_project`, `validate_project`, `preview_project`, `render_project`, `poster_frame`, `render_contact_sheet`
-**Produce:** `produce_video`, `produce_explainer`, `produce_variants`, `split_clip`, `timeline_summary`, `check_brief`
+**Projects:** `create_project`, `get_project`, `list_projects`, `patch_project`, `validate_project`, `preview_project`, `render_project`, `poster_frame`, `render_contact_sheet`, `generate_web_studio`
+**Produce:** `produce_video`, `produce_explainer`, `produce_variants`, `split_clip`, `timeline_summary`, `check_brief`, `reframe_video`
 **Snapshots:** `snapshot_project`, `rollback_project`, `list_snapshots`
 **Jobs:** `get_job` (detached jobs that survive the client closing stdio), `start_render_job`, `get_job_status`, `cancel_job` (in-process `bg_` jobs)
 **Media:** `probe_media`
+**Plugins:** `list_plugins`
 
 Every error is a JSON object with `code` and `message`, plus `field` and `clip_id` when they apply. The full agent guide lives in [`SKILL.md`](SKILL.md).
 
@@ -211,6 +252,6 @@ AgentCut is licensed under the **Business Source License 1.1** — see [LICENSE]
 
 ---
 
-## 📌 Version
+## 📌 Version & Roadmap
 
-**Current: 1.46.1** — SRT caption scaling fix (the caption wrap now measures with HarfBuzz on the real render font; Noto Sans Arabic Bold unification stays). No new features, no new MCP tools (23). Caption margins on the reference cue: 116/118px at 720p (beats 1.44.0's 62px), 149/150px at 1080p, 38/40px at 360p. `examples/basic.json` (no captions) byte-identical across 1.46.0/1.46.1. Test suite: **355/355**, run in CI on every push and pull request. Full history: [CHANGELOG.md](CHANGELOG.md).
+**Current: 1.46.1 + Next-Gen Phases 1-4 Complete** — Features native neural TTS voiceovers, ASS kinetic subtitles, timeline/process diagrams, GPU hardware acceleration & parallel rendering, multi-aspect auto-reframing (`blur_pad`/`crop`/`fit`), dynamic motion & diagram plugin architecture, interactive zero-dependency HTML5 Web Studio inspector, and 26 MCP tools. Total test suite: **380/380 passed**, run in CI on every push and pull request. See [docs/ROADMAP.md](docs/ROADMAP.md) for full architectural roadmap and test verification history. Full history: [CHANGELOG.md](CHANGELOG.md).

@@ -2379,7 +2379,9 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                                   fix="remove canvas from this template diagram, or use custom strokes with canvas instead"))
                 continue
             tname = dg["template"]
-            if tname not in TEMPLATES:
+            from .plugins import get_diagram_plugin
+            dplugin = get_diagram_plugin(tname)
+            if tname not in TEMPLATES and dplugin is None:
                 errors.append(err("INVALID_SCHEMA", f"unknown diagram template '{tname}'; valid templates are: " + ", ".join(sorted(TEMPLATES)), field="diagrams.template", clip_id=did,
                                   fix="set template to one of: " + ", ".join(sorted(TEMPLATES))))
                 continue
@@ -2388,16 +2390,22 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                 errors.append(err("INVALID_SCHEMA", "diagram params must be an object", field="diagrams.params", clip_id=did,
                                   fix="give params as an object, e.g. {'values': [10, 12, 14]}"))
                 continue
-            allowed = {"chart": {"values", "fill", "y_grid_values"},
-                       "basket": {"coins"},
-                       "balance": {"left", "right"}, "causes": {"rows"},
-                       "primitives": {"strokes", "canvas"}}[tname]
-            unknown = sorted(set(params) - allowed)
-            if unknown:
-                errors.append(err("INVALID_SCHEMA", f"template '{tname}' does not take params: " + ", ".join(unknown), field="diagrams.params", clip_id=did,
-                                  fix=f"template '{tname}' takes only: " + ", ".join(sorted(allowed))))
-                continue
-            ok = True
+            if dplugin is not None:
+                # Custom diagram plugin handles its own params in build_template
+                ok = True
+            else:
+                allowed = {"chart": {"values", "fill", "y_grid_values"},
+                           "basket": {"coins"},
+                           "balance": {"left", "right"}, "causes": {"rows"},
+                           "primitives": {"strokes", "canvas"},
+                           "timeline": {"steps", "direction", "color", "accent_color", "arrow"},
+                           "process_flow": {"steps", "color", "accent_color"}}[tname]
+                unknown = sorted(set(params) - allowed)
+                if unknown:
+                    errors.append(err("INVALID_SCHEMA", f"template '{tname}' does not take params: " + ", ".join(unknown), field="diagrams.params", clip_id=did,
+                                      fix=f"template '{tname}' takes only: " + ", ".join(sorted(allowed))))
+                    continue
+                ok = True
             if tname == "chart":
                 vals = params.get("values")
                 if not isinstance(vals, list) or not 2 <= len(vals) <= 8:
@@ -2474,6 +2482,39 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                         ok = False
                     else:
                         params = dict(params, rows=rows)
+            elif tname == "timeline":
+                try:
+                    steps = int(params.get("steps", 3))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "timeline steps must be an integer", field="diagrams.params.steps", clip_id=did,
+                                      fix="set steps to a whole number 2..6, or remove it for 3"))
+                    ok = False
+                else:
+                    if isinstance(params.get("steps", 3), bool) or not 2 <= steps <= 6:
+                        errors.append(err("INVALID_SCHEMA", "timeline steps must be 2..6", field="diagrams.params.steps", clip_id=did,
+                                          fix="set steps between 2 and 6"))
+                        ok = False
+                    else:
+                        params = dict(params, steps=steps)
+                direction = params.get("direction", "horizontal")
+                if direction not in ("horizontal", "vertical"):
+                    errors.append(err("INVALID_SCHEMA", "timeline direction must be 'horizontal' or 'vertical'", field="diagrams.params.direction", clip_id=did,
+                                      fix="set direction to 'horizontal' or 'vertical'"))
+                    ok = False
+            elif tname == "process_flow":
+                try:
+                    steps = int(params.get("steps", 3))
+                except (TypeError, ValueError):
+                    errors.append(err("INVALID_SCHEMA", "process_flow steps must be an integer", field="diagrams.params.steps", clip_id=did,
+                                      fix="set steps to a whole number 2..5, or remove it for 3"))
+                    ok = False
+                else:
+                    if isinstance(params.get("steps", 3), bool) or not 2 <= steps <= 5:
+                        errors.append(err("INVALID_SCHEMA", "process_flow steps must be 2..5", field="diagrams.params.steps", clip_id=did,
+                                          fix="set steps between 2 and 5"))
+                        ok = False
+                    else:
+                        params = dict(params, steps=steps)
             elif tname == "primitives":
                 # General primitives template: strokes are validated
                 # exactly like custom strokes, against the template
@@ -3332,7 +3373,8 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
             continue
         seen.add(mid)
         kind = el.get("kind")
-        if kind not in MOTION_KINDS:
+        from .plugins import is_known_motion_kind, get_motion_plugin
+        if not is_known_motion_kind(kind):
             errors.append(err("INVALID_SCHEMA", f"unknown motion kind '{kind}'; valid kinds are: " + ", ".join(sorted(MOTION_KINDS)), field="motion.kind", clip_id=mid,
                               fix="set kind to one of: " + ", ".join(sorted(MOTION_KINDS))))
             continue
@@ -3371,6 +3413,13 @@ def _validate_motion(project, total, width, height, fps, overlay_ids,
                 resolved.append(rel)
             continue
         if kind != "shape":
+            plugin = get_motion_plugin(kind)
+            if plugin is not None:
+                rel = plugin.validate(el, mid, start, end, width, height, fps, errors)
+                if rel is not None:
+                    _motion_style_passthrough(el, rel, mid, errors)
+                    resolved.append(rel)
+                continue
             # Later rounds land the remaining kinds. Until then
             # the kind is known but unimplemented, so it fails
             # loudly instead of validating into a drop.

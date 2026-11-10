@@ -99,7 +99,14 @@ def _diagram_card_rect(dg, width, height, dw):
 # --- Hardware encoder detection + smart errors + temp hygiene
 # (architectural refactoring; defaults unchanged) ----------------
 
-HW_ENCODERS_PREFERENCE = ("h264_nvenc", "h264_videotoolbox", "h264_vaapi")
+HW_ENCODERS_PREFERENCE = (
+    "h264_nvenc",
+    "h264_videotoolbox",
+    "h264_qsv",
+    "h264_amf",
+    "h264_mf",
+    "h264_vaapi",
+)
 
 
 def detect_hw_encoders():
@@ -6659,6 +6666,156 @@ def _explainer_pacing_beats(start, dur, title, si, nscenes,
     return beats
 
 
+def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
+                               video_codec="auto", video_preset=None, timeout=600):
+    """Render multiple explainer scenes concurrently across CPU/GPU cores (Phase 3),
+    concatenating them with ffmpeg concat demuxer (-c copy) for maximum rendering speed.
+    """
+    import concurrent.futures
+    import shutil
+
+    tmp_dir = tempfile.mkdtemp(prefix="agentcut-parallel-")
+    try:
+        chunk_files = []
+        futures = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(scenes))) as executor:
+            for si, scene in enumerate(scenes):
+                s_start = scene["start"]
+                s_end = scene["end"]
+                s_dur = scene["duration"]
+
+                sc_captions = []
+                for c in project.get("captions", []):
+                    if s_start <= c["start"] < s_end:
+                        rebased_c = dict(c)
+                        rebased_c["start"] = max(0.0, round(c["start"] - s_start, 3))
+                        rebased_c["end"] = max(rebased_c["start"] + 0.1, min(s_dur, round(c["end"] - s_start, 3)))
+                        if "word_timings" in c:
+                            rebased_c["word_timings"] = [
+                                {
+                                    "word": wt["word"],
+                                    "start": max(0.0, round(wt["start"] - s_start, 3)),
+                                    "end": min(s_dur, round(wt["end"] - s_start, 3)),
+                                }
+                                for wt in c["word_timings"]
+                            ]
+                        sc_captions.append(rebased_c)
+
+                sc_texts = []
+                for t in project.get("texts", []):
+                    if t.get("start", 0.0) == 0.0 and t.get("end", 0.0) >= s_end:
+                        rebased_t = dict(t)
+                        rebased_t["start"] = 0.0
+                        rebased_t["end"] = s_dur
+                        sc_texts.append(rebased_t)
+                    elif s_start <= t.get("start", 0.0) < s_end:
+                        rebased_t = dict(t)
+                        rebased_t["start"] = max(0.0, round(t["start"] - s_start, 3))
+                        rebased_t["end"] = max(rebased_t["start"] + 0.1, min(s_dur, round(t["end"] - s_start, 3)))
+                        sc_texts.append(rebased_t)
+
+                sc_diagrams = []
+                for d in project.get("diagrams", []):
+                    if s_start <= d.get("start", 0.0) < s_end:
+                        rebased_d = dict(d)
+                        rebased_d["start"] = max(0.0, round(d["start"] - s_start, 3))
+                        rebased_d["end"] = max(rebased_d["start"] + 0.1, min(s_dur, round(d["end"] - s_start, 3)))
+                        sc_diagrams.append(rebased_d)
+
+                sc_motion = []
+                for m in project.get("motion", []):
+                    if s_start <= m.get("start", 0.0) < s_end:
+                        rebased_m = dict(m)
+                        rebased_m["start"] = max(0.0, round(m["start"] - s_start, 3))
+                        rebased_m["end"] = max(rebased_m["start"] + 0.1, min(s_dur, round(m["end"] - s_start, 3)))
+                        sc_motion.append(rebased_m)
+
+                clip_i = dict(project["clips"][si])
+                clip_i["transition"] = "none"
+                clip_i.pop("transition_duration", None)
+
+                chunk_proj = {
+                    "id": f"{project.get('id', 'proj')}_chunk_{si}",
+                    "version": 1,
+                    "output": project["output"],
+                    "clips": [clip_i],
+                    "audio": [{"src": scene["narration"], "kind": "voice", "volume": 1.0, "start": 0.0}],
+                    "captions": sc_captions,
+                    "texts": sc_texts,
+                    "diagrams": sc_diagrams,
+                    "motion": sc_motion,
+                    "scrims": project.get("scrims", {}),
+                    "default_image_motion": project.get("default_image_motion", False),
+                }
+
+                chunk_out = os.path.join(tmp_dir, f"chunk_{si:03d}.mp4")
+                chunk_files.append(chunk_out)
+
+                future = executor.submit(
+                    render_project,
+                    chunk_proj,
+                    chunk_out,
+                    scale_factor=scale_factor,
+                    video_codec=video_codec,
+                    video_preset=video_preset,
+                    timeout=max(120, int(s_dur * 20)),
+                )
+                futures.append((si, future))
+
+            for si, f in futures:
+                ok, res = f.result()
+                if not ok:
+                    return False, res
+
+        list_file = os.path.join(tmp_dir, "concat_list.txt")
+        with open(list_file, "w", encoding="utf-8") as lf:
+            for cf in chunk_files:
+                norm_p = cf.replace("\\", "/")
+                lf.write(f"file '{norm_p}'\n")
+
+        joined_path = os.path.join(tmp_dir, "joined.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",
+            joined_path,
+        ]
+        proc = subprocess.run(concat_cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.isfile(joined_path):
+            return False, {"code": "CONCAT_FAILED", "message": f"FFmpeg concat demuxer failed: {proc.stderr}"}
+
+        music_tracks = [a for a in project.get("audio", []) if a.get("kind") == "music"]
+        if music_tracks:
+            music_src = music_tracks[0]["src"]
+            final_tmp = os.path.join(tmp_dir, "final_mix.mp4")
+            mix_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", joined_path,
+                "-i", music_src,
+                "-filter_complex",
+                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first[a]",
+                "-map", "0:v",
+                "-map", "[a]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                final_tmp,
+            ]
+            proc = subprocess.run(mix_cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and os.path.isfile(final_tmp):
+                shutil.move(final_tmp, output_path)
+            else:
+                shutil.move(joined_path, output_path)
+        else:
+            shutil.move(joined_path, output_path)
+
+        return True, {"output": output_path, "parallel_chunks": len(scenes)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def produce_explainer(brief, output_path, review_dir=None):
     """One-button board explainer (v1.39.0): one brief in, one
     finished video out. No hand-written project.json: every
@@ -6803,18 +6960,38 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_SCHEMA",
                        "message": "title must be a non-empty string",
                        "fix": "set title to the video title, or remove it"}
+    brief_transition = brief.get("transition", "none")
+    if brief_transition is not None and brief_transition != "none":
+        from .validate import CUSTOM_TRANSITIONS, XFADE_TRANSITIONS
+        all_trans = set(XFADE_TRANSITIONS) | set(CUSTOM_TRANSITIONS)
+        if brief_transition not in all_trans:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"unknown explainer transition '{brief_transition}'",
+                           "fix": f"set transition to one of: {', '.join(sorted(all_trans))} or 'none'"}
+    captions_style = brief.get("captions_style", "plain")
+    if captions_style not in ("plain", "karaoke"):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"captions_style must be 'plain' or 'karaoke', got {captions_style!r}",
+                       "fix": "set captions_style to 'karaoke' for word-by-word active highlighting, or 'plain'"}
     scenes_in = brief.get("scenes")
     if not isinstance(scenes_in, list) or not scenes_in:
         return False, {"code": "EMPTY_TIMELINE",
                        "message": "explainer brief needs a non-empty scenes list",
                        "fix": "give scenes as a list of {id, title, narration, captions} objects"}
     music = brief.get("music")
+    ambient_file = None
     if music is not None:
         if not isinstance(music, str) or not music:
             return False, {"code": "INVALID_SCHEMA",
-                           "message": "music must be a local audio file path or null",
-                           "fix": "set music to an audio file path, or null for no music"}
-        if not os.path.isfile(resolve_path(music)):
+                           "message": "music must be a local audio file path, 'ambient', or null",
+                           "fix": "set music to an audio file path, 'ambient', or null for no music"}
+        if music in ("ambient", "procedural"):
+            from .tts import generate_ambient_audio
+            tts_dir = output_path + ".tts"
+            os.makedirs(tts_dir, exist_ok=True)
+            ambient_file = os.path.join(tts_dir, "ambient_bg.mp3")
+            music = ambient_file
+        elif not os.path.isfile(resolve_path(music)):
             return False, {"code": "FILE_NOT_FOUND",
                            "message": f"music file not found: {music}",
                            "fix": "fix the music path to an existing local audio file, or set music to null"}
@@ -6824,11 +7001,11 @@ def produce_explainer(brief, output_path, review_dir=None):
     # chimes, so a long explainer has audible beats throughout
     # instead of one pop per video.
     sfx_density = brief.get("sfx_density", "minimal")
-    if sfx_density not in ("minimal", "rich"):
+    if sfx_density not in ("minimal", "rich", "auto"):
         return False, {"code": "INVALID_SCHEMA",
-                       "message": "sfx_density must be 'minimal' or 'rich'",
-                       "fix": "set sfx_density to 'rich' for scene-transition whoosh + keyword pops + diagram chimes, or remove it for the minimal default"}
-    rich = (sfx_density == "rich")
+                       "message": "sfx_density must be 'minimal', 'rich', or 'auto'",
+                       "fix": "set sfx_density to 'rich' or 'auto' for scene-transition whoosh + keyword pops + diagram chimes, or remove it for the minimal default"}
+    rich = (sfx_density in ("rich", "auto"))
     # v1.45.0, R8: visual pacing (Visual Beat Interval
     # 5.0..7.0s). Default ON: long scenes (>= 13s) get
     # lower_third + chart + counter beats so no stretch is
@@ -6870,11 +7047,33 @@ def produce_explainer(brief, output_path, review_dir=None):
             return False, {"code": "INVALID_SCHEMA",
                            "message": f"scene {si} needs a non-empty string id",
                            "fix": f"give scene {si} an id, e.g. 's{si + 1}'"}
+        scene_word_timings = None
         narration = scene.get("narration")
         if not isinstance(narration, str) or not narration:
-            return False, {"code": "INVALID_SCHEMA",
-                           "message": f"scene {sid} needs a narration audio path",
-                           "fix": f"set scene {sid} narration to a local audio file"}
+            narration_text = (scene.get("narration_text")
+                              or scene.get("speech_text")
+                              or scene.get("text"))
+            if isinstance(narration_text, str) and narration_text.strip():
+                from .tts import synthesize_speech
+                tts_dir = output_path + ".tts"
+                os.makedirs(tts_dir, exist_ok=True)
+                audio_path = os.path.join(tts_dir, f"{sid}.mp3")
+                auto_srt_path = os.path.join(tts_dir, f"{sid}.srt")
+                voice = scene.get("voice") or brief.get("voice")
+                try:
+                    tts_res = synthesize_speech(narration_text, audio_path, auto_srt_path, voice=voice)
+                    narration = audio_path
+                    scene_word_timings = tts_res.get("word_timings")
+                    if not scene.get("captions"):
+                        scene["captions"] = auto_srt_path
+                except Exception as exc:
+                    return False, {"code": "TTS_FAILED",
+                                   "message": f"scene {sid} TTS synthesis failed: {exc}",
+                                   "fix": "verify network connection and edge-tts installation, or provide a narration audio file"}
+            else:
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} needs a narration audio path or narration_text",
+                               "fix": f"set scene {sid} narration to a local audio file or provide narration_text"}
         if not os.path.isfile(resolve_path(narration)):
             return False, {"code": "FILE_NOT_FOUND",
                            "message": f"scene {sid} narration not found: {narration}",
@@ -6901,14 +7100,39 @@ def produce_explainer(brief, output_path, review_dir=None):
                            "message": f"scene {sid} captions cannot be parsed: {exc}",
                            "fix": f"fix scene {sid} captions as a valid SRT file"}
         start, end = total, total + dur
+        is_karaoke = (captions_style == "karaoke"
+                      or scene.get("captions_style") == "karaoke"
+                      or bool(scene.get("kinetic")))
         for cue in cues:
             if cue["start"] >= dur:
                 continue
-            captions.append({"text": cue["text"],
-                             "start": round(start + cue["start"], 3),
-                             "end": round(start + min(cue["end"], dur), 3)})
-        clips.append({"id": sid, "kind": "image", "src": background,
-                      "duration": dur, "transition": "none"})
+            c_start = round(start + cue["start"], 3)
+            c_end = round(start + min(cue["end"], dur), 3)
+            cap_entry = {"text": cue["text"], "start": c_start, "end": c_end}
+            if is_karaoke and scene_word_timings:
+                cue_words = []
+                for wt in scene_word_timings:
+                    if cue["start"] - 0.05 <= wt["start"] and wt["end"] <= cue["end"] + 0.05:
+                        cue_words.append({
+                            "word": wt["word"],
+                            "start": round(start + wt["start"], 3),
+                            "end": round(start + min(wt["end"], dur), 3),
+                        })
+                if cue_words and [w["word"] for w in cue_words] == str(cue["text"]).split():
+                    cap_entry["word_timings"] = cue_words
+                    cap_entry["highlight_color"] = scene.get("highlight_color") or brief.get("highlight_color", "yellow")
+                    cap_entry["highlight_mode"] = scene.get("highlight_mode", "word")
+            captions.append(cap_entry)
+        scene_trans = "none"
+        if si > 0:
+            scene_trans = scene.get("transition") or brief_transition or "none"
+        clip_entry = {"id": sid, "kind": "image", "src": background,
+                      "duration": dur, "transition": scene_trans}
+        if scene_trans != "none":
+            clip_entry["transition_duration"] = float(
+                scene.get("transition_duration", brief.get("transition_duration", 0.5))
+            )
+        clips.append(clip_entry)
         # v1.40.0: look treatment/grade ride on every scene clip,
         # whatever the background is (photo, solid, board).
         if look.get("treatment"):
@@ -7085,6 +7309,9 @@ def produce_explainer(brief, output_path, review_dir=None):
     if brief.get("chapters"):
         project["chapters"] = [{"title": s["title"] or s["id"],
                                 "start": s["start"]} for s in scenes]
+    if ambient_file is not None:
+        from .tts import generate_ambient_audio
+        generate_ambient_audio(ambient_file, duration=max(10.0, total + 5.0))
     if music is not None:
         project["audio"].append({"src": music, "kind": "music",
                                  "volume": 1.0, "start": 0.0})
@@ -7119,8 +7346,22 @@ def produce_explainer(brief, output_path, review_dir=None):
     # load (the failed run left no partial file — renders
     # are atomic — so the retry is still one finished
     # video from one call).
+    # Phase 3: Hardware acceleration, Parallel chunking, and Ultra-Fast Draft Mode
+    video_codec = brief.get("video_codec", "auto")
+    is_draft = bool(brief.get("draft") or brief.get("mode") == "draft")
+    scale_factor = 0.5 if is_draft else float(brief.get("scale_factor", 1.0))
+    video_preset = "ultrafast" if is_draft else brief.get("video_preset")
+    is_parallel = bool(brief.get("parallel") or brief.get("render_mode") == "parallel")
+
     timeout = max(600, int(total * 20))
-    ok, rinfo = render_project(project, output_path, timeout=timeout)
+    if is_parallel and len(scenes) >= 2:
+        ok, rinfo = _render_explainer_parallel(
+            project, scenes, output_path, scale_factor=scale_factor,
+            video_codec=video_codec, video_preset=video_preset, timeout=timeout)
+    else:
+        ok, rinfo = render_project(
+            project, output_path, scale_factor=scale_factor,
+            video_codec=video_codec, video_preset=video_preset, timeout=timeout)
     if not ok:
         return False, rinfo
     if review_dir is None:
@@ -7138,8 +7379,10 @@ def produce_explainer(brief, output_path, review_dir=None):
     return True, {
         "output": output_path,
         "duration": info["total_duration"],
-        "width": width, "height": height, "fps": fps,
+        "width": int(width * scale_factor), "height": int(height * scale_factor), "fps": fps,
         "look": look_name,
+        "draft": is_draft,
+        "parallel": is_parallel and len(scenes) >= 2,
         "scenes": scenes,
         "chapters": info.get("chapters", []),
         "warnings": explainer_warnings,
@@ -7664,3 +7907,7 @@ def run_job_worker(jobs_dir, job_id, out_dir):
         ok = False
     store._write(record)
     return ok
+
+
+from .reframe import reframe_to_variants, reframe_video
+

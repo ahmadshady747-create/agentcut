@@ -84,6 +84,67 @@ def _main(argv):
         # disk state file and write the final state back to disk.
         # Started by JobStore.run_async, never by hand in normal use.
         return 0 if run_job_worker(argv[1], argv[2], argv[3]) else 1
+    if argv[0] == "tts" and len(argv) in (3, 4, 5):
+        from .tts import synthesize_speech
+        text = argv[1]
+        out_mp3 = argv[2]
+        out_srt = argv[3] if len(argv) >= 4 and not argv[3].startswith("-") else None
+        voice = argv[4] if len(argv) >= 5 else None
+        res = synthesize_speech(text, out_mp3, out_srt, voice=voice)
+        print(json.dumps(res, indent=2))
+        return 0
+    if argv[0] == "voices" and len(argv) in (1, 2):
+        from .tts import list_voices
+        lang = argv[1] if len(argv) == 2 else None
+        vlist = list_voices(lang)
+        print(json.dumps(vlist, indent=2))
+        return 0
+    if argv[0] == "reframe" and len(argv) >= 3:
+        from .reframe import reframe_video
+        in_path = argv[1]
+        out_path = argv[2]
+        aspect = "9:16"
+        mode = "blur_pad"
+        draft = "--draft" in argv
+        for idx in range(3, len(argv)):
+            if argv[idx] == "--aspect" and idx + 1 < len(argv):
+                aspect = argv[idx + 1]
+            elif argv[idx] == "--mode" and idx + 1 < len(argv):
+                mode = argv[idx + 1]
+        ok, info = reframe_video(in_path, out_path, target_aspect=aspect, mode=mode, draft=draft)
+        print(json.dumps(info, indent=2, default=str))
+        return 0 if ok else 1
+    if argv[0] == "studio" and len(argv) >= 2:
+        from .studio import generate_studio_html
+        target_json = argv[1]
+        video_arg = None
+        out_html = None
+        auto_open = "--open" in argv
+        idx = 2
+        while idx < len(argv):
+            if argv[idx] in ("-o", "--output") and idx + 1 < len(argv):
+                out_html = argv[idx + 1]
+                idx += 2
+            elif argv[idx] != "--open" and video_arg is None:
+                video_arg = argv[idx]
+                idx += 1
+            else:
+                idx += 1
+        path = generate_studio_html(target_json, video_path=video_arg, output_html_path=out_html)
+        print(json.dumps({"studio_html": path}, indent=2))
+        if auto_open:
+            import webbrowser
+            webbrowser.open(f"file://{path}")
+        return 0
+    if argv[0] == "plugins" and len(argv) in (1, 2):
+        from .plugins import discover_plugins, list_diagram_plugins, list_motion_plugins
+        sub = argv[1] if len(argv) == 2 else "list"
+        if sub == "discover":
+            loaded = discover_plugins()
+            print(json.dumps({"discovered_files": loaded, "motion_plugins": list_motion_plugins(), "diagram_plugins": list_diagram_plugins()}, indent=2))
+        else:
+            print(json.dumps({"motion_plugins": list_motion_plugins(), "diagram_plugins": list_diagram_plugins()}, indent=2))
+        return 0
     if argv[0] == "probe" and len(argv) == 2:
         info = probe_media(argv[1])
         print(json.dumps(info, indent=2, default=str) if info else "cannot probe")
@@ -91,12 +152,12 @@ def _main(argv):
     if argv[0] == "package" and len(argv) in (3, 4):
         trim = len(argv) == 4 and argv[3] == "--trim-clips"
         if len(argv) == 4 and not trim:
-            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
+            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>|tts <text> <mp3> [srt] [voice]|voices [lang]|reframe <in.mp4> <out.mp4> [--aspect 9:16] [--mode blur_pad]|studio <json> [video.mp4] [-o out.html]|plugins [list|discover]]")
             return 2
         summary = package_project(_load(argv[1]), argv[2], trim_clips=trim)
         print(json.dumps(summary, indent=2, default=str))
         return 0
-    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>]")
+    print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>|tts <text> <mp3> [srt] [voice]|voices [lang]|reframe <in.mp4> <out.mp4> [--aspect 9:16] [--mode blur_pad]|studio <json> [video.mp4] [-o out.html]|plugins [list|discover]]")
     return 2
 
 

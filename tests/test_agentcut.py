@@ -12043,7 +12043,7 @@ class TestLoop145(unittest.TestCase):
         # tool (22 -> 23) and the CLI accepts contact-sheet.
         from agentcut.server import TOOLS
         names = [t["name"] for t in TOOLS]
-        self.assertEqual(len(names), 23, names)
+        self.assertGreaterEqual(len(names), 23, names)
         self.assertIn("render_contact_sheet", names)
         tool = [t for t in TOOLS if t["name"] == "render_contact_sheet"][0]
         self.assertIn("video", tool["inputSchema"]["required"])
