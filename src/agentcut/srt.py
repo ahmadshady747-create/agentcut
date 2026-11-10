@@ -698,10 +698,13 @@ def build_karaoke_ass(events, width, height):
             # Arabic lines; Latin lines are byte-identical.
             body = pos + (RLM if _ARABIC_RE.search(ev["text"]) else "") \
                 + _ass_escape(ev["text"])
-        elif ev["kind"] == "karaoke":
+        elif ev["kind"] in ("karaoke", "karaoke_pill"):
             hi_hex = _ass_hex(ev["hi_color"])
             chron = list(ev["words"])
             is_ar = any(_ARABIC_RE.search(w["word"]) for w in chron)
+            is_pill = (ev["kind"] == "karaoke_pill"
+                       or ev.get("caption_style") == "karaoke_pill"
+                       or ev.get("captions_style") == "karaoke_pill")
             # One Dialogue per word window (chronological file
             # order): the full line, with the window's word
             # highlighted and the rest base. Gaps between
@@ -725,7 +728,10 @@ def build_karaoke_ass(events, width, height):
                         parts.append(_ass_escape(w2["word"]))
                     if after:
                         parts.append(" ")
-                    parts.append(r"{\c&H%s&}" % hi_hex[2:])
+                    if is_pill:
+                        parts.append(r"{\fscx110\fscy110\c&H%s&}" % hi_hex[2:])
+                    else:
+                        parts.append(r"{\c&H%s&}" % hi_hex[2:])
                     parts.append(_ass_escape(w["word"]))
                     # R7b (Fix 2, kinetic-space loss): the gap
                     # between the highlighted word and the word
@@ -745,7 +751,10 @@ def build_karaoke_ass(events, width, height):
                     # hold line has the same word + space).
                     if before:
                         parts.append(" ")
-                    parts.append(r"{\c&H%s&}" % base_hex[2:])
+                    if is_pill:
+                        parts.append(r"{\fscx100\fscy100\c&H%s&}" % base_hex[2:])
+                    else:
+                        parts.append(r"{\c&H%s&}" % base_hex[2:])
                     parts.append(RLM)
                     for j, w2 in enumerate(before):
                         if j > 0:
@@ -756,9 +765,14 @@ def build_karaoke_ass(events, width, height):
                         if j > 0:
                             parts.append(" ")
                         if j == ci:
-                            parts.append(r"{\c&H%s&}" % hi_hex[2:])
-                            parts.append(_ass_escape(w2["word"]))
-                            parts.append(r"{\c&H%s&}" % base_hex[2:])
+                            if is_pill:
+                                parts.append(r"{\fscx110\fscy110\c&H%s&}" % hi_hex[2:])
+                                parts.append(_ass_escape(w2["word"]))
+                                parts.append(r"{\fscx100\fscy100\c&H%s&}" % base_hex[2:])
+                            else:
+                                parts.append(r"{\c&H%s&}" % hi_hex[2:])
+                                parts.append(_ass_escape(w2["word"]))
+                                parts.append(r"{\c&H%s&}" % base_hex[2:])
                         else:
                             parts.append(_ass_escape(w2["word"]))
                 dialogues.append(

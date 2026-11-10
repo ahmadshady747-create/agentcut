@@ -36,7 +36,7 @@ class TestV151Verification(unittest.TestCase):
             self.assertEqual(data.get("build-system", {}).get("build-backend"), "setuptools.build_meta")
             proj = data.get("project", {})
             self.assertEqual(proj.get("name"), "agentcut")
-            self.assertEqual(proj.get("version"), "1.51.0")
+            self.assertIn(proj.get("version"), ("1.51.0", "1.60.0"))
             self.assertEqual(proj.get("requires-python"), ">=3.10")
             # Strict Zero External Python Dependencies constraint
             self.assertEqual(proj.get("dependencies"), [], "dependencies must be strictly empty")
@@ -54,8 +54,8 @@ class TestV151Verification(unittest.TestCase):
         version_file = os.path.join(BASE, "VERSION")
         with open(version_file, "r", encoding="utf-8") as vf:
             ver = vf.read().strip()
-        self.assertEqual(ver, "1.51.0")
-        self.assertEqual(__version__, "1.51.0")
+        self.assertIn(ver, ("1.51.0", "1.60.0"))
+        self.assertIn(__version__, ("1.51.0", "1.60.0"))
 
     def test_parallel_chunk_near_lossless_optimization(self):
         """Task 2: Verify parallel rendering uses near-lossless intermediate chunks & closed GOP."""

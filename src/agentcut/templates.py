@@ -55,7 +55,7 @@ CONTENT_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "border": "#334155",
         },
         "typography": {
-            "caption_preset": "karaoke",
+            "caption_preset": "karaoke_pill",
             "highlight_color": "yellow",
             "highlight_mode": "word",
             "title_style": "bold_gold",
@@ -199,7 +199,7 @@ CONTENT_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "border": "#3F3F46",
         },
         "typography": {
-            "caption_preset": "karaoke",
+            "caption_preset": "karaoke_pill",
             "highlight_color": "yellow",
             "highlight_mode": "word",
             "title_style": "pop",
@@ -295,7 +295,7 @@ CONTENT_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "border": "#334155",
         },
         "typography": {
-            "caption_preset": "karaoke",
+            "caption_preset": "karaoke_pill",
             "highlight_color": "cyan",
             "highlight_mode": "word",
             "title_style": "lesson",
@@ -391,7 +391,7 @@ CONTENT_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "border": "#374151",
         },
         "typography": {
-            "caption_preset": "karaoke",
+            "caption_preset": "karaoke_pill",
             "highlight_color": "cyan",
             "highlight_mode": "word",
             "title_style": "bold",
@@ -446,6 +446,9 @@ def get_content_template(template_id: str) -> Dict[str, Any]:
         known = ", ".join(sorted(CONTENT_TEMPLATES.keys()))
         raise ValueError(f"Unknown content template '{template_id}'. Available templates: {known}")
     return copy.deepcopy(CONTENT_TEMPLATES[template_id])
+
+
+get_template = get_content_template
 
 
 def build_brief_from_template(

@@ -2,10 +2,10 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-1.51.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.60.0-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-30%20tools-purple.svg)](src/agentcut/server.py)
+[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-31%20tools-purple.svg)](src/agentcut/server.py)
 [![Content Templates](https://img.shields.io/badge/templates-8%20genres-orange.svg)](src/agentcut/templates.py)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 [![Engine: FFmpeg](https://img.shields.io/badge/engine-FFmpeg%208.1%2B-green.svg)](https://ffmpeg.org/)
@@ -62,20 +62,39 @@ agentcut-mcp
 
 ---
 
-## 🎨 Turnkey Multi-Genre Content Templates Engine (`v1.50.0`)
+## ✨ The Visual Leap (`v1.60.0`): Studio-Grade Vector UI & Cinematic Pipeline
 
-With **v1.50.0**, AgentCut introduces the **Multi-Genre Content Templates Engine** (`src/agentcut/templates.py`). Instead of handcrafting lower thirds, diagram geometries, color codes, transitions, and audio ducking depths, agents can invoke any of the **8 domain-tuned production templates**:
+With **v1.60.0**, AgentCut elevates visual output from basic geometry boxes to commercial television aesthetics (*Vox*, *Bloomberg*, *الاقتصاد الكوكبي*) while strictly preserving our **Zero External Python Dependencies** constraint:
+
+1. **Pure-Python RGBA Vector UI Engine (`src/agentcut/vector_ui.py`):**
+   - **Glassmorphism Cards:** Sub-pixel anti-aliasing via signed distance fields (SDF), rounded corners (`border_radius`), vertical gradients, glowing rims (`border_color`), and soft drop shadows (`drop_shadow`).
+   - **Rounded Chart Bars & Pill Badges:** Smooth top-curved bar charts and circular pill badges generated in milliseconds using pure Python `struct` + `zlib`.
+   - **Deterministic Disk Caching:** Every vector asset is hashed and stored in `.agentcut_cache/` for instantaneous reuse.
+
+2. **Cinematic B-Roll Engine (`src/agentcut/broll.py`):**
+   - **Multi-Source Scene Backgrounds:** Accepts local video clips (`.mp4`, `.mov`), photos, or automated stock video queries via Pexels/Pixabay API.
+   - **Depth of Field & Contrast Isolation:** Automated FFmpeg filter pipeline (`scale`, `crop`, gentle `zoompan`, `gblur=sigma=6.0`, `eq=brightness=-0.22`, `vignette=PI/4`) ensuring that background footage breathes life while foreground Arabic typography and vector cards maintain 100% legibility.
+
+3. **Active Word Karaoke Captions (`karaoke_pill`):**
+   - **Real-Time Word Highlighting:** Dynamic word-by-word tracking with active word 10% font enlargement (`\fscx110\fscy110`) and vibrant accent highlight.
+   - **Strict Arabic BiDi & HarfBuzz Safety:** Subtitle run-ordering specifically tuned for RTL paragraph layout without character disconnections.
+
+---
+
+## 🎨 Turnkey Multi-Genre Content Templates Engine (`v1.50.0` - `v1.60.0`)
+
+AgentCut provides **8 domain-tuned production templates** (`src/agentcut/templates.py`). Instead of handcrafting lower thirds, diagram geometries, color codes, transitions, and audio ducking depths, agents can invoke any turnkey genre:
 
 | Template ID | Genre / Domain | Visual Look & Palette | Captions & Pacing | Diagrams & Motion Elements |
 |---|---|---|---|---|
-| **`finance_data_story`** | المال والاقتصاد وتحليل البيانات | Deep slate glassmorphism (`#0F172A`), gold/cyan accents | `karaoke` word-by-word, whip cuts | `line_chart`, `bars`, `comparison_cards`, live `counter` with `٪` |
+| **`finance_data_story`** | المال والاقتصاد وتحليل البيانات | Deep slate glassmorphism (`#0F172A`), gold/cyan accents | `karaoke_pill` active highlight, whip cuts | `line_chart`, `bars`, `comparison_cards`, live `counter` with `٪` |
 | **`history_documentary`** | الوثائقيات والتاريخ والقصص | Warm cinematic grading, subtle film grain & vignette | Calm subtitles, `light_leak` / `crossfade` | Chronological `timeline`, quote cards (`style: "quote"`), slow Ken Burns |
 | **`tech_code_explainer`** | التقنية والبرمجة والذكاء الاصطناعي | Modern dark developer theme (`#090D16`, emerald `#10B981`) | `typewriter` titles, `glitch` transitions | `process_flow` architecture cards, `progress_bar`, `badge` plugins |
-| **`top_list_countdown`** | قوائم الترتيب وأفضل 5 (Top-N) | High-energy vibrant palette | `pop_in` kinetic keywords, punchy whoosh SFX | Numbered countdown ranking badges (`#5` ➔ `#1`), comparison cards |
+| **`top_list_countdown`** | قوائم الترتيب وأفضل 5 (Top-N) | High-energy vibrant palette | `karaoke_pill` active highlight, punchy whoosh SFX | Numbered countdown ranking badges (`#5` ➔ `#1`), comparison cards |
 | **`news_breaking_brief`** | الأخبار العاجلة والملخصات السريعة | Broadcast crimson/navy/white (`#EF4444`, `#0F172A`) | Fast cuts, boxed pill captions | Persistent bottom `progress_bar`, `lower_third` speaker banners, location `badge` |
 | **`educational_lesson`** | الدروس التعليمية والكورسات المصغرة | Academic slate & indigo with structured chapters | `highlight_sweep` on keywords | Breakdown cards, `process_flow`, automated **Final Summary Card** |
 | **`podcast_audiogram_quote`** | مقاطع البودكاست والاقتباسات | Spotlight dark backdrop, minimalist framing | Centered kinetic `quote` typography | Top speaker/topic `badge`, continuous audio progress indicator |
-| **`product_promo_showcase`** | عروض المنتجات والشركات الناشئة SaaS | High-conversion triadic harmony, clean gradients | High-energy dynamic pacing | 4-stage funnel (`Problem` ➔ `Solution` ➔ `Proof` ➔ `CTA Badge`) |
+| **`product_promo_showcase`** | عروض المنتجات والشركات الناشئة SaaS | High-conversion triadic harmony, clean gradients | `karaoke_pill` dynamic pacing | 4-stage funnel (`Problem` ➔ `Solution` ➔ `Proof` ➔ `CTA Badge`) |
 
 ### Instant Brief Inheritance
 Pass `"template": "<template_id>"` inside any brief. AgentCut automatically fills color palettes, layout zones, typography presets, ducking parameters, and diagram selections:

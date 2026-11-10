@@ -1,3 +1,27 @@
+## 1.60.0 — The Visual Leap: Pure-Python RGBA Glass Cards, Cinematic B-Roll & Karaoke Captions
+
+Major release bumping AgentCut to `v1.60.0`. Delivers a quantum leap in visual production quality from flat FFmpeg drawbox geometry to commercial broadcast standards (*Vox*, *Bloomberg*, *الاقتصاد الكوكبي*) while strictly maintaining our **Zero External Python Dependencies** constraint (`Python stdlib + FFmpeg` only).
+
+### 💎 Pure-Python Vector UI & Glassmorphism Cards (`src/agentcut/vector_ui.py`):
+- **Pure-Python 32-bit RGBA PNG Generator**: Built-in RFC 2083 PNG encoder using Python stdlib `struct` and `zlib` (<60 lines of code) producing valid 32-bit transparent RGBA PNGs at millisecond speeds with zero third-party dependencies (no Pillow, no Cairo, no OpenCV).
+- **Signed Distance Field (SDF) Glass Cards**: Sub-pixel anti-aliasing, rounded corners (`border_radius`), vertical linear gradients, glowing rim borders (`border_color`), and soft drop shadows (`drop_shadow`) with quadratic distance falloff.
+- **Rounded Bars & Pill Badges**: Smooth rounded-top bar chart columns with vertical sheen and circular pill badges (`radius = height / 2`).
+- **Deterministic Disk Caching**: Generated UI vector assets are cached under `.agentcut_cache/` by parameter content hash, eliminating runtime re-computation across renders.
+
+### 🎥 Cinematic B-Roll Engine (`src/agentcut/broll.py`):
+- **Per-Scene Background Media**: Support for `scene["broll"]` and `scene["bg_media"]` accepting local videos (`.mp4`, `.mov`), photos, or automated stock video queries via Pexels/Pixabay API with graceful fallback to canvas backgrounds.
+- **Depth of Field & Contrast Isolation Pipeline**: Automated filter chain (`scale`, `crop`, gentle `zoompan`, `gblur=sigma=6.0`, `eq=brightness=-0.22:contrast=1.12:saturation=0.85`, `vignette=PI/4`) ensuring realistic, living background motion while isolating foreground Arabic text and diagrams with 100% legibility.
+
+### 🎤 Active Word Karaoke Captions (`karaoke_pill`):
+- **Dynamic Word-by-Word Highlighting**: Real-time spoken word tracking with 10% font enlargement (`\fscx110\fscy110`) and vibrant accent highlight on the active spoken word while remaining words stay clean white.
+- **BiDi & HarfBuzz RTL Safety**: Reverse run-order ASS subtitle architecture specifically designed for Arabic right-to-left layout without breaking character ligatures.
+- Integrated into turnkey templates `finance_data_story`, `top_list_countdown`, and `product_promo_showcase`.
+
+### 🛠️ Tooling & Standard Packaging:
+- Bumped version to `1.60.0` in `pyproject.toml`, `VERSION`, and `agentcut.__version__`.
+- Registered new MCP tool `generate_glass_card_preview` in `src/agentcut/server.py` allowing AI agents to generate and inspect custom glassmorphism cards.
+- Added comprehensive test suite `tests/test_v160_visual_leap.py` verifying all features.
+
 ## 1.51.0 — Standard Packaging, Lossless Parallel Chunks & Telemetry Verification
 
 Release bumping AgentCut to `v1.51.0`. Adds standard Python packaging via `pyproject.toml`, eliminates generation loss and A/V sync drift in parallel rendering, adds native `bars` diagram template support, and establishes automated audio/video telemetry verification.

@@ -396,6 +396,18 @@ TOOLS = [
          "aspect": {"type": "string", "description": "Target aspect ratio: '9:16', '16:9', '1:1', '4:5'. Default '9:16'."},
          "parallel": {"type": "boolean", "description": "Whether to render scenes concurrently across CPU cores. Default false."}},
          "required": ["template_id", "title", "scenes", "output_path"]}},
+    {"name": "generate_glass_card_preview",
+     "description": "Generate a studio-grade pure-Python 32-bit RGBA vector glassmorphism card with anti-aliasing, linear gradient, glowing rim, and drop shadow.",
+     "inputSchema": {"type": "object", "properties": {
+         "width": {"type": "integer", "description": "Card width in pixels (e.g. 500)."},
+         "height": {"type": "integer", "description": "Card height in pixels (e.g. 260)."},
+         "border_radius": {"type": "number", "description": "Corner radius in pixels (default 24.0)."},
+         "bg_color_top": {"type": "string", "description": "Top background color or RGBA (default 'rgba(30, 41, 59, 0.85)')."},
+         "bg_color_bottom": {"type": "string", "description": "Bottom background color or RGBA (default 'rgba(15, 23, 42, 0.95)')."},
+         "border_width": {"type": "number", "description": "Glowing rim border width (default 1.5)."},
+         "border_color": {"type": "string", "description": "Rim border color (default 'rgba(255, 255, 255, 0.25)')."},
+         "drop_shadow": {"type": "boolean", "description": "Whether to include soft drop shadow (default true)."}},
+         "required": ["width", "height"]}},
 ]
 
 
@@ -724,6 +736,29 @@ def call_tool(name, args):
         if not ok:
             return _tool_error(info)
         return _text(info)
+    if name == "generate_glass_card_preview":
+        from .vector_ui import get_cached_glass_card
+        w = int(args.get("width", 500))
+        h = int(args.get("height", 260))
+        rx = float(args.get("border_radius", 24.0))
+        top = args.get("bg_color_top", "rgba(30, 41, 59, 0.85)")
+        bot = args.get("bg_color_bottom", "rgba(15, 23, 42, 0.95)")
+        bw = float(args.get("border_width", 1.5))
+        bc = args.get("border_color", "rgba(255, 255, 255, 0.25)")
+        ds = bool(args.get("drop_shadow", True))
+        card_path = get_cached_glass_card(
+            width=w, height=h, border_radius=rx,
+            bg_color_top=top, bg_color_bottom=bot,
+            border_width=bw, border_color=bc, drop_shadow=ds,
+        )
+        return _text({
+            "status": "success",
+            "path": card_path,
+            "width": w,
+            "height": h,
+            "border_radius": rx,
+            "ui_style": "glass_vector",
+        })
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

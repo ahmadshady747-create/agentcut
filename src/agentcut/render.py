@@ -1306,6 +1306,14 @@ def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
     if not isinstance(treatment, dict):
         return ""
     parts = []
+    blur = float(treatment.get("blur", 0) or 0)
+    if blur > 0:
+        parts.append(f"gblur=sigma={blur}")
+    br = float(treatment.get("brightness", 0) or 0)
+    co = float(treatment.get("contrast", 1.0) or 1.0)
+    sa = float(treatment.get("saturation", 1.0) or 1.0)
+    if br != 0.0 or co != 1.0 or sa != 1.0:
+        parts.append(f"eq=brightness={br}:contrast={co}:saturation={sa}")
     grain = float(treatment.get("grain", 0) or 0)
     g = int(round(grain))
     if g > 0:
@@ -3596,8 +3604,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                         "x": float(width) / 2, "y": _cap_y,
                         "text": " ".join(w["word"] for w in _ch)})
                 else:
+                    _cap_style = (_item.get("caption_style")
+                                  or _item.get("captions_style")
+                                  or info.get("caption_style")
+                                  or info.get("captions_style"))
+                    _kind = "karaoke_pill" if _cap_style == "karaoke_pill" else "karaoke"
                     ass_events.append({
-                        "kind": "karaoke", "start": _cstart, "end": _cend,
+                        "kind": _kind, "caption_style": _cap_style,
+                        "start": _cstart, "end": _cend,
                         "font": _font, "size": int(round(_size)),
                         "base_color": _base_color, "hi_color": _hi_color,
                         "align": 8,
@@ -5143,16 +5157,30 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
             # (set by the adapter), so the card lands exactly
             # under the motion element.
             if dg.get("card"):
-                from .diagrams import (resolve_color, rounded_card_rgba,
-                                       write_png_rgba)
-                _cc = resolve_color(dg.get("card_color", "black")) or (0, 0, 0)
-                _co = float(dg.get("card_opacity", 0.45))
-                _card_path = os.path.join(diagram_dir, f"card_{di}.png")
-                write_png_rgba(_card_path, int(dg["canvas_w"]),
-                               int(dg["canvas_h"]),
-                               rounded_card_rgba(int(dg["canvas_w"]),
-                                                 int(dg["canvas_h"]),
-                                                 _cc, _co))
+                ui_style = dg.get("ui_style") or info.get("ui_style") or (project.get("ui_style") if isinstance(project, dict) else "default")
+                if ui_style == "glass_vector" or dg.get("glass_vector"):
+                    from .vector_ui import get_cached_glass_card
+                    _card_path = get_cached_glass_card(
+                        int(dg["canvas_w"]),
+                        int(dg["canvas_h"]),
+                        border_radius=float(dg.get("card_radius", 24.0)),
+                        bg_color_top=dg.get("card_color_top", "rgba(30, 41, 59, 0.85)"),
+                        bg_color_bottom=dg.get("card_color_bottom", "rgba(15, 23, 42, 0.95)"),
+                        border_width=float(dg.get("card_border_width", 1.5)),
+                        border_color=dg.get("card_border_color", "rgba(255, 255, 255, 0.25)"),
+                        drop_shadow=bool(dg.get("card_shadow", True)),
+                    )
+                else:
+                    from .diagrams import (resolve_color, rounded_card_rgba,
+                                           write_png_rgba)
+                    _cc = resolve_color(dg.get("card_color", "black")) or (0, 0, 0)
+                    _co = float(dg.get("card_opacity", 0.45))
+                    _card_path = os.path.join(diagram_dir, f"card_{di}.png")
+                    write_png_rgba(_card_path, int(dg["canvas_w"]),
+                                   int(dg["canvas_h"]),
+                                   rounded_card_rgba(int(dg["canvas_w"]),
+                                                     int(dg["canvas_h"]),
+                                                     _cc, _co))
                 dg["_card"] = _card_path
     # Motion graphics (v1.43.0): generate each raster element's
     # transparent animation video before the main graph is built
@@ -7205,11 +7233,11 @@ def produce_explainer(brief, output_path, review_dir=None):
             return False, {"code": "INVALID_SCHEMA",
                            "message": f"unknown explainer transition '{brief_transition}'",
                            "fix": f"set transition to one of: {', '.join(sorted(all_trans))} or 'none'"}
-    captions_style = brief.get("captions_style", "plain")
-    if captions_style not in ("plain", "karaoke"):
+    captions_style = brief.get("captions_style") or brief.get("caption_style", "plain")
+    if captions_style not in ("plain", "karaoke", "karaoke_pill"):
         return False, {"code": "INVALID_SCHEMA",
-                       "message": f"captions_style must be 'plain' or 'karaoke', got {captions_style!r}",
-                       "fix": "set captions_style to 'karaoke' for word-by-word active highlighting, or 'plain'"}
+                       "message": f"captions_style must be 'plain', 'karaoke', or 'karaoke_pill', got {captions_style!r}",
+                       "fix": "set captions_style to 'karaoke_pill', 'karaoke', or 'plain'"}
     scenes_in = brief.get("scenes")
     if not isinstance(scenes_in, list) or not scenes_in:
         return False, {"code": "EMPTY_TIMELINE",
@@ -7337,8 +7365,10 @@ def produce_explainer(brief, output_path, review_dir=None):
                            "message": f"scene {sid} captions cannot be parsed: {exc}",
                            "fix": f"fix scene {sid} captions as a valid SRT file"}
         start, end = total, total + dur
-        is_karaoke = (captions_style == "karaoke"
-                      or scene.get("captions_style") == "karaoke"
+        is_karaoke = (captions_style in ("karaoke", "karaoke_pill")
+                      or scene.get("captions_style") in ("karaoke", "karaoke_pill")
+                      or scene.get("caption_style") in ("karaoke", "karaoke_pill")
+                      or brief.get("caption_style") in ("karaoke", "karaoke_pill")
                       or bool(scene.get("kinetic")))
         for cue in cues:
             if cue["start"] >= dur:
@@ -7361,23 +7391,48 @@ def produce_explainer(brief, output_path, review_dir=None):
                     cap_entry["word_timings"] = cue_words
                     cap_entry["highlight_color"] = scene.get("highlight_color") or brief.get("highlight_color", "yellow")
                     cap_entry["highlight_mode"] = scene.get("highlight_mode", "word")
+                    cap_entry["caption_style"] = (scene.get("caption_style")
+                                                  or scene.get("captions_style")
+                                                  or brief.get("caption_style")
+                                                  or captions_style)
             captions.append(cap_entry)
         scene_trans = "none"
         if si > 0:
             scene_trans = scene.get("transition") or brief_transition or "none"
-        clip_entry = {"id": sid, "kind": "image", "src": background,
+
+        # v1.60.0 B-Roll & per-scene background media resolution
+        scene_broll = scene.get("broll") or scene.get("bg_media") or scene.get("background")
+        scene_src = background
+        scene_kind = "image"
+        is_broll = False
+        if scene_broll and scene_broll != "canvas":
+            from .broll import resolve_broll_media, is_video_file
+            res_broll = resolve_broll_media(scene_broll, width=width, height=height)
+            if res_broll:
+                scene_src = res_broll
+                scene_kind = "video" if is_video_file(res_broll) else "image"
+                is_broll = True
+
+        clip_entry = {"id": sid, "kind": scene_kind, "src": scene_src,
                       "duration": dur, "transition": scene_trans}
         if scene_trans != "none":
             clip_entry["transition_duration"] = float(
                 scene.get("transition_duration", brief.get("transition_duration", 0.5))
             )
-        clips.append(clip_entry)
-        # v1.40.0: look treatment/grade ride on every scene clip,
-        # whatever the background is (photo, solid, board).
-        if look.get("treatment"):
-            clips[-1]["treatment"] = dict(look["treatment"])
+
+        # v1.60.0: B-roll cinematic legibility grading (depth of field, vignette, darkening)
+        if is_broll:
+            clip_entry["treatment"] = {
+                "blur": 6.0,
+                "brightness": -0.22,
+                "contrast": 1.12,
+                "saturation": 0.85,
+                "vignette": 1.0,
+            }
+        elif look.get("treatment"):
+            clip_entry["treatment"] = dict(look["treatment"])
         if look.get("grade"):
-            clips[-1]["grade"] = look["grade"]
+            clip_entry["grade"] = look["grade"]
         # v1.41.0, rich SFX: every scene after the first opens
         # with a whoosh, so scene changes are heard, not just seen.
         if rich and si > 0:

@@ -2794,6 +2794,10 @@ def _validate_diagrams(project, total, width, height, overlay_ids,
                 rdg["card_opacity"] = dg["card_opacity"]
             if dg.get("card"):
                 rdg["backdrop_blur"] = bool(dg.get("backdrop_blur", True))
+            for k in ("ui_style", "glass_vector", "card_radius", "card_color_top",
+                      "card_color_bottom", "card_border_width", "card_border_color", "card_shadow"):
+                if k in dg:
+                    rdg[k] = dg[k]
         resolved.append(rdg)
     return resolved, adapted
 
