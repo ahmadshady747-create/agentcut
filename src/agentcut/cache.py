@@ -3,6 +3,22 @@
 Inspired by ProCraft's cryptographic hashing tools, adapted for AgentCut multi-scene
 timeline caching to skip re-rendering unchanged scenes during iterative edits.
 Zero external dependencies.
+
+v1.62.0 — this module is THE cache layer for AgentCut, at two granularities
+sharing one directory (`.agentcut_cache` next to the output file, or
+`/tmp/agentcut_cache` when no project dir is given):
+- SCENE cache (this module): whole rendered scenes as `scene_<hash>.mp4`,
+  keyed by compute_scene_hash. Wired into the parallel explainer path
+  (_render_explainer_parallel): an unchanged scene's chunk is reused,
+  so re-rendering an explainer after editing one scene re-renders only
+  that scene. The hash covers the full chunk project, the narration and
+  clip source file stats, the render parameters, and the AgentCut
+  version — a stale chunk can only win if a source file changed without
+  changing size or mtime_ns.
+- SEGMENT cache (render.render_project_cached): per-clip lossless
+  segments as `seg_<sha256>.mkv`. It resolves its directory through
+  get_cache_dir here, so both caches live in the same folder and
+  clear_cache removes both.
 """
 
 from __future__ import annotations
@@ -16,15 +32,25 @@ from pathlib import Path
 from typing import Any
 
 
-def _normalize_obj(obj: Any) -> Any:
-    """Recursively normalize dicts, lists, and numbers for stable hashing."""
+def normalize_for_hash(obj: Any) -> Any:
+    """Recursively normalize dicts, lists, and numbers for stable hashing.
+
+    Dicts sort by key, floats round to 4 decimals, so two
+    equal-valued structures hash identically regardless of
+    key order or float noise. (v1.62.0: public — the shared
+    normalization for every AgentCut hash.)
+    """
     if isinstance(obj, dict):
-        return {k: _normalize_obj(v) for k, v in sorted(obj.items())}
+        return {k: normalize_for_hash(v) for k, v in sorted(obj.items())}
     elif isinstance(obj, (list, tuple)):
-        return [_normalize_obj(x) for x in obj]
+        return [normalize_for_hash(x) for x in obj]
     elif isinstance(obj, float):
         return round(obj, 4)
     return obj
+
+
+# Back-compat alias (the pre-1.62.0 private name).
+_normalize_obj = normalize_for_hash
 
 
 def compute_scene_hash(scene: dict[str, Any], output_params: dict[str, Any] | None = None) -> str:
@@ -36,8 +62,8 @@ def compute_scene_hash(scene: dict[str, Any], output_params: dict[str, Any] | No
     """
     hasher = hashlib.sha256()
 
-    normalized_scene = _normalize_obj(scene)
-    normalized_output = _normalize_obj(output_params or {})
+    normalized_scene = normalize_for_hash(scene)
+    normalized_output = normalize_for_hash(output_params or {})
 
     # Hash structural JSON
     payload = json.dumps({"scene": normalized_scene, "output": normalized_output}, sort_keys=True, ensure_ascii=False)
@@ -83,14 +109,20 @@ def store_scene_cache(scene_hash: str, rendered_mp4: str | Path, project_dir: st
 
 
 def clear_cache(project_dir: str | Path | None = None) -> int:
-    """Clear all cached scene MP4 files and return the number of removed files."""
+    """Clear all cached files and return the number removed.
+
+    Removes scene MP4s (scene_*.mp4, this module) AND segment
+    files (seg_*.mkv, render_project_cached) — v1.62.0, one
+    cache-clearing API for the unified cache directory.
+    """
     cache_dir = get_cache_dir(project_dir)
     removed = 0
     if cache_dir.exists():
-        for item in cache_dir.glob("scene_*.mp4"):
-            try:
-                item.unlink()
-                removed += 1
-            except OSError:
-                pass
+        for pattern in ("scene_*.mp4", "seg_*.mkv"):
+            for item in cache_dir.glob(pattern):
+                try:
+                    item.unlink()
+                    removed += 1
+                except OSError:
+                    pass
     return removed

@@ -15,6 +15,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .reframe import parse_aspect_ratio
 from .srt import parse_srt_file
 
 MAX_DURATION = 600.0
@@ -1098,8 +1099,21 @@ def _validate_treatment(obj, errors, oid, field_prefix):
     treatment is {grain, vignette, shadow}, all optional, all
     default off: grain 0..30 (noise strength), vignette 0..1
     (corner darkening strength), shadow 0..1 (soft inner edge
-    shadow strength). Unknown keys are rejected: a mistyped key
-    must not silently render untreated."""
+    shadow strength). v1.62.0 adds grain_mode: "off" (no noise
+    even when grain is set), "frozen" (one static noise pattern
+    on every frame — the default, and the fastest: a frozen
+    pattern is perfectly predictable across frames, so the
+    encoder compresses it far better than shimmering noise),
+    or "temporal" (the pre-1.62.0 shimmering noise). v1.62.0
+    also ADDS blur 0..30 (gblur sigma), brightness -1..1,
+    contrast 0..3 and saturation 0..3 to the whitelist: the
+    RENDERER has supported these keys all along
+    (_treatment_filters) and the 1.60.0 B-roll path set them,
+    but the validator rejected them as unknown — so every
+    explainer brief with B-roll failed validation (a 1.60.0
+    defect, found by the 1.62.0 compositor wiring). Unknown
+    keys are rejected: a mistyped key must not silently render
+    untreated."""
     tr = obj.get("treatment")
     if tr is None:
         return
@@ -1109,10 +1123,17 @@ def _validate_treatment(obj, errors, oid, field_prefix):
                           fix="set treatment to e.g. {\"grain\": 8, \"vignette\": 0.3}, or remove it"))
         return
     for key in tr:
-        if key not in ("grain", "vignette", "shadow"):
-            errors.append(err("INVALID_SCHEMA", f"unknown treatment key '{key}' (known: grain, vignette, shadow)", field=field, clip_id=oid,
-                              fix="remove the unknown key, or use grain, vignette or shadow"))
-    for fname, lo, hi in (("grain", 0.0, 30.0), ("vignette", 0.0, 1.0), ("shadow", 0.0, 1.0)):
+        if key not in ("grain", "vignette", "shadow", "grain_mode",
+                       "blur", "brightness", "contrast", "saturation"):
+            errors.append(err("INVALID_SCHEMA", f"unknown treatment key '{key}' (known: grain, vignette, shadow, grain_mode, blur, brightness, contrast, saturation)", field=field, clip_id=oid,
+                              fix="remove the unknown key, or use grain, vignette, shadow, grain_mode, blur, brightness, contrast or saturation"))
+    if "grain_mode" in tr:
+        if tr["grain_mode"] not in ("off", "frozen", "temporal"):
+            errors.append(err("INVALID_SCHEMA", f"treatment grain_mode must be 'off', 'frozen' or 'temporal', got {tr['grain_mode']!r}", field=field, clip_id=oid,
+                              fix="set grain_mode to 'frozen' (default, static pattern), 'temporal' (shimmering), or 'off' (no grain)"))
+    for fname, lo, hi in (("grain", 0.0, 30.0), ("vignette", 0.0, 1.0), ("shadow", 0.0, 1.0),
+                          ("blur", 0.0, 30.0), ("brightness", -1.0, 1.0),
+                          ("contrast", 0.0, 3.0), ("saturation", 0.0, 3.0)):
         if fname in tr:
             try:
                 fv = float(tr[fname])
@@ -4005,12 +4026,11 @@ def _validate_reframe_clip(clip, probe, trim_in, trim_out, errors, cid,
     if data is None:
         return None, None, []
     target = spec.get("target_aspect")
+    # v1.62.0: the "W:H" parse is reframe.parse_aspect_ratio —
+    # the single aspect parser for the codebase.
     try:
-        tw, th = target.split(":")
-        tw, th = float(tw), float(th)
-        if tw <= 0 or th <= 0:
-            raise ValueError
-    except (AttributeError, TypeError, ValueError):
+        tw, th = parse_aspect_ratio(target)
+    except ValueError:
         errors.append(err("INVALID_SCHEMA", "reframe target_aspect must be 'W:H', e.g. '9:16'", field="clips.reframe.target_aspect", clip_id=cid,
                           fix="set target_aspect to '9:16' for a vertical cut, or '16:9' for a wide one"))
         return None, None, []

@@ -12,7 +12,9 @@ Verifies:
 from __future__ import annotations
 
 import os
+import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 import zlib
@@ -25,9 +27,11 @@ from agentcut.broll import (
     is_video_file,
     resolve_broll_media,
 )
+from agentcut.render import render_project
 from agentcut.server import call_tool
 from agentcut.srt import build_karaoke_ass
 from agentcut.templates import get_template, list_content_templates
+from agentcut.validate import probe_media
 from agentcut.vector_ui import (
     encode_rgba_png,
     get_cached_glass_card,
@@ -228,15 +232,15 @@ class TestV160VisualLeap(unittest.TestCase):
         content = pyproject_path.read_text(encoding="utf-8")
 
         self.assertIn('name = "agentcut"', content)
-        self.assertIn('version = "1.61.0"', content)
+        self.assertIn('version = "1.62.0"', content)
         self.assertIn("dependencies = []", content)
         self.assertIn('agentcut = "agentcut.__main__:main"', content)
         self.assertIn('agentcut-mcp = "agentcut.server:main"', content)
 
         # Verify version alignment
         version_file = Path("VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version_file, "1.61.0")
-        self.assertEqual(__version__, "1.61.0")
+        self.assertEqual(version_file, "1.62.0")
+        self.assertEqual(__version__, "1.62.0")
 
     def test_mcp_glass_card_preview_tool(self):
         """Verify MCP server exposes and executes generate_glass_card_preview."""
@@ -267,6 +271,90 @@ class TestV160VisualLeap(unittest.TestCase):
 
         tpl_promo = get_template("product_promo_showcase")
         self.assertEqual(tpl_promo["typography"]["caption_preset"], "karaoke_pill")
+
+
+class TestV160VisualLeapRenders(unittest.TestCase):
+    """Real renders (v1.62.0): the 1.60.0 visual-leap file had ZERO
+    renders — assertions only. These two render the glass card and
+    the karaoke captions for real and check the pixels."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agentcut-test-v160-")
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.media = os.path.join(base, "data", "test_media")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _frame_mean_var(self, video_path, time_s):
+        """(mean, variance) of a frame's RGB pixels, sampled at
+        180x320 — mean near 0 means a black frame, variance near
+        0 means a flat/empty one. Raw rgb24 via ffmpeg (the
+        repo's _crop_mean pattern)."""
+        cmd = ["ffmpeg", "-v", "error", "-ss", str(time_s), "-i",
+               video_path, "-vf", "scale=180:320", "-frames:v", "1",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        data = subprocess.run(cmd, capture_output=True,
+                              check=True).stdout
+        assert len(data) == 180 * 320 * 3, f"short frame: {len(data)}"
+        n = len(data)
+        mean = sum(data) / n
+        var = sum((b - mean) ** 2 for b in data) / n
+        return mean, var
+
+    def test_glass_card_renders(self):
+        card = get_cached_glass_card(300, 120, project_dir=self.tmp)
+        project = {
+            "id": "v160-glass", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 30},
+            "clips": [{"id": "c1", "kind": "image",
+                       "src": os.path.join(self.media, "pattern.jpg"),
+                       "duration": 4.0}],
+            "texts": [{"text": "بطاقة زجاجية", "start": 0.5, "end": 3.5,
+                       "size": 40, "x": "center", "y": 300}],
+            "overlays": [{"id": "card", "kind": "image", "src": card,
+                          "start": 0.5, "duration": 3.0,
+                          "size": 300 / 360, "x": 30, "y": 280}],
+        }
+        out = os.path.join(self.tmp, "glass.mp4")
+        ok, info = render_project(project, out, video_preset="veryfast",
+                                  timeout=600)
+        self.assertTrue(ok, info)
+        probe = probe_media(out)
+        self.assertIsNotNone(probe)
+        self.assertAlmostEqual(probe["duration"], 4.0, delta=0.5)
+        self.assertEqual((probe["width"], probe["height"]), (360, 640))
+        mean, var = self._frame_mean_var(out, 2.0)
+        self.assertGreater(mean, 5.0, "frame looks black")
+        self.assertGreater(var, 10.0, "frame looks flat")
+
+    def test_karaoke_captions_render(self):
+        project = {
+            "id": "v160-karaoke", "version": 1,
+            "output": {"width": 360, "height": 640, "fps": 30},
+            "clips": [{"id": "c1", "kind": "image",
+                       "src": os.path.join(self.media, "poster.png"),
+                       "duration": 4.0}],
+            "captions": [{
+                "start": 0.0, "end": 3.6, "text": "كلمة أولى ثانية",
+                "captions_style": "karaoke",
+                "word_timings": [
+                    {"word": "كلمة", "start": 0.0, "end": 1.2},
+                    {"word": "أولى", "start": 1.2, "end": 2.4},
+                    {"word": "ثانية", "start": 2.4, "end": 3.6},
+                ],
+            }],
+        }
+        out = os.path.join(self.tmp, "karaoke.mp4")
+        ok, info = render_project(project, out, video_preset="veryfast",
+                                  timeout=600)
+        self.assertTrue(ok, info)
+        probe = probe_media(out)
+        self.assertIsNotNone(probe)
+        self.assertAlmostEqual(probe["duration"], 4.0, delta=0.5)
+        mean, var = self._frame_mean_var(out, 2.0)
+        self.assertGreater(mean, 5.0, "frame looks black")
+        self.assertGreater(var, 10.0, "frame looks flat")
 
 
 if __name__ == "__main__":

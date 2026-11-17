@@ -5750,7 +5750,12 @@ class TestVisualLoop(unittest.TestCase):
         p["clips"][0]["treatment"] = {"grain": 8, "vignette": 0.5,
                                       "shadow": 0.5}
         graph = self._graph(p)
-        self.assertIn("noise=alls=8:allf=t", graph)
+        # v1.62.0: the grain default is FROZEN (no allf=t) — the
+        # frozen pattern is byte-identical per frame, keeps the
+        # grain look, and renders ~2.4x faster than temporal
+        # (measured 50.8s vs 124.5s on the 30s benchmark).
+        self.assertIn("noise=alls=8", graph)
+        self.assertNotIn("allf=t", graph)
         # v1.46.0 (R3): the vignette stays the built-in
         # per-frame filter (a mask cannot reproduce its
         # direct-Y multiply exactly — see
@@ -5762,7 +5767,12 @@ class TestVisualLoop(unittest.TestCase):
         self.assertNotIn("geq=", graph)
         p2 = self._img_project(treatment={"grain": 8})
         graph2 = self._graph(p2)
-        self.assertIn("noise=alls=8:allf=t", graph2)
+        self.assertIn("noise=alls=8", graph2)
+        self.assertNotIn("allf=t", graph2)
+        # Explicit temporal still shimmers.
+        p3 = self._img_project(
+            treatment={"grain": 8, "grain_mode": "temporal"})
+        self.assertIn("noise=alls=8:allf=t", self._graph(p3))
 
     def test_treatment_renders_visible_effects(self):
         tmp = os.path.join(BASE, "data", "test_visual_tmp")
@@ -8612,11 +8622,11 @@ class TestLoop142(unittest.TestCase):
         self.assertIn("-b:a 192k", graph)
         self.assertIn("-ar 48000", graph)
 
-    def test_fix6_version_is_1_61_0(self):
+    def test_fix6_version_is_1_62_0(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "1.61.0")
+        self.assertEqual(agentcut.__version__, "1.62.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.61.0")
+            self.assertEqual(f.read().strip(), "1.62.0")
 
 
 class TestLoop143(unittest.TestCase):

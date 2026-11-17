@@ -9,6 +9,18 @@ Modes:
   and softly darkened background of itself (industry standard for vertical adaptation).
 - crop: Center-crops or focal-crops the source video to completely fill the target frame.
 - fit: Letterboxes or pillarboxes the video with black or custom colored padding.
+
+v1.62.0 — this module is THE reframe API for AgentCut, at two levels:
+- WHOLE FILE: reframe_video / reframe_to_variants / build_reframe_filter
+  (static blur_pad/crop/fit geometry, one finished file in, one out).
+- PER CLIP: build_windows_crop_filter — the AgentMedia windows crop the
+  render path applies per clip (clip["reframe"] =
+  {windows_file, target_aspect}); render.py's clip chain calls it
+  instead of building the crop inline, so the windows-crop expression
+  exists in exactly one place. track_interp_expr is the shared
+  time-sampled interpolation primitive both the windows crop and the
+  follow-track text path use. parse_aspect_ratio is the single "W:H"
+  parser (validate.py's reframe validation uses it too).
 """
 
 import json
@@ -140,6 +152,76 @@ def parse_target_dimensions(
     w = (w // 2) * 2
     h = (h // 2) * 2
     return max(2, w), max(2, h)
+
+
+def parse_aspect_ratio(target_aspect: str) -> Tuple[float, float]:
+    """Parse a "W:H" aspect string into (width, height) floats.
+
+    Raises ValueError (with the offending value) for anything
+    that is not two positive numbers separated by ":". The
+    single "W:H" parser for AgentCut (v1.62.0): validate.py's
+    clip-reframe validation and any other "W:H" consumer use
+    this instead of splitting inline.
+    """
+    try:
+        tw, th = str(target_aspect).split(":")
+        tw, th = float(tw), float(th)
+        if tw <= 0 or th <= 0:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(
+            f"aspect must be 'W:H' with positive numbers, "
+            f"got {target_aspect!r}")
+    return tw, th
+
+
+def track_interp_expr(points, var, key):
+    """FFmpeg eval expression for one linearly interpolated track
+    coordinate at time `var` (v1.44.0, F2; moved here v1.62.0).
+
+    points are sorted {t, x, y, w, h} dicts (the loader dedupes
+    equal times, so no segment divides by zero). The time is
+    clamped to [t0, t_last] with min/max, so the first/last
+    point is HELD outside the track instead of extrapolating.
+    Same nested-if shape as _interp_expr_eased, but strictly
+    linear: a track is measured data, not a designed ease.
+    Shared by the reframe windows crop (build_windows_crop_filter)
+    and the follow-track text path (render._track_text_expr).
+    """
+    t0 = float(points[0]["t"])
+    t1 = float(points[-1]["t"])
+    vc = f"min(max({var},{t0!r}),{t1!r})"
+    expr = repr(float(points[-1][key]))
+    for i in range(len(points) - 2, -1, -1):
+        ta = float(points[i]["t"]); va = float(points[i][key])
+        tb = float(points[i + 1]["t"]); vb = float(points[i + 1][key])
+        seg = f"{va!r}+({vb!r}-{va!r})*((({vc})-{ta!r})/({tb!r}-{ta!r}))"
+        expr = f"if(lt({vc},{tb!r}),{seg},{expr})"
+    return expr
+
+
+def build_windows_crop_filter(windows, var="t"):
+    """Crop filter fragment for AgentMedia reframe windows (v1.62.0).
+
+    windows is the validated AgentMedia list: {t, x, y, w, h}
+    dicts in SOURCE pixels and source seconds, all sharing one
+    crop size (w/h) — the AgentMedia contract, enforced by
+    validate._validate_reframe_clip. Returns the crop filter
+    string (e.g. "crop=720:1280:x='...':y='...'") with per-frame
+    x/y sampled from the windows at source time `var` (the
+    crop filter's t is the input timestamp, which trim has not
+    reset yet — so the crop goes BEFORE trim in the chain).
+    Crop offsets are rounded to even pixels for yuv420p (<=1px).
+    The render path's clip chain calls this instead of building
+    the crop inline; the per-clip reframe schema is unchanged.
+    """
+    if not windows:
+        raise ValueError("reframe windows must hold at least 1 window")
+    cw = int(windows[0]["w"])
+    ch = int(windows[0]["h"])
+    rx = f"2*trunc(({track_interp_expr(windows, var, 'x')})/2)"
+    ry = f"2*trunc(({track_interp_expr(windows, var, 'y')})/2)"
+    return f"crop={cw}:{ch}:x='{rx}':y='{ry}'"
 
 
 def build_reframe_filter(

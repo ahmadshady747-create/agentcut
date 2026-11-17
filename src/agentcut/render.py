@@ -21,6 +21,8 @@ import tempfile
 import time
 import uuid
 
+from .cache import (compute_scene_hash, get_cache_dir,
+                    lookup_scene_cache, store_scene_cache)
 from .srt import build_karaoke_ass, measure_text_width, wrap_subtitle_text
 from .validate import (CUSTOM_TRANSITIONS, GRADE_PRESETS,
                        SFX_NAMES, TEXT_PRESETS, TEXT_STYLES,
@@ -55,6 +57,27 @@ POS_MAP = {
     "bottom_center": ("(w-text_w)/2", "h-text_h-40"),
     "bottom_right": ("w-text_w-40", "h-text_h-40"),
 }
+
+
+def _pos_map(scale_factor=1.0):
+    """POS_MAP at the render scale (v1.62.0, draft text scaling).
+
+    The 40px preset margins scale with the frame, so a 0.5
+    draft lays text out exactly like the full render, halved.
+    At scale_factor == 1.0 it IS POS_MAP (same object), so a
+    full-resolution render is byte-identical to before."""
+    if scale_factor == 1.0:
+        return POS_MAP
+    m = int(round(40 * scale_factor))
+    return {
+        "top_left": (str(m), str(m)),
+        "top_center": ("(w-text_w)/2", str(m)),
+        "top_right": (f"w-text_w-{m}", str(m)),
+        "center": ("(w-text_w)/2", "(h-text_h)/2"),
+        "bottom_left": (str(m), f"h-text_h-{m}"),
+        "bottom_center": ("(w-text_w)/2", f"h-text_h-{m}"),
+        "bottom_right": (f"w-text_w-{m}", f"h-text_h-{m}"),
+    }
 
 
 def _even(n):
@@ -1027,27 +1050,13 @@ def _interp_expr_eased(points, var):
     return f"if(lt({var},{points[0][0]!r}),{points[0][1]!r},{expr})"
 
 
-def _track_interp_expr(points, var, key):
-    """FFmpeg eval expression for one linearly interpolated track
-    coordinate at time `var` (v1.44.0, F2).
-
-    points are sorted {t, x, y, w, h} dicts (the loader dedupes
-    equal times, so no segment divides by zero). The time is
-    clamped to [t0, t_last] with min/max, so the first/last
-    point is HELD outside the track instead of extrapolating.
-    Same nested-if shape as _interp_expr_eased, but strictly
-    linear: a track is measured data, not a designed ease.
-    """
-    t0 = float(points[0]["t"])
-    t1 = float(points[-1]["t"])
-    vc = f"min(max({var},{t0!r}),{t1!r})"
-    expr = repr(float(points[-1][key]))
-    for i in range(len(points) - 2, -1, -1):
-        ta = float(points[i]["t"]); va = float(points[i][key])
-        tb = float(points[i + 1]["t"]); vb = float(points[i + 1][key])
-        seg = f"{va!r}+({vb!r}-{va!r})*((({vc})-{ta!r})/({tb!r}-{ta!r}))"
-        expr = f"if(lt({vc},{tb!r}),{seg},{expr})"
-    return expr
+# v1.62.0: _track_interp_expr lives in reframe.py now
+# (track_interp_expr — the shared time-sampled
+# interpolation primitive for the reframe windows crop and
+# the follow-track text path). It is imported at the bottom
+# of this module (with the other reframe imports) and aliased
+# there as _track_interp_expr, so every call site below is
+# unchanged and the name resolves at call time.
 
 
 def _track_data_for(item, info):
@@ -1086,7 +1095,7 @@ def _track_overlay_expr(ov, info, width, height, ostart):
     return x_expr, y_expr
 
 
-def _track_text_expr(item, info, width, height, start):
+def _track_text_expr(item, info, width, height, start, scale_factor=1.0):
     """(x_expr, y_expr) for a track-following text/caption
     (v1.44.0, F2). The text CENTRES on the tracked box's centre
     (x + w/2, y + h/2), scaled from the track frame_size to the
@@ -1094,6 +1103,9 @@ def _track_text_expr(item, info, width, height, start):
     drawtext text_w/text_h re-centre it. Sampled in the text's
     source time (t - start; reveal-expanded word items use the
     original item's start via _track_base_start).
+    v1.62.0: width/height are the RENDER size, so the track
+    coords scale through sx/sy; the offsets are full-res
+    project pixels, so they scale by scale_factor.
     """
     data = _track_data_for(item, info)
     pts = data["track"]
@@ -1104,8 +1116,8 @@ def _track_text_expr(item, info, width, height, start):
     # Offsets are element properties: the text's own track
     # spec carries them (the shared entry holds file data only).
     _spec = item.get("track") or {}
-    ox = float(_spec.get("offset_x", 0))
-    oy = float(_spec.get("offset_y", 0))
+    ox = float(_spec.get("offset_x", 0)) * scale_factor
+    oy = float(_spec.get("offset_y", 0)) * scale_factor
     base = float(item.get("_track_base_start", start))
     var = f"(t-{base!r})"
     cx = (f"(({_track_interp_expr(pts, var, 'x')})"
@@ -1285,14 +1297,46 @@ def _treatment_shadow_inline(treatment, _fmt="yuv420p", _afmt="rgba"):
             f"b='b(X,Y)*(1-{sh}*({f}))',format={_fmt}")
 
 
-def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
+# v1.62.0: the default grain mode when a treatment sets
+# grain without naming grain_mode. "frozen" — one static
+# noise pattern on every frame — keeps the grain look
+# (frame 1 is byte-identical to the temporal pattern: same
+# seed) while the encoder compresses it far better than
+# shimmering noise, because a frozen pattern is perfectly
+# predictable across frames. Measured 2026-11-16 on the 30s
+# explainer benchmark (720x1280, grain 10, vignette 0.4,
+# 2 runs each; ~/workspace/agentcut-162-logs/grain-bench/
+# results.json): temporal 122.3/126.7s (mean 124.5, ~31MB),
+# frozen 51.2/50.4s (mean 50.8, ~4.5MB), off 71.6/68.3s
+# (mean 70.0, ~3.5MB), default 51.9/52.4s (mean 52.2,
+# confirming the default IS frozen). Frozen is FASTER than
+# off on this benchmark (confirming the single 1.46.0
+# measurement: frozen 40.1s vs off 61.8s) and 2.4x faster
+# than temporal at 1/7th the file size — so frozen is the
+# default: the grain look at less than the cost of no grain.
+DEFAULT_GRAIN_MODE = "frozen"
+
+
+def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba",
+                       grain_off=False):
     """FFmpeg filter chain for a treatment dict (v1.40.0).
 
     Returns "" when nothing is set (all default off, so old
-    projects render identically). Grain is temporal noise
-    (alls is the integer strength, allf=t so it shimmers per
-    frame); vignette maps strength 0..1 to the lens angle
-    PI/40..PI/4 (measured on this build on flat grey:
+    projects render identically). Grain is noise (alls is the
+    integer strength); its mode (v1.62.0, treatment.grain_mode)
+    decides whether it shimmers ("temporal": allf=t, the
+    pre-1.62.0 behaviour), stays frozen ("frozen": no allf —
+    verified on this build: identical frames, same seed as
+    temporal frame 1), or is skipped ("off"). The default is
+    DEFAULT_GRAIN_MODE ("frozen"): it keeps the grain look
+    and is far faster than temporal, because the cost of
+    grain is mostly encoder-side (x264 on incompressible
+    noise), not filter-side, and a frozen pattern compresses
+    nearly as well as no grain at all. grain_off=True (draft
+    renders, scale_factor < 1.0) forces grain off entirely:
+    a draft is for layout review, and grain there only costs
+    encoder time. Vignette maps strength 0..1 to the lens
+    angle PI/40..PI/4 (measured on this build on flat grey:
     corner/centre 0.99 at PI/40, 0.33 at PI/4). Since v1.46.0
     (R3) the SHADOW is NOT here: it is applied as a
     pre-rendered 1-frame mask + overlay via
@@ -1300,9 +1344,7 @@ def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
     build_ffmpeg_args), because the shadow geq is evaluated
     per frame while the mask is rendered once. The vignette
     stays a per-frame filter — a mask cannot reproduce it
-    exactly (see _treatment_mask_path). Grain stays per-frame
-    by design — it must shimmer, and it is nearly free as a
-    filter (its cost is encoder-side)."""
+    exactly (see _treatment_mask_path)."""
     if not isinstance(treatment, dict):
         return ""
     parts = []
@@ -1316,8 +1358,14 @@ def _treatment_filters(treatment, _fmt="yuv420p", _afmt="rgba"):
         parts.append(f"eq=brightness={br}:contrast={co}:saturation={sa}")
     grain = float(treatment.get("grain", 0) or 0)
     g = int(round(grain))
-    if g > 0:
-        parts.append(f"noise=alls={g}:allf=t")
+    if g > 0 and not grain_off:
+        _mode = treatment.get("grain_mode") or DEFAULT_GRAIN_MODE
+        if _mode == "temporal":
+            parts.append(f"noise=alls={g}:allf=t")
+        elif _mode == "frozen":
+            parts.append(f"noise=alls={g}")
+        # "off" (or anything unexpected — validation rejects
+        # it first) emits no noise filter at all.
     vig = float(treatment.get("vignette", 0) or 0)
     if vig > 0:
         import math as _math
@@ -1356,7 +1404,7 @@ def _measure_text_width(text, font, size, cache=None):
 
 
 def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
-                         zone_clamp=False):
+                         zone_clamp=False, scale_factor=1.0):
     """Top y of a no-position caption block (v1.42.0, Fix 3).
 
     The old default anchors the LAST line's top at height-120
@@ -1366,30 +1414,35 @@ def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
     the same clamp validate.py's _text_box applies to the
     estimated caption box, so validation and rendering agree.
     Without it the anchor is exactly the old height-120.
-    """
+    v1.62.0: the 120px anchor scales with the render
+    (scale_factor), so a 0.5 draft anchors at height-60 —
+    the same relative position, not the same pixels."""
     est_h = (n_lines - 1) * size * line_spacing + size * 1.4
-    top = float(height - 120) - (n_lines - 1) * size * line_spacing
+    top = float(height - 120 * scale_factor) - (n_lines - 1) * size * line_spacing
     if zone_clamp:
         top = min(top, 0.92 * height - est_h)
     return top
 
 
-def _active_caption_y(item, size, height, zone_clamp=False):
+def _active_caption_y(item, size, height, zone_clamp=False, scale_factor=1.0):
     """Single-line y for an active caption chunk (v1.37.0).
 
     Mirrors the normal caption bands numerically: top bands at
     40, bottom bands just above the frame bottom, centre centred,
     and the no-position default at height-120 (the old caption
     default). Active chunks are single-line by design, so one y
-    serves the whole chunk."""
+    serves the whole chunk. v1.62.0: the 40px bands scale with
+    the render (scale_factor)."""
+    m40 = 40.0 * scale_factor
     pos = item.get("position")
     if pos in ("top_left", "top_center", "top_right"):
-        return 40.0
+        return m40
     if pos in ("bottom_left", "bottom_center", "bottom_right"):
-        return float(height - 40 - size * 1.4)
+        return float(height - m40 - size * 1.4)
     if pos == "center":
         return float((height - size * 1.4) / 2)
-    return _default_caption_top(height, size, 1, 1.35, zone_clamp)
+    return _default_caption_top(height, size, 1, 1.35, zone_clamp,
+                                scale_factor)
 
 
 def _expand_text_preset(item):
@@ -1518,25 +1571,28 @@ def _ass_font_for(item, sample_text):
     return ("DejaVu Sans", 0)
 
 
-def _ass_pos_for_text(item, size, width, height, kin_y):
+def _ass_pos_for_text(item, size, width, height, kin_y, scale_factor=1.0):
     """(alignment, x, y) for an ASS title event, mirroring the
     old kinetic drawtext anchors: a numeric x is the line's left
     edge (alignment 7, top-left); left/right presets anchor at
     the 40px margins (7 / 9); centre/centre presets and absent
     x centre the line (alignment 8, top-centre, x = width/2).
-    kin_y is the line's top (same band logic as drawtext y)."""
+    kin_y is the line's top (same band logic as drawtext y).
+    v1.62.0: the numeric x and the 40px margins scale with the
+    render (scale_factor); width is already the render width."""
     _pos = item.get("position")
     _xv = item.get("x", "center")
+    _m40 = 40.0 * scale_factor
     if isinstance(_xv, (int, float)):
-        return (7, float(_xv), kin_y)
+        return (7, float(_xv) * scale_factor, kin_y)
     if _pos in ("top_left", "bottom_left"):
-        return (7, 40.0, kin_y)
+        return (7, _m40, kin_y)
     if _pos in ("top_right", "bottom_right"):
-        return (9, float(width - 40), kin_y)
+        return (9, float(width - _m40), kin_y)
     return (8, float(width) / 2, kin_y)
 
 
-def _background_rects(info, width, height):
+def _background_rects(info, width, height, scale_factor=1.0):
     """(x, y, w, h, start, end) rects that act as a text's background
     (v1.45.0, R4c-2, Defect 2): motion shapes (rect/circle/ellipse)
     and lower_third cards use their keyframe-union bbox
@@ -1552,6 +1608,12 @@ def _background_rects(info, width, height):
     shape's rect is conservative (it covers the whole path); the
     time-window check keeps a text off a shape that is never
     there with it.
+    v1.62.0: width/height are the RENDER dimensions, but the
+    motion bbox and diagram x/y are FULL-RES project
+    coordinates, so they scale by scale_factor here; the
+    size-fraction diagram width is already at render scale
+    (it multiplies the render width). At scale 1.0 every
+    rect is identical to before.
     """
     rects = []
     for el in info.get("motion", []) or []:
@@ -1569,13 +1631,14 @@ def _background_rects(info, width, height):
         if not bb or len(bb) != 4:
             continue
         try:
-            bx, by, bw, bh = (float(v) for v in bb)
+            bx, by, bw, bh = (float(v) * scale_factor for v in bb)
             st, en = float(el["start"]), float(el["end"])
         except (KeyError, TypeError, ValueError):
             continue
         if bw <= 0 or bh <= 0 or en <= st:
             continue
         rects.append((bx, by, bw, bh, st, en))
+    _m20 = 20.0 * scale_factor
     for dg in info.get("diagrams", []) or []:
         if not isinstance(dg, dict) or not dg.get("card"):
             continue
@@ -1590,23 +1653,24 @@ def _background_rects(info, width, height):
             continue
         if "x" in dg and "y" in dg:
             try:
-                dx, dy = float(dg["x"]), float(dg["y"])
+                dx, dy = (float(dg["x"]) * scale_factor,
+                          float(dg["y"]) * scale_factor)
             except (TypeError, ValueError):
                 continue
         else:
             pos = dg.get("position", "bottom_right")
             if pos in ("bottom_left", "top_left"):
-                dx = 20.0
+                dx = _m20
             elif pos in ("bottom_right", "top_right"):
-                dx = width - dw - 20.0
+                dx = width - dw - _m20
             else:
                 dx = (width - dw) / 2
             if pos in ("top_left", "top_center", "top_right"):
-                dy = 20.0
+                dy = _m20
             elif pos == "center":
                 dy = (height - dh) / 2
             else:
-                dy = height - dh - 20.0
+                dy = height - dh - _m20
         rects.append((dx, dy, dw, dh, st, en))
     return rects
 
@@ -1614,16 +1678,22 @@ def _background_rects(info, width, height):
 def _pos_expr_value(expr, width, height, tw, th):
     """Numerically evaluate one POS_MAP expression (w/h are the
     output size, tw/th the text width/height). Only the five
-    forms POS_MAP uses are recognised; anything else is 0."""
+    forms POS_MAP uses are recognised; anything else is 0.
+    v1.62.0: the margin forms parse their trailing number, so
+    the scaled margins from _pos_map (e.g. w-text_w-20 at a
+    0.5 draft) evaluate correctly; at scale 1.0 the margin is
+    40 and the results are identical to before."""
     expr = str(expr)
     if expr == "(w-text_w)/2":
         return (width - tw) / 2
     if expr == "(h-text_h)/2":
         return (height - th) / 2
-    if expr == "w-text_w-40":
-        return width - tw - 40.0
-    if expr == "h-text_h-40":
-        return height - th - 40.0
+    _m = re.match(r"^w-text_w-([\d.]+)$", expr)
+    if _m:
+        return width - tw - float(_m.group(1))
+    _m = re.match(r"^h-text_h-([\d.]+)$", expr)
+    if _m:
+        return height - th - float(_m.group(1))
     try:
         return float(expr)
     except (TypeError, ValueError):
@@ -1631,7 +1701,7 @@ def _pos_expr_value(expr, width, height, tw, th):
 
 
 def _text_on_background(item, is_caption, width, height, size, bg_rects,
-                        width_cache, zone_clamp=False):
+                        width_cache, zone_clamp=False, scale_factor=1.0):
     """True when a text/caption item sits on a background rect
     (Defect 2): its centre falls inside a background rect whose
     time window overlaps the item's window. The centre test (not
@@ -1645,6 +1715,10 @@ def _text_on_background(item, is_caption, width, height, size, bg_rects,
     motion-label form); the width is the HarfBuzz shaped width
     and the height the caption line-height factor (size*1.4) —
     the centre is what matters, so the approximation is fine.
+    v1.62.0: width/height/size/bg_rects arrive at the RENDER
+    scale, but a numeric x/y and the motion-label cx are
+    FULL-RES project coordinates, so they scale here by
+    scale_factor; the POS_MAP margins come from _pos_map.
     """
     if item.get("_counter") or item.get("track"):
         return False
@@ -1663,21 +1737,23 @@ def _text_on_background(item, is_caption, width, height, size, bg_rects,
     tw = _measure_text_width(text, _mf, size, width_cache)
     th = float(size) * 1.4
     pos = item.get("position")
+    _pm = _pos_map(scale_factor)
     if is_caption:
         if "_wrap_y" in item:
             top = float(item["_wrap_y"])
-            _xe = (POS_MAP[item["position"]][0]
-                   if pos in POS_MAP else "(w-text_w)/2")
+            _xe = (_pm[item["position"]][0]
+                   if pos in _pm else "(w-text_w)/2")
             left = _pos_expr_value(_xe, width, height, tw, th)
-        elif pos in POS_MAP:
-            _xe, _ye = POS_MAP[pos]
+        elif pos in _pm:
+            _xe, _ye = _pm[pos]
             left = _pos_expr_value(_xe, width, height, tw, th)
             top = _pos_expr_value(_ye, width, height, tw, th)
         else:
             left = (width - tw) / 2
-            top = _default_caption_top(height, size, 1, 1.35, zone_clamp)
-    elif pos in POS_MAP:
-        _xe, _ye = POS_MAP[pos]
+            top = _default_caption_top(height, size, 1, 1.35, zone_clamp,
+                                       scale_factor)
+    elif pos in _pm:
+        _xe, _ye = _pm[pos]
         left = _pos_expr_value(_xe, width, height, tw, th)
         top = _pos_expr_value(_ye, width, height, tw, th)
     else:
@@ -1686,15 +1762,15 @@ def _text_on_background(item, is_caption, width, height, size, bg_rects,
             left = (width - tw) / 2
         else:
             try:
-                left = float(xv)
+                left = float(xv) * scale_factor
             except (TypeError, ValueError):
                 _m = re.match(r"^\(([\d.]+)-text_w/2\)$", str(xv))
-                left = (float(_m.group(1)) - tw / 2
+                left = (float(_m.group(1)) * scale_factor - tw / 2
                         if _m else (width - tw) / 2)
         try:
-            top = float(item.get("y", 100))
+            top = float(item.get("y", 100)) * scale_factor
         except (TypeError, ValueError):
-            top = 100.0
+            top = 100.0 * scale_factor
     cx, cy = left + tw / 2, top + th / 2
     for (bx, by, bw, bh, bs, be) in bg_rects:
         if start >= be or bs >= end:
@@ -1739,7 +1815,12 @@ def _rgb_hex(rgb):
 
 
 def _diagram_derived_texts(info, width, height):
-    """Drawtext items for diagram-template labels (timeline & process_flow)."""
+    """Drawtext items for diagram-template labels (timeline & process_flow).
+
+    width/height are the FULL-RES project dims (v1.62.0): every
+    label is built in full-res project pixels and the text
+    stage scales it exactly once, like every other text item.
+    """
     items = []
     for dg in info.get("diagrams", []) or []:
         template = dg.get("template")
@@ -1814,7 +1895,7 @@ def _diagram_derived_texts(info, width, height):
     return items
 
 
-def _motion_derived_texts(info, width, height):
+def _motion_derived_texts(info, width, height, scale_factor=1.0):
     """Drawtext items for motion-graphics labels (v1.43.0, Round 2).
 
     Chart value/category labels are plain text items through the
@@ -1824,6 +1905,12 @@ def _motion_derived_texts(info, width, height):
     stays to the element end. x is a centred expression string
     ("(cx-text_w/2)"), which the text loop passes through
     verbatim; y is clamped into the frame.
+    width/height are the FULL-RES project dims (v1.62.0): every
+    label is built in full-res project pixels and the text
+    stage scales it exactly once. The ONE exception is the
+    lower-third x expression: it embeds absolute numbers in an
+    if() expression the text loop cannot parse, so those numbers
+    are scaled here by scale_factor (unchanged at 1.0).
     """
     from .motion import (bars_layout, donut_segments, line_chart_points,
                          _fmt_value)
@@ -1973,37 +2060,44 @@ def _motion_derived_texts(info, width, height):
             # the linear fade_in/fade_out ramp); the position
             # is the x expression below.
             from .motion import _easing_expr_ffmpeg
-            _x_in = f"{tx:.1f}"
+            # v1.62.0: the x expression embeds absolute pixels
+            # the text loop cannot parse, so tx/slide scale
+            # here; the item's numeric y and size scale in the
+            # loop like every other text. At scale 1.0 the
+            # numbers are unchanged.
+            _tx_s = tx * scale_factor
+            _slide_s = slide * scale_factor
+            _x_in = f"{_tx_s:.1f}"
             _a_in = "1"
             if enter > 0:
                 _u_in = f"((t-{start:.3f})/{enter:.3f})"
                 _spr = _easing_expr_ffmpeg("spring", _u_in)
-                _x_in = f"{tx:.1f}-{slide:.1f}*(1-{_spr})"
+                _x_in = f"{_tx_s:.1f}-{_slide_s:.1f}*(1-{_spr})"
                 _a_in = f"(min({_spr},1))"
-            _x_out = f"{tx:.1f}"
+            _x_out = f"{_tx_s:.1f}"
             _a_out = "1"
             if exit_ > 0:
                 _u_out = f"((t-{end - exit_:.3f})/{exit_:.3f})"
-                _x_out = f"{tx:.1f}-{slide:.1f}*{_u_out}"
+                _x_out = f"{_tx_s:.1f}-{_slide_s:.1f}*{_u_out}"
                 _a_out = f"(1-{_u_out})"
             if enter > 0 and exit_ > 0:
                 x_expr = (f"if(lt(t,{start + enter:.3f}),{_x_in},"
-                          f"if(gt(t,{end - exit_:.3f}),{_x_out},{tx:.1f}))")
+                          f"if(gt(t,{end - exit_:.3f}),{_x_out},{_tx_s:.1f}))")
                 _alpha_expr = (
                     f"if(lt(t,{start + enter:.3f}),{_a_in},"
                     f"if(gt(t,{end - exit_:.3f}),{_a_out},1))")
             elif enter > 0:
                 x_expr = (f"if(lt(t,{start + enter:.3f}),{_x_in},"
-                          f"{tx:.1f})")
+                          f"{_tx_s:.1f})")
                 _alpha_expr = (
                     f"if(lt(t,{start + enter:.3f}),{_a_in},1)")
             elif exit_ > 0:
                 x_expr = (f"if(gt(t,{end - exit_:.3f}),{_x_out},"
-                          f"{tx:.1f})")
+                          f"{_tx_s:.1f})")
                 _alpha_expr = (
                     f"if(gt(t,{end - exit_:.3f}),{_a_out},1)")
             else:
-                x_expr = f"{tx:.1f}"
+                x_expr = f"{_tx_s:.1f}"
                 _alpha_expr = "1"
             lt_item = {"text": str(el["text"]), "start": start,
                        "end": end,
@@ -2236,6 +2330,26 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     width = _even(info["width"] * scale_factor)
     height = _even(info["height"] * scale_factor)
     fps = info["fps"]
+    # Draft scaling helpers (v1.62.0): width/height above are the
+    # RENDER dimensions (already multiplied by scale_factor), but
+    # overlay x/y and text sizes/coords arrive in FULL-RES project
+    # pixels. A 0.5 draft used to lay them out at full size on a
+    # half frame (captions 2x too big, titles off-frame, subjects
+    # half off the right edge). Every full-res pixel quantity is
+    # therefore multiplied by scale_factor at the point it enters
+    # a stage: _px for floats, _pxi for integer pixels. At scale
+    # 1.0 each returns its input unchanged, so a full-resolution
+    # render is byte-identical to before. Quantities already
+    # computed from the render width/height are NOT scaled again.
+    def _px(v):
+        return v if scale_factor == 1.0 else v * scale_factor
+
+    def _pxi(v):
+        # Integer pixels: returned UNCHANGED at scale 1.0 (so a
+        # fractional y like 100.5 keeps its exact spelling and
+        # the full render is byte-identical), rounded to an int
+        # only when scaling down.
+        return v if scale_factor == 1.0 else int(round(v * scale_factor))
     # v1.42.0 (Fix 3): zone manager. When the project opts in
     # with resolve_overlaps: true, no-position captions use
     # the zone-clamped anchor (block bottom <= 0.92*height)
@@ -2405,7 +2519,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 # filter's t is the input timestamp, which trim
                 # has not reset yet); then scale to the exact
                 # output size — fit is ignored, the crop aspect
-                # already matches the target. Crop offsets are
+                # already matches the target. The crop fragment
+                # is built by reframe.build_windows_crop_filter
+                # (v1.62.0 unification — one windows-crop
+                # builder for the whole codebase); offsets are
                 # rounded to even pixels for yuv420p (<=1px).
                 # Validation rejects camera/stabilize/blur fits/
                 # freeze_at/reverse/speed_curve with reframe, so
@@ -2413,11 +2530,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 # speed still works (the crop is at source time).
                 _rf = (info.get("data_files") or {}).get(
                     clip["reframe_file"], {}).get("data")
-                _rw = _rf["windows"]
-                _cw = int(_rw[0]["w"]); _ch = int(_rw[0]["h"])
-                _rx = f"2*trunc(({_track_interp_expr(_rw, 't', 'x')})/2)"
-                _ry = f"2*trunc(({_track_interp_expr(_rw, 't', 'y')})/2)"
-                vf = (f"[{i}:v]crop={_cw}:{_ch}:x='{_rx}':y='{_ry}',"
+                _crop = build_windows_crop_filter(_rf["windows"])
+                vf = (f"[{i}:v]{_crop},"
                       f"{pre},scale={width}:{height}{cs},"
                       f"fps={fps},format={_fmt}")
             elif clip.get("camera"):
@@ -2641,7 +2755,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # are multiplicative, so the order vs fades does not
         # change the pixels. If mask generation fails, the
         # inline vignette/shadow filters run instead.
-        _tr = _treatment_filters(clip.get("treatment"), _fmt, _afmt)
+        _tr = _treatment_filters(clip.get("treatment"), _fmt, _afmt,
+                                 grain_off=(scale_factor < 1.0))
         _tmask = _treatment_mask_path(clip.get("treatment"),
                                       width, height)
         if _tmask is None and _treatment_has_shadow(
@@ -2988,14 +3103,17 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # after the overlay stream ends). Overlay audio is mixed only
     # when the overlay sets volume > 0 (default 0.0, muted, for
     # backward compatibility); see the audio section below.
+    # v1.62.0: the 20px preset margins scale with the draft
+    # (_pxi returns 20 unchanged at scale 1.0).
+    _om20 = _pxi(20)
     OVERLAY_POS = {
-        "top_left": ("20", "20"),
-        "top_center": ("(main_w-overlay_w)/2", "20"),
-        "top_right": ("main_w-overlay_w-20", "20"),
+        "top_left": (str(_om20), str(_om20)),
+        "top_center": ("(main_w-overlay_w)/2", str(_om20)),
+        "top_right": (f"main_w-overlay_w-{_om20}", str(_om20)),
         "center": ("(main_w-overlay_w)/2", "(main_h-overlay_h)/2"),
-        "bottom_left": ("20", "main_h-overlay_h-20"),
-        "bottom_center": ("(main_w-overlay_w)/2", "main_h-overlay_h-20"),
-        "bottom_right": ("main_w-overlay_w-20", "main_h-overlay_h-20"),
+        "bottom_left": (str(_om20), f"main_h-overlay_h-{_om20}"),
+        "bottom_center": ("(main_w-overlay_w)/2", f"main_h-overlay_h-{_om20}"),
+        "bottom_right": (f"main_w-overlay_w-{_om20}", f"main_h-overlay_h-{_om20}"),
     }
     # General image treatment, project level (v1.40.0): on the
     # joined timeline after scrims, before overlays/texts, so
@@ -3005,7 +3123,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # mask overlaid on the joined timeline (same factor, one
     # overlay instead of a per-frame filter/geq). If mask
     # generation fails, the inline filters run instead.
-    _ptr = _treatment_filters(project.get("treatment"), _fmt, _afmt)
+    _ptr = _treatment_filters(project.get("treatment"), _fmt, _afmt,
+                              grain_off=(scale_factor < 1.0))
     if _ptr:
         filters.append(f"[{vcur_chain}]{_ptr}[vtr]")
         vcur_chain = "vtr"
@@ -3077,7 +3196,55 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             _guard = max(2560, width, height)
             if _iw and _ih and max(_iw, _ih) > _guard:
                 chain += f",scale={_guard}:{_guard}:force_original_aspect_ratio=decrease"
-        if kfs and len({f["scale"] for f in kfs}) > 1:
+        scale_varies = bool(kfs) and len({f["scale"] for f in kfs}) > 1
+        op_vary = bool(kfs) and len({f["opacity"] for f in kfs}) > 1
+        # v1.62.0: varying opacity is applied BEFORE the scale,
+        # via the alphaextract multiply — never as a geq after
+        # it. Two pre-existing defects in the old geq-after-scale
+        # order, both found by the 1.62.0 compositor (its Layer 2
+        # subjects fade in while punching): (a) a geq fed by a
+        # varying-size scale heap-corrupts ffmpeg 8.1.2
+        # (framepool assertion / munmap / free errors — verified
+        # by bisection: geq alone OK, varying scale alone OK, the
+        # combination crashes once the scale keeps changing past
+        # the first segment; this build already rejects colorkey
+        # + scale keyframes for the same reason). (b) the old geq
+        # SET the alpha (255*opacity), destroying PNG
+        # transparency — a transparent subject rendered as an
+        # opaque black rectangle (verified: corner YAVG 17 vs
+        # background 145). The multiply (alpha x opacity) is what
+        # opacity means, and it commutes with scaling, so applying
+        # it before the scale is pixel-identical to applying it
+        # after; for opaque sources the output is unchanged. The
+        # chroma-key branch keeps its own intersection (it never
+        # meets a varying scale: validation rejects that pair),
+        # and mask + opacity keeps the old geq order (see the
+        # else branch below).
+        op_done = False
+        if op_vary and not ov.get("chroma_key_hex") and not ov.get("mask"):
+            # The opacity factor is CLIPPED to [0, 1]: geq does
+            # NOT clip out-of-range values — it wraps them
+            # modulo 256 (verified: a spring overshoot to 1.10
+            # rendered lum 25, not 255, so the subject flickered
+            # invisible mid-entrance). Any easing that overshoots
+            # (spring, ease_out_back) needs this.
+            op_expr = _interp_expr_eased(
+                [(f["time"], f["opacity"], f.get("easing", "linear"))
+                 for f in kfs], f"({seg_start!r}+N/{fps})")
+            filters.append(chain + f",format={_afmt}[ovpre{si}]")
+            filters.append(f"[ovpre{si}]split=2[ovrgb{si}][ovkeya{si}]")
+            filters.append(
+                f"[ovkeya{si}]alphaextract,"
+                f"geq=lum='lum(X,Y)*clip({op_expr},0,1)'[ovam{si}]")
+            filters.append(
+                f"[ovrgb{si}][ovam{si}]alphamerge[ovfin{si}]")
+            # The chain continues from the merged label; seed it
+            # with the format filter (a label followed by a comma
+            # is invalid filter syntax), and the scale block below
+            # skips its own format when op_done.
+            chain = f"[ovfin{si}]format={_afmt}"
+            op_done = True
+        if scale_varies:
             # Continuous scaling (Loop 6 round 3): one scale filter
             # with eval=frame, width/height interpolated linearly on
             # frame time t (overlay-relative: the chain resets PTS
@@ -3098,9 +3265,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 h_expr = f"trunc(({w_expr})*{width}*{_ih}/{_iw}/2)*2"
             else:
                 h_expr = f"trunc(({w_expr})*{width}/2)*2"
-            chain += (f",format={_afmt},"
-                      f"scale=w='trunc(({w_expr})*{width}/2)*2':"
+            _scale = (f"scale=w='trunc(({w_expr})*{width}/2)*2':"
                       f"h='{h_expr}':eval=frame")
+            if op_done:
+                # format=rgba is already the chain's first filter
+                # (seeded by the pre-scale opacity above).
+                chain += f",{_scale}"
+            else:
+                chain += f",format={_afmt},{_scale}"
         else:
             ow = _even(float(ov["size"]) * width)
             chain += f",scale={ow}:-2,format={_afmt}"
@@ -3108,7 +3280,6 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             sim = float(ov.get("chroma_similarity", 0.3))
             blend = float(ov.get("chroma_blend", 0.1))
             chain += (f",colorkey=0x{ov['chroma_key_hex']}:similarity={sim}:blend={blend}")
-        op_vary = bool(kfs) and len({f["opacity"] for f in kfs}) > 1
         # Alpha intersection (Loop 6 round 2): when chroma key meets
         # a mask (or varying opacity), the old chain replaced the
         # alpha channel — first the mask geq, then the opacity geq —
@@ -3128,7 +3299,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if op_vary:
                 op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
-                factors.append(f"({op_expr})")
+                # v1.62.0: clipped to [0, 1] — geq wraps
+                # out-of-range values modulo 256 instead of
+                # clipping them, so a spring overshoot past 1.0
+                # would flicker the overlay invisible.
+                factors.append(f"(clip({op_expr},0,1))")
             alpha_expr = "lum(X,Y)" + "".join(f"*{f}" for f in factors)
             filters.append(
                 f"[ovkeya{si}]alphaextract,"
@@ -3149,16 +3324,30 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if ov.get("mask"):
                 chain += "," + _mask_geq(ov["mask"])
             chain += _effect_chain(ov)
-            if op_vary:
+            # v1.62.0: varying opacity was already applied
+            # pre-scale above (op_done) — except for mask +
+            # opacity (no chroma key), which keeps the old geq
+            # order exactly: the mask geq above already set the
+            # alpha, and this geq replaces it, as before 1.62.0.
+            # Scale is constant here (validation rejects mask +
+            # scale keyframes), so the geq-after-scale crash
+            # cannot occur. (Mask x opacity intersection is a
+            # known gap: the opacity wins and the mask is lost,
+            # as before — see the 1.62.0 build log.)
+            if op_vary and not op_done:
                 # Smooth opacity via geq: N counts frames of this segment
                 # stream (fps-normalised), so overlay time is
                 # seg_start + N/fps. Verified against FFmpeg: geq's T
                 # does not track segment time, N does.
                 op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
+                # v1.62.0: clipped to [0, 1] — geq wraps
+                # out-of-range values modulo 256 instead of
+                # clipping them, so a spring overshoot past 1.0
+                # would flicker the overlay invisible.
                 chain += (f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                          f"a='255*({op_expr})'")
-            elif float(ov.get("opacity", 1.0)) < 1.0:
+                          f"a='255*clip({op_expr},0,1)'")
+            elif not op_done and float(ov.get("opacity", 1.0)) < 1.0:
                 chain += f",colorchannelmixer=aa={float(ov['opacity'])}"
             chain += f",setpts=PTS+{abs_start}/TB[ov{si}]"
             filters.append(chain)
@@ -3170,14 +3359,16 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # chroma-key intersection. Dressing applies to the
         # setpts-shifted stream, so timing is untouched.
         ov_label = f"ov{si}"
-        bw_dress = int(ov.get("border_width", 0) or 0)
+        # v1.62.0: border/corner sizes are overlay-frame pixels
+        # and scale with the draft (unchanged at 1.0).
+        bw_dress = _pxi(int(ov.get("border_width", 0) or 0))
         if bw_dress > 0:
             filters.append(
                 f"[{ov_label}]drawbox=x=0:y=0:w=iw:h=ih:"
                 f"color={_ff_color(ov.get('border_color', 'black'))}:"
                 f"t={bw_dress}[ovb{si}]")
             ov_label = f"ovb{si}"
-        cr_dress = int(ov.get("corner_radius", 0) or 0)
+        cr_dress = _pxi(int(ov.get("corner_radius", 0) or 0))
         if cr_dress > 0:
             filters.append(f"[{ov_label}]split=2[ovdrgb{si}][ovdkey{si}]")
             filters.append(
@@ -3194,12 +3385,15 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         elif kfs:
             # Smooth position: overlay x/y expressions use main
             # timeline time t (verified: overlay honours t).
-            x_expr = _interp_expr_eased([(ostart + f["time"], f["x"], f.get("easing", "linear")) for f in kfs], "t")
-            y_expr = _interp_expr_eased([(ostart + f["time"], f["y"], f.get("easing", "linear")) for f in kfs], "t")
+            # v1.62.0: keyframe x/y arrive in full-res project
+            # pixels and scale by scale_factor (at 1.0 _pxi
+            # returns them unchanged).
+            x_expr = _interp_expr_eased([(ostart + f["time"], _pxi(f["x"]), f.get("easing", "linear")) for f in kfs], "t")
+            y_expr = _interp_expr_eased([(ostart + f["time"], _pxi(f["y"]), f.get("easing", "linear")) for f in kfs], "t")
         else:
             px, py = OVERLAY_POS[ov.get("position", "bottom_right")]
-            x_expr = str(ov["x"]) if "x" in ov else px
-            y_expr = str(ov["y"]) if "y" in ov else py
+            x_expr = str(_pxi(ov["x"])) if "x" in ov else px
+            y_expr = str(_pxi(ov["y"])) if "y" in ov else py
         # Parallax (v1.40.0): an overlay with depth > 0 drifts
         # with the camera/background motion of the clip under
         # its start — foreground faster than background, depth 1
@@ -3463,8 +3657,20 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # Motion-graphics labels (v1.43.0, Round 2): chart value /
     # category labels are derived drawtext items (see
     # _motion_derived_texts), so they join the text list below.
-    _motion_texts = _motion_derived_texts(info, width, height)
-    _diagram_texts = _diagram_derived_texts(info, width, height)
+    # v1.62.0: the derived-text functions take the FULL-RES
+    # project dims (info["width"]/info["height"]), NOT the
+    # scaled render dims — every item they build is in
+    # full-res project pixels, and the text stage below scales
+    # each item exactly once. Passing the scaled dims mixed
+    # scales (style sizes from the scaled height against
+    # full-res element geometry) and double-scaled diagram
+    # labels. The lower-third x expression embeds absolute
+    # numbers the text loop cannot parse, so it is scaled
+    # inside _motion_derived_texts via scale_factor.
+    _motion_texts = _motion_derived_texts(info, info["width"],
+                                          info["height"], scale_factor)
+    _diagram_texts = _diagram_derived_texts(info, info["width"],
+                                            info["height"])
     all_overlays = (project.get("texts") or []) + (info.get("captions", project.get("captions") or [])) + _motion_texts + _diagram_texts
     text_dir = None
     if all_overlays:
@@ -3490,6 +3696,17 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # by the reveal expansion and the wrapping stage, so a
     # reveal prefix block and a wrapped block never collide.
     _block_seq = 0
+    # Draft text scaling (v1.62.0): the _px/_pxi helpers above
+    # (defined at the top of this function, shared with the
+    # overlay stage) scale every full-res pixel quantity at the
+    # point it enters this stage; _m40 is the 40px preset margin
+    # and _PM is POS_MAP, both scaled. At scale 1.0 each helper
+    # returns its input unchanged, so a full-resolution render is
+    # byte-identical to before. Quantities already computed from
+    # the render width/height (_wrap_y, _block_top, track
+    # expressions) are NOT scaled again.
+    _m40 = 40.0 * scale_factor
+    _PM = _pos_map(scale_factor)
     # Collision-proof layout (v1.41.0): validate computed
     # overlap_moves for keyword pops; apply them to a copy
     # of the project texts so the render matches the
@@ -3560,8 +3777,12 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # without an explicit style; absent typography is the
         # old behaviour.
         _item = _expand_text_preset(_item)
+        # v1.62.0: the style size resolves against the FULL-RES
+        # height — the text stage scales every size exactly
+        # once, and a size resolved from the scaled height
+        # would be halved twice in a draft.
         _item = _resolve_text_style(
-            _item, height,
+            _item, info["height"],
             (info.get("typography") or {}).get("default_style"))
         # Active word-timed captions (v1.37.0): the agent supplies
         # per-word timings; AgentCut renders short chunks (2–4
@@ -3588,8 +3809,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if _is_cap and _item.get("word_timings"):
             _wt = _item["word_timings"]
             _chunks = chunk_word_timings(_wt)
-            _size = float(_item.get("size", 36))
-            _cap_y = _active_caption_y(_item, _size, height, zone_clamp)
+            _size = _px(float(_item.get("size", 36)))
+            _cap_y = _active_caption_y(_item, _size, height, zone_clamp,
+                                       scale_factor)
             _font = _ass_font_for(_item, _item.get("text", ""))
             _base_color = _item.get("color", "white")
             _hi_color = _item.get("highlight_color", "yellow")
@@ -3654,21 +3876,21 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if not _is_cap and _item.get("word_timings"):
             _wt = _item["word_timings"]
             _chunks = chunk_word_timings(_wt)
-            _size = float(_item.get("size", 48))
+            _size = _px(float(_item.get("size", 48)))
             _pos = _item.get("position")
             if _pos in ("top_left", "top_center", "top_right"):
-                _kin_y = 40.0
+                _kin_y = _m40
             elif _pos in ("bottom_left", "bottom_center", "bottom_right"):
-                _kin_y = float(height - 40 - _size * 1.4)
+                _kin_y = float(height - _m40 - _size * 1.4)
             elif _pos == "center":
                 _kin_y = float((height - _size * 1.4) / 2)
             else:
-                _kin_y = float(_item.get("y", 100))
+                _kin_y = _px(float(_item.get("y", 100)))
             _font = _ass_font_for(_item, _item.get("text", ""))
             _base_color = _item.get("color", "white")
             _hi_color = _item.get("highlight_color", "yellow")
             _align, _ax, _ay = _ass_pos_for_text(
-                _item, _size, width, height, _kin_y)
+                _item, _size, width, height, _kin_y, scale_factor)
             for _ci, _ch in enumerate(_chunks):
                 _cstart = float(_ch[0]["start"])
                 _cend = float(_ch[-1]["end"])
@@ -3730,21 +3952,21 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     # the drawtext loop uses), so the wrap packs
                     # what the renderer lays out.
                     _full_lines = wrap_caption_lines(
-                        str(_item["text"]), float(_item.get("size", 36)),
+                        str(_item["text"]), _px(float(_item.get("size", 36))),
                         width * cap_maxw,
                         font_path=find_font_for_text(
                             str(_item["text"])))
                 if len(_full_lines) > 1:
-                    _rsize = float(_item.get("size", 36))
+                    _rsize = _px(float(_item.get("size", 36)))
                     _rlh = _rsize * cap_spacing
                     _rpos = _item.get("position")
                     _rn = len(_full_lines)
                     _rys = []
                     for _li in range(_rn):
                         if _rpos in ("top_left", "top_center", "top_right"):
-                            _rys.append(40 + _li * _rlh)
+                            _rys.append(_m40 + _li * _rlh)
                         elif _rpos in ("bottom_left", "bottom_center", "bottom_right"):
-                            _rys.append((height - 40 - _rsize * 1.4)
+                            _rys.append((height - _m40 - _rsize * 1.4)
                                         - (_rn - 1 - _li) * _rlh)
                         elif _rpos == "center":
                             _rbh = (_rn - 1) * _rlh + _rsize * 1.4
@@ -3752,7 +3974,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                         else:
                             _rys.append(_default_caption_top(
                                 height, _rsize, _rn, cap_spacing,
-                                zone_clamp) + _li * _rlh)
+                                zone_clamp, scale_factor) + _li * _rlh)
                     # Which full line each word belongs to.
                     _words_in_line = [len(_ln.split())
                                       for _ln in _full_lines]
@@ -3853,7 +4075,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if not _is_cap:
             wrapped_items.append((_item, _is_cap))
             continue
-        _size = float(_item.get("size", 36))
+        _size = _px(float(_item.get("size", 36)))
         # v1.46.1, R1: wrap with the real render font
         # (find_font_for_text resolves the same font the drawtext
         # loop uses), so the wrap packs what the renderer lays out.
@@ -3881,16 +4103,16 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             _sub = dict(_item)
             _sub["text"] = _ln
             if _pos in ("top_left", "top_center", "top_right"):
-                _sub["_wrap_y"] = 40 + _li * _lh
+                _sub["_wrap_y"] = _m40 + _li * _lh
             elif _pos in ("bottom_left", "bottom_center", "bottom_right"):
-                _sub["_wrap_y"] = (height - 40 - _size * 1.4) - (len(_lines) - 1 - _li) * _lh
+                _sub["_wrap_y"] = (height - _m40 - _size * 1.4) - (len(_lines) - 1 - _li) * _lh
             elif _pos == "center":
                 _block_h = (len(_lines) - 1) * _lh + _size * 1.4
                 _sub["_wrap_y"] = (height - _block_h) / 2 + _li * _lh
             else:
                 _sub["_wrap_y"] = _default_caption_top(
                     height, _size, len(_lines), cap_spacing,
-                    zone_clamp) + _li * _lh
+                    zone_clamp, scale_factor) + _li * _lh
             if _block_top is None:
                 _block_top = float(_sub["_wrap_y"])
             _sub["_block_id"] = _block_seq
@@ -3927,9 +4149,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     _width_cache = {}
     # Background rects (v1.45.0, R4c-2, Defect 2): shapes/cards a
     # text can sit on; computed once, shared by every item.
-    _bg_rects = _background_rects(info, width, height)
+    _bg_rects = _background_rects(info, width, height, scale_factor)
     for item, is_caption in render_items:
-        size = item.get("size", 36 if is_caption else 48)
+        size = _px(item.get("size", 36 if is_caption else 48))
         if not is_caption and not item.get("_counter") and not item.get("_is_reveal_sub") and not item.get("reveal") and item.get("text"):
             _txt = str(item["text"])
             _item_f = find_bundled_font(item["font"]) if item.get("font") else find_font_for_text(_txt)
@@ -3946,34 +4168,55 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if is_caption:
             if "_wrap_y" in item:
                 if item.get("position"):
-                    x_expr, _ = POS_MAP[item["position"]]
+                    x_expr, _ = _PM[item["position"]]
                 else:
                     x_expr = "(w-text_w)/2"
                 y_expr = str(item["_wrap_y"])
             elif item.get("position"):
-                x_expr, y_expr = POS_MAP[item["position"]]
+                x_expr, y_expr = _PM[item["position"]]
             else:
                 x_expr = "(w-text_w)/2"
                 y_expr = str(_default_caption_top(height, size, 1, 1.35,
-                                                  zone_clamp))
+                                                  zone_clamp, scale_factor))
         else:
             x = item.get("x", "center")
-            x_expr = "(w-text_w)/2" if x == "center" else str(x)
-            y_expr = str(item.get("y", 100))
+            if x == "center":
+                x_expr = "(w-text_w)/2"
+            elif scale_factor == 1.0:
+                x_expr = str(x)
+            else:
+                try:
+                    # Numeric x (int, float, or numeric string):
+                    # scale it. Anything else falls through to
+                    # the expression forms below.
+                    x_expr = str(_pxi(float(x)))
+                except (TypeError, ValueError):
+                    # Motion-label form "(<cx>-text_w/2)": the cx
+                    # is a full-res coordinate, so it scales.
+                    # Other expressions (the lower-third slide
+                    # expression) are pre-scaled where they are
+                    # built and pass through unchanged.
+                    _mx = re.match(r"^\(([\d.]+)-text_w/2\)$", str(x))
+                    if _mx:
+                        x_expr = (f"({_px(float(_mx.group(1))):.1f}"
+                                  f"-text_w/2)")
+                    else:
+                        x_expr = str(x)
+            y_expr = str(_pxi(item.get("y", 100)))
         start = float(item.get("start", 0))
         end = float(item.get("end", total))
         if not is_caption and item.get("position"):
-            x_expr, y_expr = POS_MAP[item["position"]]
+            x_expr, y_expr = _PM[item["position"]]
         if item.get("track"):
             # Follow-track (v1.44.0, F2): the text centres on
             # the tracked box's centre, sampled every frame.
             x_expr, y_expr = _track_text_expr(
-                item, info, width, height, start)
+                item, info, width, height, start, scale_factor)
         color = item.get("color", "white")
         if isinstance(color, str) and color.startswith("#"):
             color = "0x" + color[1:]
         box = 1 if item.get("box", True) else 0
-        box_part = ":box=1:boxcolor=black@0.5:boxborderw=12" if box else ":box=0"
+        box_part = f":box=1:boxcolor=black@0.5:boxborderw={_pxi(12)}" if box else ":box=0"
         # Defect 2 (v1.45.0, R4c-2): a text centred on a shape or
         # card gets no drawtext box and no pill — the shape/card
         # IS the background. Forced even for an explicit box=true:
@@ -3982,7 +4225,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # blue card). The pill block below honours _on_bg too.
         _on_bg = _text_on_background(item, is_caption, width, height,
                                       size, _bg_rects, _width_cache,
-                                      zone_clamp)
+                                      zone_clamp, scale_factor)
         if _on_bg:
             box = 0
             box_part = ":box=0"
@@ -4072,8 +4315,8 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if anim == "fade_up":
             _fu = f"(t-{start})/{ad}"
             y_out = (f"if(lt(t,{start + ad}),"
-                     f"({y_expr})+40*pow(1-{_fu},2),{y_expr})")
-        stroke = int(item.get("stroke", 0))
+                     f"({y_expr})+{_m40}*pow(1-{_fu},2),{y_expr})")
+        stroke = _pxi(int(item.get("stroke", 0)))
         stroke_part = ""
         if stroke > 0:
             sc = item.get("stroke_color", "black")
@@ -4088,10 +4331,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         # Setting either axis takes over both (the missing axis
         # reads as 0), so shadow_x=0 alone disables the default.
         if "shadow_x" in item or "shadow_y" in item:
-            sx = int(item.get("shadow_x", 0))
-            sy = int(item.get("shadow_y", 0))
+            sx = _pxi(int(item.get("shadow_x", 0)))
+            sy = _pxi(int(item.get("shadow_y", 0)))
         else:
-            sx, sy = 2, 2
+            sx, sy = _pxi(2), _pxi(2)
         shadow_part = ""
         if sx or sy:
             shadow_part = (f":shadowcolor={_ff_color(item.get('shadow_color', 'black'))}"
@@ -4123,14 +4366,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 _cmax = str(item.get("_counter_max_text") or "0")
                 _cw = _measure_text_width(_cmax, item_font, size,
                                           _width_cache)
-                _cpad = int(item.get("box_padding", 12))
+                _cpad = _pxi(int(item.get("box_padding", 12)))
                 _cbw = int(_cw + 2 * _cpad + 0.5)
                 _cbh = int(float(size) * 1.4 + 2 * _cpad + 0.5)
-                _ccx = float(item.get("_counter_cx", 0.0))
+                _ccx = _px(float(item.get("_counter_cx", 0.0)))
                 _cbx = max(0, int(_ccx - _cbw / 2))
-                _cby = max(0, int(float(item.get("y", 0)) - _cpad))
+                _cby = max(0, int(_px(float(item.get("y", 0))) - _cpad))
                 _crad = item.get("box_radius")
-                _crad = 16 if _crad is None else int(_crad)
+                _crad = _pxi(16) if _crad is None else _pxi(int(_crad))
                 vcur = _emit_text_pill(
                     filters, vcur, overlay_index, _cbx, _cby,
                     _cbw, _cbh, _crad,
@@ -4196,14 +4439,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             _bwidths = [_measure_text_width(
                 _ln, item_font, size, _width_cache) for _ln in _blines]
             _bpos = item.get("position")
-            _bx_expr = (POS_MAP[_bpos][0] if _bpos in POS_MAP
+            _bx_expr = (_PM[_bpos][0] if _bpos in _PM
                         else "(w-text_w)/2")
             _blefts = [_pos_expr_value(_bx_expr, width, height,
                                        _bw, float(size) * 1.4)
                        for _bw in _bwidths]
             _bleft = min(_blefts)
             _bright = max(_l + _w for _l, _w in zip(_blefts, _bwidths))
-            _bpad = 12
+            _bpad = _pxi(12)
             _bbx = max(0, int(_bleft - _bpad))
             _bby = max(0, int(float(item["_block_top"]) - _bpad))
             _bbw = int(_bright - _bleft + 2 * _bpad + 0.5)
@@ -4213,7 +4456,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             _bbw = max(1, min(_bbw, width - _bbx))
             _bbh = max(1, min(_bbh, height - _bby))
             _bbr = item.get("box_radius")
-            _bbr = 16 if _bbr is None else int(_bbr)
+            _bbr = _pxi(16) if _bbr is None else _pxi(int(_bbr))
             vcur = _emit_text_pill(
                 filters, vcur, overlay_index, _bbx, _bby,
                 _bbw, _bbh, _bbr, item.get("box_color", "black"),
@@ -4242,43 +4485,43 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             est_w = _measure_text_width(str(item["text"]), item_font,
                                         size, _width_cache)
             est_h = float(size) * 1.4
-            pad = int(item.get("box_padding", 12))
+            pad = _pxi(int(item.get("box_padding", 12)))
             bw = int(est_w + 2 * pad + 0.5)
             bh = int(est_h + 2 * pad + 0.5)
             _brad = item.get("box_radius")
-            _brad = 16 if _brad is None else int(_brad)
+            _brad = _pxi(16) if _brad is None else _pxi(int(_brad))
             pos = item.get("position")
             if is_caption:
                 if "_wrap_y" in item:
                     top = float(item["_wrap_y"])
                 elif pos in ("top_left", "top_center", "top_right"):
-                    top = 40.0
+                    top = _m40
                 elif pos in ("bottom_left", "bottom_center", "bottom_right"):
-                    top = height - est_h - 40.0
+                    top = height - est_h - _m40
                 elif pos == "center":
                     top = (height - est_h) / 2
                 else:
                     top = _default_caption_top(height, size, 1, 1.35,
-                                               zone_clamp)
+                                               zone_clamp, scale_factor)
                 if pos in ("top_left", "bottom_left"):
-                    left = 40.0
+                    left = _m40
                 elif pos in ("top_right", "bottom_right"):
-                    left = width - est_w - 40.0
+                    left = width - est_w - _m40
                 else:
                     left = (width - est_w) / 2
             else:
                 if pos in ("top_left", "top_center", "top_right"):
-                    top = 40.0
+                    top = _m40
                 elif pos in ("bottom_left", "bottom_center", "bottom_right"):
-                    top = height - est_h - 40.0
+                    top = height - est_h - _m40
                 elif pos == "center":
                     top = (height - est_h) / 2
                 else:
-                    top = float(item.get("y", 100))
+                    top = _px(float(item.get("y", 100)))
                 if pos in ("top_left", "bottom_left"):
-                    left = 40.0
+                    left = _m40
                 elif pos in ("top_right", "bottom_right"):
-                    left = width - est_w - 40.0
+                    left = width - est_w - _m40
                 elif pos:
                     left = (width - est_w) / 2
                 else:
@@ -4287,7 +4530,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                         left = (width - est_w) / 2
                     else:
                         try:
-                            left = float(xv)
+                            left = _px(float(xv))
                         except (TypeError, ValueError):
                             # Expression x (motion labels centre
                             # on "(<cx>-text_w/2)"): centre the
@@ -4296,7 +4539,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                             _m = re.match(
                                 r"^\(([\d.]+)-text_w/2\)$",
                                 str(xv))
-                            left = (float(_m.group(1)) - est_w / 2
+                            left = (_px(float(_m.group(1))) - est_w / 2
                                     if _m else (width - est_w) / 2)
             bx = max(0, int(left - pad))
             by = max(0, int(top - pad))
@@ -4325,40 +4568,40 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # cropdetect canvas, not a real line width).
             _ink = _measure_text_width(_sw_text, item_font, size,
                                        _width_cache)
-            _pad = 12
+            _pad = _pxi(12)
             _bar_w = float(_ink) + 2 * _pad
             if is_caption:
                 if "_wrap_y" in item:
                     _sw_top = float(item["_wrap_y"])
                 elif item.get("position") in ("top_left", "top_center", "top_right"):
-                    _sw_top = 40.0
+                    _sw_top = _m40
                 elif item.get("position") in ("bottom_left", "bottom_center", "bottom_right"):
-                    _sw_top = height - float(size) * 1.4 - 40.0
+                    _sw_top = height - float(size) * 1.4 - _m40
                 elif item.get("position") == "center":
                     _sw_top = (height - float(size) * 1.4) / 2
                 else:
                     _sw_top = _default_caption_top(height, size, 1, 1.35,
-                                                   zone_clamp)
+                                                   zone_clamp, scale_factor)
                 if item.get("position") in ("top_left", "bottom_left"):
-                    _sw_left = 40.0
+                    _sw_left = _m40
                 elif item.get("position") in ("top_right", "bottom_right"):
-                    _sw_left = width - float(_ink) - 40.0
+                    _sw_left = width - float(_ink) - _m40
                 else:
                     _sw_left = (width - float(_ink)) / 2
             else:
                 _pos = item.get("position")
                 if _pos in ("top_left", "top_center", "top_right"):
-                    _sw_top = 40.0
+                    _sw_top = _m40
                 elif _pos in ("bottom_left", "bottom_center", "bottom_right"):
-                    _sw_top = height - float(size) * 1.4 - 40.0
+                    _sw_top = height - float(size) * 1.4 - _m40
                 elif _pos == "center":
                     _sw_top = (height - float(size) * 1.4) / 2
                 else:
-                    _sw_top = float(item.get("y", 100))
+                    _sw_top = _px(float(item.get("y", 100)))
                 if _pos in ("top_left", "bottom_left"):
-                    _sw_left = 40.0
+                    _sw_left = _m40
                 elif _pos in ("top_right", "bottom_right"):
-                    _sw_left = width - float(_ink) - 40.0
+                    _sw_left = width - float(_ink) - _m40
                 elif _pos:
                     _sw_left = (width - float(_ink)) / 2
                 else:
@@ -4367,22 +4610,22 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                         _sw_left = (width - float(_ink)) / 2
                     else:
                         try:
-                            _sw_left = float(_xv)
+                            _sw_left = _px(float(_xv))
                         except (TypeError, ValueError):
                             _m = re.match(
                                 r"^\(([\d.]+)-text_w/2\)$",
                                 str(_xv))
-                            _sw_left = (float(_m.group(1))
+                            _sw_left = (_px(float(_m.group(1)))
                                         - float(_ink) / 2
                                         if _m
                                         else (width - float(_ink)) / 2)
             if item.get("_sweep") == "highlight":
-                _sw_h = float(size) * 1.4 + 2 * 8
-                _sw_y = max(0, int(_sw_top - 8))
+                _sw_h = float(size) * 1.4 + 2 * _px(8)
+                _sw_y = max(0, int(_sw_top - _px(8)))
                 _sw_color = _ff_color(item.get("highlight_color", "yellow"))
                 _sw_alpha = 0.5
             else:
-                _sw_h = 6
+                _sw_h = _px(6)
                 _sw_y = int(_sw_top + float(size) * 1.15)
                 _sw_color = _ff_color(item.get(
                     "underline_color",
@@ -4453,11 +4696,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
         if guides:
             filters.append(
                 f"[{cur}]drawbox=x='iw*0.05':y='ih*0.05':w='iw*0.9':"
-                f"h='ih*0.9':color=yellow@0.9:t=2[vguide1]")
+                f"h='ih*0.9':color=yellow@0.9:t={_pxi(2)}[vguide1]")
             cur = "vguide1"
             filters.append(
                 f"[{cur}]drawbox=x='iw*0.1':y='ih*0.1':w='iw*0.8':"
-                f"h='ih*0.8':color=red@0.9:t=2[vguide2]")
+                f"h='ih*0.8':color=red@0.9:t={_pxi(2)}[vguide2]")
             cur = "vguide2"
         if review_timecode:
             tc_font = info.get("font") or find_font()
@@ -4467,8 +4710,9 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                     "(bundled fonts/ or $AGENTCUT_FONT_DIR)")
             filters.append(
                 f"[{cur}]drawtext=fontfile='{_esc_filter_arg(tc_font)}':"
-                f"text='%{{pts\\:hms}}':fontsize=28:fontcolor=yellow:"
-                f"box=1:boxcolor=black@0.5:boxborderw=8:x=20:y=20:"
+                f"text='%{{pts\\:hms}}':fontsize={_pxi(28)}:fontcolor=yellow:"
+                f"box=1:boxcolor=black@0.5:boxborderw={_pxi(8)}:"
+                f"x={_pxi(20)}:y={_pxi(20)}:"
                 f"text_shaping=1[vtc]")
             cur = "vtc"
         vcur = cur
@@ -5386,6 +5630,10 @@ def render_project(project, output_path, scale_factor=1.0, timeout=600,
 # + multi-clip filter-concat assembly; v1 segments were tv-converted
 # for a demuxer join and must not be reused by v2.
 SEGMENT_CACHE_VERSION = "agentcut-segment-v3"
+# v1.62.0: scene-cache format marker (parallel explainer chunks).
+# Bump when the chunk render changes in a way the hash inputs
+# do not already capture, to invalidate every cached chunk.
+SCENE_CACHE_VERSION = "agentcut-scene-v1"
 SEGMENT_CONTAINER = "mkv"
 _SEGMENT_VOLATILE_KEYS = {"probe", "_stab_trf", "_video"}
 
@@ -5690,8 +5938,11 @@ def render_project_cached(project, output_path, scale_factor=1.0,
     if not qualifies or not use_cache:
         return _plain(reason or "cache disabled")
     if cache_dir is None:
-        cache_dir = os.path.join(
-            os.path.dirname(os.path.abspath(output_path)), ".agentcut_cache")
+        # v1.62.0: the cache dir resolves through cache.py, so
+        # the segment cache shares its directory with the scene
+        # cache (one .agentcut_cache next to the output).
+        cache_dir = str(get_cache_dir(
+            os.path.dirname(os.path.abspath(output_path))))
     try:
         os.makedirs(cache_dir, exist_ok=True)
     except OSError as exc:
@@ -6333,6 +6584,18 @@ def produce_video(brief, output_path, review_dir=None):
     Muse, Claude, Cursor, or any other MCP client — can produce a
     video in one step and then review its own frames before delivery.
     Returns (ok, info_or_error).
+
+    style "cinematic" (v1.62.0) opts into the 3-layer cinematic
+    compositor (compositor.py): Layer 1 adds the cinematic
+    treatment (blur + darkening + contrast + vignette) and
+    cycled slow Ken Burns to image clips; Layer 2 turns a
+    per-clip "subject" (or a brief-level "subject" for clips
+    without one) — a local transparent PNG from AgentMedia
+    remove_background, optional "subject_placement"
+    center/left/right and "subject_size" 0.10..0.85 — into a
+    keyframed overlay with a spring entrance + measured
+    punch-ins; Layer 3 puts a glass card behind each auto
+    title card. Absent style renders exactly as before.
     """
     if not isinstance(brief, dict):
         return False, {"code": "INVALID_SCHEMA", "message": "produce brief must be an object"}
@@ -6355,6 +6618,15 @@ def produce_video(brief, output_path, review_dir=None):
     if fmt is not None and fmt not in FORMATS:
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"format must be one of {sorted(FORMATS)}"}
+    # v1.62.0: style "cinematic" opts into the 3-layer
+    # cinematic compositor (compositor.py); absent renders
+    # exactly as before.
+    pv_style = brief.get("style")
+    if pv_style is not None and pv_style != "cinematic":
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": f"produce style must be 'cinematic', got {pv_style!r}",
+                       "fix": "set style to 'cinematic' for the 3-layer compositor, or remove it"}
+    pv_cinematic = (pv_style == "cinematic")
     explicit_size = None
     if brief.get("width") is not None or brief.get("height") is not None:
         ew, eh = brief.get("width"), brief.get("height")
@@ -6406,12 +6678,22 @@ def produce_video(brief, output_path, review_dir=None):
     if not brief_items:
         return False, {"code": "EMPTY_TIMELINE", "message": "produce brief needs a non-empty clips list"}
     clips = []
+    pv_subjects = []
     for i, item in enumerate(brief_items):
         if not isinstance(item, dict) or not item.get("src"):
             return False, {"code": "INVALID_SCHEMA", "message": f"clip {i} needs a src path"}
         src = item["src"]
         kind = item.get("kind") or _brief_kind(src)
         clip = {"id": item.get("id", f"c{i + 1}"), "kind": kind, "src": src}
+        # v1.62.0, cinematic Layer 2: a per-clip subject
+        # (transparent PNG) is collected here and turned into
+        # a keyframed overlay by the compositor below; a
+        # brief-level subject applies to clips without one.
+        if pv_cinematic and item.get("subject"):
+            pv_subjects.append({"clip_index": i, "src": item["subject"],
+                                "placement": item.get("subject_placement",
+                                                      "center"),
+                                "base_size": item.get("subject_size", 0.5)})
         if kind == "image":
             # A non-numeric duration used to raise ValueError out
             # of produce_video (a raw traceback on the CLI path);
@@ -6476,6 +6758,7 @@ def produce_video(brief, output_path, review_dir=None):
     except ValueError as exc:
         return False, {"code": "INVALID_SCHEMA", "message": str(exc)}
     texts = list(brief.get("texts") or [])
+    pv_title_cards = []
     # Section title cards: one auto text at each section's start.
     section_info = []
     if sections is not None:
@@ -6492,12 +6775,20 @@ def produce_video(brief, output_path, review_dir=None):
             tstart = st + 0.5 if st + 0.5 < end else st
             texts.append({"text": title_s, "start": tstart, "end": end,
                           "size": 64, "x": "center", "y": 100})
+            # v1.62.0: auto section titles get a glass card in
+            # cinematic mode.
+            if pv_cinematic:
+                pv_title_cards.append({"y": 100, "size": 64,
+                                       "start": tstart, "end": end})
             section_info.append({"title": title_s, "start": st, "end": end})
     title = brief.get("title")
     if title and not brief.get("texts") and sections is None:
         end = min(4.0, total - 0.5) if total > 1.5 else total
         texts.append({"text": title, "start": 0.5, "end": end,
                       "size": 64, "x": "center", "y": 100})
+        if pv_cinematic:
+            pv_title_cards.append({"y": 100, "size": 64,
+                                   "start": 0.5, "end": end})
     try:
         _fps_int = int(fps_value)
     except (TypeError, ValueError):
@@ -6543,6 +6834,51 @@ def produce_video(brief, output_path, review_dir=None):
         project["caption_size"] = brief["caption_size"]
     if brief.get("caption_position") is not None:
         project["caption_position"] = brief["caption_position"]
+    # v1.62.0: the cinematic compositor (Layer 1 treatment +
+    # Ken Burns, Layer 2 subjects, Layer 3 title cards). A
+    # brief-level subject applies to every clip without its
+    # own; subjects must be local files (AgentMedia
+    # separation — never fetched).
+    if pv_cinematic:
+        from .compositor import apply_compositor_to_project
+        _brief_subject = brief.get("subject")
+        if _brief_subject:
+            _own = {s["clip_index"] for s in pv_subjects}
+            for _i in range(len(clips)):
+                if _i not in _own:
+                    pv_subjects.append({
+                        "clip_index": _i, "src": _brief_subject,
+                        "placement": brief.get("subject_placement", "center"),
+                        "base_size": brief.get("subject_size", 0.5)})
+        _pv_subjects = []
+        for _s in pv_subjects:
+            _src = _s["src"]
+            if not isinstance(_src, str) or not os.path.isfile(
+                    resolve_path(_src)):
+                return False, {"code": "FILE_NOT_FOUND",
+                               "message": f"subject not found: {_src!r}",
+                               "fix": "set subject to a local transparent PNG from AgentMedia remove_background, or remove it"}
+            try:
+                _size = float(_s.get("base_size", 0.5))
+            except (TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": "subject_size must be a number 0.10..0.85",
+                               "fix": "set subject_size to e.g. 0.5, or remove it"}
+            _pv_subjects.append({"clip_index": _s["clip_index"],
+                                 "src": resolve_path(_src),
+                                 "placement": _s.get("placement", "center"),
+                                 "base_size": _size})
+        try:
+            apply_compositor_to_project(
+                project,
+                clip_windows=list(zip(starts, durations)),
+                subjects=_pv_subjects,
+                title_cards=pv_title_cards,
+                project_dir=os.path.dirname(os.path.abspath(output_path)))
+        except ValueError as exc:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"cinematic compositor: {exc}",
+                           "fix": "set subject_placement to 'center', 'left' or 'right'"}
     errors, info = validate_project(project)
     if errors:
         return False, {"code": "INVALID_PROJECT", "errors": errors}
@@ -6814,9 +7150,22 @@ def _explainer_pacing_beats(start, dur, title, si, nscenes,
 
 
 def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
-                               video_codec="auto", video_preset=None, timeout=600):
+                               video_codec="auto", video_preset=None, timeout=600,
+                               use_cache=True):
     """Render multiple explainer scenes concurrently across CPU/GPU cores (Phase 3),
-    concatenating them with ffmpeg concat demuxer (-c copy) for maximum rendering speed.
+    joining them with the concat FILTER via a render_project assembly (v1.62.0).
+    The concat DEMUXER used to join here (-f concat -c copy) offsets each chunk
+    by its container duration and shifts audio one video frame late at every
+    boundary (measured; see render_project_cached's docstring). The concat
+    FILTER joins by frame/sample count, so audio aligns exactly — the same
+    assembly pattern render_project_cached uses.
+    Scene caching (v1.62.0, cache.py): each chunk is hashed (full chunk
+    project + narration/clip source stats + render parameters + cache
+    version) and looked up in .agentcut_cache next to the output file
+    before rendering; a hit reuses the cached chunk, so re-rendering
+    after editing one scene re-renders only that scene. A cache problem
+    never fails a render (fail-open: lookup/store errors fall through
+    to a fresh render). use_cache=False disables it (brief cache_scenes).
     """
     import concurrent.futures
     import shutil
@@ -6825,6 +7174,9 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
     try:
         chunk_files = []
         futures = []
+        cache_hits = 0
+        fps = int(project.get("output", {}).get("fps", 30) or 30)
+        cache_parent = os.path.dirname(os.path.abspath(output_path))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(scenes))) as executor:
             for si, scene in enumerate(scenes):
@@ -6878,6 +7230,39 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                         rebased_m["end"] = max(rebased_m["start"] + 0.1, min(s_dur, round(m["end"] - s_start, 3)))
                         sc_motion.append(rebased_m)
 
+                # v1.62.0: overlays rebase like texts (the
+                # cinematic compositor's subjects + glass cards
+                # live here; without this the parallel path
+                # silently dropped every overlay). Keyframe
+                # times are overlay-relative, so rebasing the
+                # start leaves them untouched — for overlays
+                # starting inside the scene. A FULL-SPAN
+                # overlay with keyframes replays its keyframes
+                # from the start in every chunk (same
+                # limitation as a full-span animated text);
+                # the compositor never generates full-span
+                # overlays, so this stays theoretical here.
+                # Same limitation as texts: an overlay starting
+                # before the scene (and not spanning the whole
+                # video) is dropped from this chunk.
+                sc_overlays = []
+                for ov in project.get("overlays", []):
+                    _o_start = float(ov.get("start", 0.0))
+                    _o_dur = float(ov.get("duration", 0.0))
+                    if _o_start == 0.0 and _o_start + _o_dur >= s_end:
+                        rebased_ov = dict(ov)
+                        rebased_ov["start"] = 0.0
+                        rebased_ov["duration"] = s_dur
+                        sc_overlays.append(rebased_ov)
+                    elif s_start <= _o_start < s_end:
+                        rebased_ov = dict(ov)
+                        rebased_ov["start"] = max(
+                            0.0, round(_o_start - s_start, 3))
+                        rebased_ov["duration"] = max(
+                            0.1, min(s_dur - rebased_ov["start"],
+                                     round(_o_dur, 3)))
+                        sc_overlays.append(rebased_ov)
+
                 clip_i = dict(project["clips"][si])
                 clip_i["transition"] = "none"
                 clip_i.pop("transition_duration", None)
@@ -6892,6 +7277,7 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     "texts": sc_texts,
                     "diagrams": sc_diagrams,
                     "motion": sc_motion,
+                    "overlays": sc_overlays,
                     "scrims": project.get("scrims", {}),
                     "default_image_motion": project.get("default_image_motion", False),
                 }
@@ -6899,7 +7285,6 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 chunk_proj["output"]["loudnorm_i"] = -14.0
 
                 chunk_out = os.path.join(tmp_dir, f"chunk_{si:03d}.mp4")
-                chunk_files.append(chunk_out)
 
                 # Near-lossless fast intermediate encoding for sub-chunks (v1.51.0):
                 chunk_codec = choose_video_codec(video_codec)
@@ -6916,6 +7301,48 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     chunk_crf = 10
                     chunk_preset = "ultrafast"
 
+                # Scene cache lookup (v1.62.0): the hash covers the
+                # full chunk project, the scene duration, the
+                # narration + clip source file stats (resolved
+                # paths, so a rewritten source invalidates), the
+                # render parameters, and the cache version.
+                # Fail-open: any hashing/lookup error renders
+                # the chunk fresh instead of failing the video.
+                chunk_hash = None
+                if use_cache:
+                    try:
+                        _hash_scene = {
+                            "chunk": chunk_proj,
+                            "duration": s_dur,
+                            "narration": resolve_path(scene["narration"]),
+                        }
+                        _clip_src = clip_i.get("src")
+                        if isinstance(_clip_src, str) and _clip_src:
+                            _hash_scene[
+                                "video" if clip_i.get("kind") == "video"
+                                else "image"] = resolve_path(_clip_src)
+                        _hash_output = {
+                            "width": project["output"].get("width"),
+                            "height": project["output"].get("height"),
+                            "fps": fps,
+                            "scale_factor": scale_factor,
+                            "codec": chunk_codec,
+                            "preset": chunk_preset,
+                            "crf": chunk_crf,
+                            "cache_version": SCENE_CACHE_VERSION,
+                        }
+                        chunk_hash = compute_scene_hash(
+                            _hash_scene, _hash_output)
+                        cached = lookup_scene_cache(
+                            chunk_hash, project_dir=cache_parent)
+                        if cached is not None:
+                            chunk_files.append(str(cached))
+                            cache_hits += 1
+                            continue
+                    except Exception:
+                        chunk_hash = None
+                chunk_files.append(chunk_out)
+
                 future = executor.submit(
                     render_project,
                     chunk_proj,
@@ -6924,34 +7351,58 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     video_codec=chunk_codec,
                     video_crf=chunk_crf,
                     video_preset=chunk_preset,
-                    t_override=s_dur,
+                    # v1.62.0: one frame of -t slack, so the
+                    # assembly's trim_out=s_dur stays inside
+                    # the chunk (the render_project_cached
+                    # pattern — the fps filter drops the
+                    # EOF-flushed boundary frame without it).
+                    t_override=s_dur + 1.0 / fps,
                     timeout=max(120, int(s_dur * 20)),
                 )
-                futures.append((si, future))
+                futures.append((si, future, chunk_out, chunk_hash))
 
-            for si, f in futures:
+            for si, f, _cout, _chash in futures:
                 ok, res = f.result()
                 if not ok:
                     return False, res
+                # Store the fresh chunk for the next render
+                # (fail-open: a store error is ignored).
+                if use_cache and _chash:
+                    try:
+                        store_scene_cache(_chash, _cout,
+                                          project_dir=cache_parent)
+                    except Exception:
+                        pass
 
-        list_file = os.path.join(tmp_dir, "concat_list.txt")
-        with open(list_file, "w", encoding="utf-8") as lf:
-            for cf in chunk_files:
-                norm_p = cf.replace("\\", "/")
-                lf.write(f"file '{norm_p}'\n")
-
+        # Concat-FILTER join (v1.62.0): the assembly is a
+        # project whose clips ARE the chunk files, trimmed to
+        # the scene durations — exactly the render_project_cached
+        # pattern. The old demuxer join (-f concat -c copy)
+        # shifted audio one video frame late at every boundary;
+        # the filter joins by frame/sample count, so audio
+        # aligns exactly. The assembly re-encodes at crf 10
+        # (near-lossless, like the chunks); the transitions
+        # pass below re-encodes again only when cuts apply.
+        total = sum(float(s["duration"]) for s in scenes)
+        assembly = {
+            "id": f"{project.get('id', 'proj')}_parallel_assembly",
+            "version": 1,
+            "output": dict(project["output"]),
+            "clips": [{"id": f"chunk-{si}", "kind": "video",
+                       "src": chunk_files[si],
+                       "trim_in": 0,
+                       "trim_out": float(scenes[si]["duration"])}
+                      for si in range(len(scenes))],
+        }
         joined_path = os.path.join(tmp_dir, "joined.mp4")
-        concat_cmd = [
-            "ffmpeg", "-y", "-v", "error",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_file,
-            "-c", "copy",
-            joined_path,
-        ]
-        proc = subprocess.run(concat_cmd, capture_output=True, text=True)
-        if proc.returncode != 0 or not os.path.isfile(joined_path):
-            return False, {"code": "CONCAT_FAILED", "message": f"FFmpeg concat demuxer failed: {proc.stderr}"}
+        ok, ainfo = render_project(
+            assembly, joined_path, scale_factor=scale_factor,
+            video_codec=video_codec, video_crf=10,
+            video_preset=video_preset or "fast",
+            t_override=total + 1.0 / fps,
+            timeout=timeout)
+        if not ok:
+            return False, ainfo
 
         # Apply scene transitions if specified (Bug 5 fix)
         cuts_to_apply = []
@@ -6967,7 +7418,6 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
 
         # Total duration: the music mix below needs it even when no
         # transitions apply, so it is defined unconditionally.
-        total = cur_time
         if cuts_to_apply:
             trans_filters = []
             vcur_chain = "0:v"
@@ -7075,7 +7525,8 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         else:
             shutil.move(joined_path, output_path)
 
-        return True, {"output": output_path, "parallel_chunks": len(scenes)}
+        return True, {"output": output_path, "parallel_chunks": len(scenes),
+                      "cache_hits": cache_hits}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -7122,6 +7573,31 @@ def produce_explainer(brief, output_path, review_dir=None):
       on; motion "gentle" (or absent) turns
       default_image_motion on. punch_in ANYWHERE in the
       brief is rejected: gentle motion only, zero punch-ins.
+    - style "cinematic" (v1.62.0) opts into the 3-layer
+      cinematic compositor (compositor.py), the recommended
+      style; blackboard stays as the explicit classic.
+      Layer 1: per-scene B-roll (LOCAL files only — a
+      non-local broll spec is a brief error, never a fetch)
+      with blur + darkening + contrast + vignette and slow
+      Ken Burns on stills; with no B-roll and no background
+      file, a rich cinematic gradient background is
+      generated (background is optional in cinematic mode;
+      "canvas" also means the gradient). Layer 2: a scene
+      "subject" (local transparent PNG from AgentMedia
+      remove_background, optional "subject_placement"
+      center/left/right and "subject_size" 0.10..0.85)
+      gets a spring entrance + a measured punch-in every
+      ~5s, generated by the tool as overlay keyframes with
+      ABSOLUTE scale (max 1.15x base) — the SOLE exception
+      to the punch_in rejection above, which still rejects
+      any brief-level punch_in. Layer 3: keywords move to
+      the callout zone (60-70%) with a glass card behind
+      them; diagrams clamp into the diagram zone (22-56%);
+      titles stay in the header zone (5-18%) and captions
+      in the subtitle zone (76-92%). Cinematic clips carry
+      explicit Ken Burns, so default_image_motion stays off.
+      Note: style "cinematic" and look "cinematic" are
+      separate keys and combine freely.
     - look (v1.40.0, optional) picks a profile from
       EXPLAINER_LOOKS — clean, cinematic, vintage, bold,
       still, modern — combining clip treatment + grade +
@@ -7172,10 +7648,19 @@ def produce_explainer(brief, output_path, review_dir=None):
                        "message": f"punch_in is not allowed in a one-button explainer (found at {punched})",
                        "fix": "remove punch_in from the brief; gentle motion (default_image_motion) is the only motion in this path"}
     style = brief.get("style", "blackboard")
-    if style != "blackboard":
+    if style not in ("blackboard", "cinematic"):
         return False, {"code": "INVALID_SCHEMA",
-                       "message": f"explainer style must be 'blackboard', got {style!r}",
-                       "fix": "set style to 'blackboard', or remove it for the blackboard default"}
+                       "message": f"explainer style must be 'blackboard' or 'cinematic', got {style!r}",
+                       "fix": "set style to 'blackboard' (the classic board) or 'cinematic' (the 3-layer compositor), or remove it for the blackboard default"}
+    # v1.62.0: the 3-layer cinematic compositor (compositor.py).
+    # style "cinematic" opts a brief into it; "blackboard" (or
+    # absent) renders exactly as before. Cinematic is the new
+    # recommended/flagship style; blackboard stays as the
+    # explicit opt-in classic. NOTE: style and look are
+    # separate keys — look "cinematic" is a treatment/grade
+    # profile that applies on ANY background, while style
+    # "cinematic" is the compositor; they combine freely.
+    cinematic = (style == "cinematic")
     # v1.40.0: look profiles (EXPLAINER_LOOKS above). Unknown
     # looks are rejected with the known list; a brief field
     # always wins over its look counterpart (motion below).
@@ -7204,11 +7689,27 @@ def produce_explainer(brief, output_path, review_dir=None):
                        "message": "output width/height must both be integers 16..3840",
                        "fix": "set output width and height, e.g. 720 and 1280, or remove output for the 720x1280 default"}
     background = brief.get("background")
-    if not isinstance(background, str) or not background:
+    _bg_is_gradient = False
+    if cinematic and (not isinstance(background, str) or not background
+                      or background == "canvas"):
+        # v1.62.0, cinematic Layer 1 fallback: no board image
+        # (or the "canvas" sentinel) means a rich cinematic
+        # gradient background, generated beside the output (it
+        # must outlive this call, since the project references
+        # it by path) — never a flat solid colour, never the
+        # black board.
+        from .compositor import write_cinematic_gradient
+        _grad_path = os.path.join(
+            os.path.dirname(os.path.abspath(output_path)),
+            f"{brief.get('id', 'explainer')}-cinematic-gradient.png")
+        write_cinematic_gradient(_grad_path, width, height)
+        background = _grad_path
+        _bg_is_gradient = True
+    elif not isinstance(background, str) or not background:
         return False, {"code": "INVALID_SCHEMA",
                        "message": "explainer brief needs a background board image path",
                        "fix": "set background to a local board image, e.g. data/test_media/board.png"}
-    if background == "canvas":
+    elif background == "canvas":
         # v1.41.0 Fix 6: the sentinel "canvas" generates a
         # dual-tone canvas beside the output (it must outlive
         # this call, since the project references it by path).
@@ -7290,12 +7791,16 @@ def produce_explainer(brief, output_path, review_dir=None):
     # Derive the timeline: probe every narration first, so a
     # bad scene fails before any render starts.
     scenes, clips, texts, captions, diagrams, audio = [], [], [], [], [], []
+    overlays = []
     motion_els = []
     # v1.41.0 Fix 6 safe margins (modern look only): the title
     # stack is zoned — fixed title at or below the 10% line,
     # scene title below it, keywords below that — so diagrams
     # clamp into the middle zone above the caption band.
-    _safe = bool(look.get("safe_margins"))
+    # v1.62.0: cinematic ALWAYS zones (the compositor's Vertical
+    # Zone Manager), with keywords in the callout zone instead
+    # of under the title (see _kw_y below).
+    _safe = bool(look.get("safe_margins")) or cinematic
     _fixed_y = max(80, int(round(0.10 * height))) if _safe else 80
     _ts = TEXT_STYLES.get(look.get("title_style")) \
         if isinstance(look.get("title_style"), str) else None
@@ -7402,18 +7907,34 @@ def produce_explainer(brief, output_path, review_dir=None):
         if si > 0:
             scene_trans = scene.get("transition") or brief_transition or "none"
 
-        # v1.60.0 B-Roll & per-scene background media resolution
+        # v1.60.0 B-Roll & per-scene background media resolution.
+        # v1.62.0 cinematic: B-roll is LOCAL FILES ONLY (the
+        # AgentMedia separation — AgentCut never fetches). A
+        # non-local broll spec in cinematic mode is a brief
+        # error, not a fetch; blackboard keeps the 1.60.0
+        # resolve_broll_media behaviour (local / URL / keyword).
         scene_broll = scene.get("broll") or scene.get("bg_media") or scene.get("background")
         scene_src = background
         scene_kind = "image"
         is_broll = False
         if scene_broll and scene_broll != "canvas":
-            from .broll import resolve_broll_media, is_video_file
-            res_broll = resolve_broll_media(scene_broll, width=width, height=height)
-            if res_broll:
-                scene_src = res_broll
-                scene_kind = "video" if is_video_file(res_broll) else "image"
+            if cinematic:
+                if not isinstance(scene_broll, str) or not os.path.isfile(
+                        resolve_path(scene_broll)):
+                    return False, {"code": "FILE_NOT_FOUND",
+                                   "message": f"scene {sid} broll must be a local file in cinematic mode: {scene_broll!r}",
+                                   "fix": f"set scene {sid} broll to a local image/video file from AgentMedia, or remove it for the gradient background"}
+                from .broll import is_video_file
+                scene_src = resolve_path(scene_broll)
+                scene_kind = "video" if is_video_file(scene_src) else "image"
                 is_broll = True
+            else:
+                from .broll import resolve_broll_media, is_video_file
+                res_broll = resolve_broll_media(scene_broll, width=width, height=height)
+                if res_broll:
+                    scene_src = res_broll
+                    scene_kind = "video" if is_video_file(res_broll) else "image"
+                    is_broll = True
 
         clip_entry = {"id": sid, "kind": scene_kind, "src": scene_src,
                       "duration": dur, "transition": scene_trans}
@@ -7422,8 +7943,22 @@ def produce_explainer(brief, output_path, review_dir=None):
                 scene.get("transition_duration", brief.get("transition_duration", 0.5))
             )
 
+        # v1.62.0, cinematic Layer 1: the cinematic treatment
+        # (blur + darkening + contrast + vignette) and cycled
+        # slow Ken Burns on stills — the compositor owns the
+        # look, so it replaces the look treatment (the look's
+        # grade still applies below). A scene on the GENERATED
+        # gradient gets the lighter gradient treatment (no
+        # darkening — the gradient is already dark).
+        if cinematic:
+            from .compositor import GRADIENT_TREATMENT, cinematic_layer1_clip
+            if _bg_is_gradient and not is_broll:
+                cinematic_layer1_clip(clip_entry, si,
+                                      treatment=GRADIENT_TREATMENT)
+            else:
+                cinematic_layer1_clip(clip_entry, si)
         # v1.60.0: B-roll cinematic legibility grading (depth of field, vignette, darkening)
-        if is_broll:
+        elif is_broll:
             clip_entry["treatment"] = {
                 "blur": 6.0,
                 "brightness": -0.22,
@@ -7436,6 +7971,38 @@ def produce_explainer(brief, output_path, review_dir=None):
         if look.get("grade"):
             clip_entry["grade"] = look["grade"]
         clips.append(clip_entry)
+        # v1.62.0, cinematic Layer 2: a background-removed
+        # foreground subject (transparent PNG from AgentMedia
+        # remove_background) with a spring entrance + measured
+        # punch-ins (compositor.subject_overlay). The punch-ins
+        # are GENERATED keyframes — the sole exception to the
+        # 1.39.0 punch_in rejection (a brief-level punch_in is
+        # still rejected above).
+        if cinematic and scene.get("subject"):
+            from .compositor import subject_overlay
+            _subj_src = scene["subject"]
+            if not isinstance(_subj_src, str) or not os.path.isfile(
+                    resolve_path(_subj_src)):
+                return False, {"code": "FILE_NOT_FOUND",
+                               "message": f"scene {sid} subject not found: {_subj_src!r}",
+                               "fix": f"set scene {sid} subject to a local transparent PNG from AgentMedia remove_background, or remove it"}
+            try:
+                _subj_size = float(scene.get("subject_size", 0.5))
+            except (TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} subject_size must be a number 0.10..0.85",
+                               "fix": f"set scene {sid} subject_size to e.g. 0.5, or remove it"}
+            try:
+                overlays.append(subject_overlay(
+                    overlay_id=f"comp-subject-{sid}",
+                    src=resolve_path(_subj_src),
+                    start=start, duration=dur, width=width, height=height,
+                    placement=scene.get("subject_placement", "center"),
+                    base_size=_subj_size))
+            except ValueError as exc:
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} subject: {exc}",
+                               "fix": "set subject_placement to 'center', 'left' or 'right'"}
         # v1.41.0, rich SFX: every scene after the first opens
         # with a whoosh, so scene changes are heard, not just seen.
         if rich and si > 0:
@@ -7478,12 +8045,19 @@ def produce_explainer(brief, output_path, review_dir=None):
         # v1.41.0 Fix 6: this scene's content-stack bottom —
         # scene title if present, else the fixed title — and
         # the keyword line below it. Diagrams clamp below this.
+        # v1.62.0 cinematic: keywords live in the CALLOUT zone
+        # (60-70% of the frame) with a glass card behind them,
+        # BELOW the diagram zone — so _content_bottom (which
+        # pushes diagrams down) ignores keywords in cinematic
+        # mode and the diagram clamp uses the zone bands.
         _title_bottom = (_scene_y + int(round(_scene_title_size * 1.4))
                          if isinstance(stitle, str) and stitle.strip()
                          else _fixed_y + int(round(60 * 1.4)))
-        _kw_y = max(260, _title_bottom + 16) if _safe else 260
+        _kw_y = (int(round(0.62 * height)) if cinematic else
+                 (max(260, _title_bottom + 16) if _safe else 260))
         _content_bottom = (_kw_y + int(round(56 * 1.4))
-                           if scene.get("keywords") else _title_bottom)
+                           if scene.get("keywords") and not cinematic
+                           else _title_bottom)
         dg = scene.get("diagram")
         if dg is not None:
             if not isinstance(dg, dict):
@@ -7554,9 +8128,21 @@ def produce_explainer(brief, output_path, review_dir=None):
                         _cw = int(ndg["canvas"].get("width", 900))
                         _ch = int(ndg["canvas"].get("height", 560))
                     _dh = _even(_dw * _ch / _cw) if _cw else _dw
-                    _top = max(int(round(0.10 * height)),
-                               _content_bottom + 16)
-                    _bot = (height - 120) - 16
+                    if cinematic:
+                        # Compositor zones: the diagram's top
+                        # stays at/below the diagram zone top
+                        # (22%) and its BOTTOM stays at/above
+                        # the zone bottom (56%), above the
+                        # callout zone. A diagram taller than
+                        # the zone lands at the top (best
+                        # effort — it is not resized).
+                        _top = max(int(round(0.22 * height)),
+                                   _title_bottom + 16)
+                        _bot = max(_top, int(round(0.56 * height)) - _dh)
+                    else:
+                        _top = max(int(round(0.10 * height)),
+                                   _content_bottom + 16)
+                        _bot = (height - 120) - 16
                     if "x" in ndg:
                         _lo = int(round(0.10 * width))
                         _hi = int(round(0.90 * width)) - _dw
@@ -7612,6 +8198,35 @@ def produce_explainer(brief, output_path, review_dir=None):
             if rich and kw.get("sfx") is None:
                 ktext["sfx"] = "pop"
             texts.append(ktext)
+            # v1.62.0, cinematic Layer 3: a glass card behind
+            # the keyword callout (callout zone 60-70%). The
+            # card hugs the measured text width + padding; the
+            # keyword text (box=False) sits on top of it. A
+            # keyword with an explicit numeric x left-aligns
+            # its card to that x; otherwise the card centres.
+            if cinematic:
+                from .compositor import glass_card_overlay
+                _card_w = int(round(width * 0.6))
+                if kw_font:
+                    _card_w = int(round(
+                        _measure_text_width(kw_text, kw_font, kw_size)
+                        + 48))
+                _card_w = max(120, min(_card_w, int(round(0.9 * width))))
+                _card_h = int(round(kw_size * 1.4 + 32))
+                _kx = ktext.get("x", "center")
+                if isinstance(_kx, (int, float)):
+                    _card_x = int(round(float(_kx) - 24))
+                else:
+                    _card_x = int(round((width - _card_w) / 2))
+                overlays.append(glass_card_overlay(
+                    overlay_id=f"comp-card-{sid}-{ki}",
+                    x=_card_x,
+                    y=int(round(float(ktext.get("y", _kw_y)) - 16)),
+                    w=_card_w, h=_card_h,
+                    start=round(start + ks, 3), duration=round(ke - ks, 3),
+                    width=width,
+                    project_dir=os.path.dirname(
+                        os.path.abspath(output_path))))
         scenes.append({"id": sid, "title": stitle, "start": round(start, 3),
                        "end": round(end, 3), "duration": round(dur, 3),
                        "narration": narration, "captions": srt_path})
@@ -7644,8 +8259,12 @@ def produce_explainer(brief, output_path, review_dir=None):
         "audio": audio,
         "diagrams": diagrams,
         "motion": motion_els,
+        "overlays": overlays,
         "scrims": {"top": True, "bottom": True},
-        "default_image_motion": motion == "gentle",
+        # v1.62.0: cinematic clips carry explicit Ken Burns
+        # (Layer 1), so the default image motion stays off —
+        # the compositor owns the camera.
+        "default_image_motion": motion == "gentle" and not cinematic,
     }
     if brief.get("chapters"):
         project["chapters"] = [{"title": s["title"] or s["id"],
@@ -7699,7 +8318,8 @@ def produce_explainer(brief, output_path, review_dir=None):
     if is_parallel and len(scenes) >= 2:
         ok, rinfo = _render_explainer_parallel(
             project, scenes, output_path, scale_factor=scale_factor,
-            video_codec=video_codec, video_preset=video_preset, timeout=timeout)
+            video_codec=video_codec, video_preset=video_preset, timeout=timeout,
+            use_cache=bool(brief.get("cache_scenes", True)))
     else:
         ok, rinfo = render_project(
             project, output_path, scale_factor=scale_factor,
@@ -7723,8 +8343,12 @@ def produce_explainer(brief, output_path, review_dir=None):
         "duration": info["total_duration"],
         "width": int(width * scale_factor), "height": int(height * scale_factor), "fps": fps,
         "look": look_name,
+        "style": style,
         "draft": is_draft,
         "parallel": is_parallel and len(scenes) >= 2,
+        # v1.62.0: scene-cache hits from the parallel render
+        # (0 for the serial path, which has no scene cache).
+        "cache_hits": rinfo.get("cache_hits", 0),
         "scenes": scenes,
         "chapters": info.get("chapters", []),
         "warnings": explainer_warnings,
@@ -8251,5 +8875,11 @@ def run_job_worker(jobs_dir, job_id, out_dir):
     return ok
 
 
-from .reframe import reframe_to_variants, reframe_video
+from .reframe import (build_windows_crop_filter, reframe_to_variants,
+                      reframe_video, track_interp_expr)
+
+# v1.62.0: the track-interpolation primitive lives in reframe.py
+# now (see the note at the old _track_interp_expr site); this
+# alias keeps every call site in this module unchanged.
+_track_interp_expr = track_interp_expr
 

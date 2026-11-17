@@ -2,7 +2,7 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-1.61.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.62.0-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20Tools-34%20tools-purple.svg)](src/agentcut/server.py)
@@ -105,6 +105,50 @@ Ken Burns/camera moves, reframe, SFX and adjustments. The receiving
 editor rebuilds those by hand; every dropped feature is listed in
 the export warnings. Resolve import itself is unverified in this
 environment — open the file in Resolve to confirm.
+
+---
+
+## 🎬 3-Layer Cinematic Compositor (`v1.62.0`): From-Scratch Videos That Look Directed
+
+With **v1.62.0**, `produce_explainer` and `produce_video` gain a
+3-layer cinematic compositor (`src/agentcut/compositor.py`, stdlib
+only). Pass `style: "cinematic"` in the brief — the blackboard stays
+as the explicit opt-in classic, and existing briefs render as before
+unless they opt in.
+
+- **Layer 1 — background with depth**: per-scene B-roll (local files
+  only, e.g. from AgentMedia) with soft depth-of-field blur,
+  darkening and vignette so Arabic text stays legible, plus slow Ken
+  Burns cycled per scene (max 1.12x). With no B-roll and no background
+  file, a rich cinematic gradient background is generated — never a
+  flat solid colour, never the black board.
+- **Layer 2 — foreground subject**: a background-removed transparent
+  PNG (from AgentMedia `remove_background`) placed centre or on a
+  third, with a spring entrance and a measured punch-in every ~5s
+  (absolute scale, max 1.15x base — never stacked on Ken Burns).
+- **Layer 3 — analytical layer + Arabic text**: glass cards and
+  MotionCanvas counters/charts as complements over the scene, with
+  the Vertical Zone Manager enforced (header 5–18%, diagram 22–56%,
+  callout 60–70%, subtitles 76–92%) so cards never collide with
+  captions. The Arabic text path (HarfBuzz, BiDi, Noto Sans Arabic
+  Bold) is untouched.
+
+Design change: the 1.39.0 punch_in rejection is superseded for the
+compositor's foreground-subject punch-ins ONLY (tool-generated
+keyframes, absolute scale); a brief-level `punch_in` is still
+rejected everywhere.
+
+Also in 1.62.0: the parallel path's one-frame audio shift is fixed
+(concat FILTER join — regression-tested with beep onsets); draft
+renders place text correctly at `scale_factor < 1.0` (full renders
+byte-identical to before); the scene cache is wired into the render
+path (`cache_hits` in the result); cache and reframe share one API
+each; and grain gets `treatment.grain_mode` (`off` | `frozen` |
+`temporal`, default `frozen`). Measured on the 30s 720p benchmark:
+temporal 124.5s / ~31 MB, frozen 50.8s / ~4.5 MB, off 70.0s — frozen
+keeps the grain look and is the fastest, because the grain cost is
+mostly in the x264 encoder and a frozen pattern is perfectly
+predictable across frames. Grain is off by default in draft mode.
 
 ---
 
@@ -285,7 +329,7 @@ AgentCut exposes **34 structured tools** over stdio MCP:
 ## 🧪 Testing & Verification
 
 AgentCut enforces a comprehensive test suite executed across every push and pull request:
-- **445 automated tests** verifying mathematical pixel geometry, HarfBuzz text shaping, ASS karaoke timing, FFmpeg filter graph construction, EBU R128 loudness compliance, and template schema integrity.
+- **481 automated tests** verifying mathematical pixel geometry, HarfBuzz text shaping, ASS karaoke timing, FFmpeg filter graph construction, EBU R128 loudness compliance, and template schema integrity.
 - **Empirical Frame Auditing:** Contact sheet generation and pixel-difference assertions ensure zero visual artifacts, zero clipping, and 100% deterministic reproducibility.
 
 ```sh

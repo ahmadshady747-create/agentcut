@@ -1,4 +1,4 @@
-"""OTIO (.otio) exporter tests (AgentCut v1.61.0).
+"""OTIO (.otio) exporter tests (AgentCut v1.62.0).
 
 Verifies the stdlib-only OpenTimelineIO exporter: clip order,
 source_range math (including fps conversion), chapter markers,
@@ -57,10 +57,10 @@ def _v1_transitions(timeline):
 
 class TestOtioExporter(unittest.TestCase):
 
-    def test_version_is_1_61_0(self):
-        self.assertEqual(__version__, "1.61.0")
+    def test_version_is_1_62_0(self):
+        self.assertEqual(__version__, "1.62.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.61.0")
+            self.assertEqual(f.read().strip(), "1.62.0")
 
     def test_tool_count_is_34_and_export_otio_listed(self):
         names = [t["name"] for t in TOOLS]

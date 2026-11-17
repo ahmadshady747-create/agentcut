@@ -1,3 +1,186 @@
+## 1.62.0 — 3-Layer Cinematic Compositor + Parallel Join, Draft Scaling, Cache/Reframe Unification, Grain Modes
+
+From-scratch videos no longer default to the black board + flat
+geometric shapes. `produce_explainer` and `produce_video` gain a
+3-layer cinematic compositor (`src/agentcut/compositor.py`, stdlib
+only, no new dependency): blurred B-roll backgrounds with slow Ken
+Burns over a rich cinematic gradient fallback, background-removed
+foreground subjects with a spring entrance + measured punch-ins, and
+glass cards / counters / charts as complements over the scene — with
+the Arabic text path and the Vertical Zone Manager intact. The
+blackboard stays as the explicit opt-in classic; existing briefs
+render as before unless they opt into `style: "cinematic"`. Alongside
+it: the parallel path's one-frame audio shift is fixed (concat FILTER
+join), draft renders place text correctly, the scene cache is wired
+into the render path, the two reframe paths share one API, and grain
+gets a mode switch with a measured frozen default.
+
+### 🎬 3-layer cinematic compositor (`src/agentcut/compositor.py`, new module)
+
+- **Layer 1 — background with depth**: per-scene B-roll (local files
+  only — AgentCut never fetches; a non-local broll spec in cinematic
+  mode is a structured brief error) through the 1.60.0 cinematic
+  treatment (blur 6.0, brightness −0.22, contrast 1.12, saturation
+  0.85, vignette 1.0) plus slow Ken Burns cycled per scene
+  (zoom_in / zoom_out / pan_left / pan_right, max 1.12x, inside the
+  1.25x rule; an explicit per-clip ken_burns always wins). With no
+  B-roll and no background file, a rich cinematic gradient background
+  is generated beside the output (`{id}-cinematic-gradient.png`,
+  deterministic slate/indigo/teal gradient with a warm radial glow
+  and corner vignette — never a flat solid colour, never the black
+  board). The "dynamic" part is the Ken Burns drift over it.
+- **Layer 2 — foreground subject**: a scene/clip `subject` (local
+  transparent PNG from AgentMedia remove_background, optional
+  `subject_placement` center/left/right and `subject_size` 0.10..0.85)
+  becomes a keyframed overlay: spring entrance (0–0.6s, opacity 0→1,
+  scale 0.92x→1.0x base) then a measured punch every 5s (base → 1.15x
+  base → base over 0.8s, ease_in_out). Every keyframe carries x/y
+  computed from its scale, so the subject grows IN PLACE around its
+  centre; punch scale is ABSOLUTE (max 0.85 × 1.15 = 0.98 of frame
+  width), never stacked on Ken Burns. Subjects sit vertically centred
+  on the diagram zone (0.39×H); tall subjects shrink to fit the
+  diagram zone (34% of the frame height).
+- **Layer 3 — analytical layer + Arabic text**: keywords move to the
+  callout zone (60–70%) with a glass card behind each (card hugs the
+  HarfBuzz-measured text width + 48px); diagrams clamp into the
+  diagram zone (22–56%); titles stay in the header zone (5–18%) and
+  captions in the subtitle zone (76–92%). The Arabic path is
+  untouched (HarfBuzz measurement, bidi_display_text, Noto Sans
+  Arabic Bold). In `produce_video`, auto title cards get glass cards
+  too.
+- **DESIGN CHANGE (authorized)**: the 1.39.0 punch_in rejection is
+  superseded for the compositor's foreground-subject punch-ins ONLY —
+  they are tool-generated keyframes with absolute scale, not brief
+  punch_ins. A brief-level `punch_in` is still rejected everywhere.
+  Note: `style: "cinematic"` (the compositor) and `look: "cinematic"`
+  (a treatment/grade profile) are separate keys and combine freely.
+- **Wiring**: `produce_explainer` accepts `style: "cinematic"`
+  (blackboard/absent unchanged; anything else is an error); background
+  is optional in cinematic mode (absent or `"canvas"` → gradient);
+  `default_image_motion` stays off for cinematic (clips carry explicit
+  Ken Burns); the result gains `"style"`. `produce_video` accepts
+  brief `style: "cinematic"` with per-clip or brief-level `subject`.
+  The parallel path now rebases overlays into scene chunks (before
+  1.62.0 it silently dropped every overlay).
+
+### 🔧 Parallel-path audio shift fixed (Task 2.1)
+
+- `_render_explainer_parallel` joins scene chunks with the concat
+  FILTER via a `render_project` assembly (clips = chunk files,
+  trim_out = scene duration, `t_override = total + 1/fps`) — the
+  `render_project_cached` pattern — instead of the concat DEMUXER
+  (`-f concat -c copy`), which shifted audio one video frame late at
+  every scene boundary. Chunks render with one frame of `-t` slack.
+  The assembly re-encodes at crf 10 like the chunks. Correction to
+  the 1.62.0 brief: `_join_segments` is the demuxer utility, not the
+  serial path — the serial concat-filter join lives in
+  `build_ffmpeg_args` / `render_project_cached`'s assembly.
+- Regression test: a 3-scene parallel render with a beep 0.05s into
+  each scene's narration asserts every beep onset within one frame of
+  its expected time (container durations alone cannot catch a shift —
+  a late-shifted track is cut to the same length by `-t`).
+
+### 🔧 Draft-mode text scaling (Task 2.2)
+
+- At `scale_factor < 1.0`, every text quantity scales exactly once:
+  drawtext coordinates, fontsize, ASS sizes/margins, box borders,
+  stroke, shadow, counter/pill geometry, timecode, guides. At 1.0
+  every helper returns its input unchanged, so full renders are
+  byte-identical to before (proven: `examples/basic.json` md5 matches
+  the pre-1.62.0 tree — see the 1.62.0 build log). Filter-level proof
+  in the suite: at 0.5 the title is fontsize 24 y=40 (was 48/80).
+- Residuals (pre-existing, out of scope): diagrams/overlays with
+  explicit x/y are still misplaced in drafts (raw full-res coords);
+  ASS outline/shadow are unscaled in drafts (cosmetic).
+
+### 🔧 Cache + reframe unification (Task 2.3)
+
+- `cache.py` is THE cache layer at two granularities sharing one
+  `.agentcut_cache` dir: the scene cache (`scene_<hash>.mp4`, now
+  WIRED into `_render_explainer_parallel` — per-chunk hash over the
+  chunk project + source stats + render params, fail-open on any
+  cache error, `cache_scenes` brief flag default True, result gains
+  `cache_hits`) and the segment cache (`seg_<sha>.mkv`,
+  `render_project_cached`, whose default dir now resolves through
+  `cache.get_cache_dir`). `clear_cache` removes both kinds.
+  `_normalize_obj` is now public `normalize_for_hash` (alias kept).
+  `segment_fingerprint` is unchanged (its payload is pinned by
+  `SEGMENT_CACHE_VERSION`).
+- `reframe.py` is THE reframe API: `track_interp_expr` moved there
+  from render.py (render keeps an alias); `build_windows_crop_filter`
+  is the one windows-crop builder (the per-clip reframe path calls
+  it); `parse_aspect_ratio` is the single "W:H" parser (validate's
+  clip-reframe validation uses it). The per-clip reframe schema is
+  unchanged.
+
+### 🔧 Grain modes (Task 2.4) — measured, frozen default
+
+- New `treatment.grain_mode`: `off` (no noise even when grain is
+  set), `frozen` (one static noise pattern on every frame — the
+  DEFAULT), `temporal` (the pre-1.62.0 shimmering noise). Grain is
+  OFF by default in draft mode (`scale_factor < 1.0`). A frozen
+  pattern keeps the grain look on any single frame (verified:
+  `noise=alls=10` without `allf=t` produces byte-identical frames,
+  and temporal frame 1 is byte-identical to frozen frame 1 — same
+  seed).
+- Measured on the 30s 720x1280 benchmark (grain 10 + vignette 0.4,
+  2 runs each, 2026-11-16): temporal 124.5s mean (~31.0 MB), frozen
+  50.8s mean (~4.46 MB), off 70.0s mean (3.54 MB), default 52.2s
+  (confirms the default IS frozen). Frozen is faster than off and
+  2.4x faster than temporal at 1/7th the file size — the grain cost
+  is mostly in the x264 encoder (incompressible noise), and a frozen
+  pattern is perfectly predictable across frames.
+
+### 🐛 Defects found and fixed by this build (pre-existing)
+
+- **Treatment validator rejected the B-roll treatment (1.60.0)**:
+  `_treatment_filters` supported blur/brightness/contrast/saturation
+  and the 1.60.0 B-roll path set them, but `_validate_treatment`
+  whitelisted only grain/vignette/shadow — so every explainer brief
+  with B-roll failed validation. The validator now allows blur 0..30,
+  brightness −1..1, contrast 0..3, saturation 0..3.
+- **Overlay opacity geq crashed ffmpeg after a varying scale**:
+  a geq fed by a `scale eval=frame` stream heap-corrupts ffmpeg 8.1.2
+  (framepool assertion / munmap / free errors — verified by bisection:
+  geq alone OK, varying scale alone OK, the combination crashes once
+  the scale keeps changing past the first segment). Varying opacity is
+  now applied BEFORE the scale via the alphaextract multiply
+  (split → alphaextract → geq on the alpha → alphamerge), which also
+  fixes the second defect below. Mask + scale keyframes and chroma-key
+  + scale keyframes were already rejected by validation, so the
+  opacity geq was the only unguarded combination.
+- **Overlay opacity geq destroyed PNG transparency**: the old geq SET
+  the alpha (255×opacity) instead of multiplying it, so a transparent
+  subject rendered as an opaque black rectangle (verified: corner
+  YAVG 17 vs background 145). The alphaextract multiply preserves
+  transparency. For opaque sources the output is unchanged.
+- **geq wraps out-of-range alpha instead of clipping it**: a spring
+  overshoot to 1.10 rendered lum 25, not 255 — the subject flickered
+  invisible mid-entrance (verified: frames 4–8 near-invisible, then
+  full). All opacity geq expressions are now `clip(expr,0,1)`.
+- **Mask × opacity intersection is a known gap**: mask + opacity
+  keyframes (no chroma key) keeps the old geq order exactly (the
+  opacity wins, the mask is lost, as before) — the intersection is
+  only implemented for the chroma-key branch.
+
+### 🧪 Tests (Task 3) — 481 tests, 100% green
+
+- New `tests/test_v162_compositor.py` (18 tests): compositor units
+  (gradient determinism, subject keyframes incl. in-place growth,
+  zones, Layer 1 cycle, glass-card exact rect), cinematic wiring
+  errors (bad style, non-local broll, missing subject, bad placement),
+  and real renders — a multi-layer 720p project (blurred B-roll +
+  transparent PNG subject + glass card + Arabic text + ASS karaoke)
+  with a render_contact_sheet, ffprobe + RGB mean/variance checks;
+  the parallel A/V-sync beep regression test; the scene-cache
+  hit/miss test (second identical parallel run: `cache_hits` == 2).
+- New `tests/test_v162_core.py` (15 tests): grain modes + validation,
+  draft scaling (filter-level), cache unification, reframe
+  unification, treatment key ranges.
+- `tests/test_v160_visual_leap.py` gains real renders (was ZERO
+  renders): a glass-card render and a karaoke-caption render at
+  360x640 with pixel checks.
+
 ## 1.61.0 — OTIO Exporter: AgentCut Projects Open in DaVinci Resolve
 
 Ends AgentCut's isolation: any project now exports to an
