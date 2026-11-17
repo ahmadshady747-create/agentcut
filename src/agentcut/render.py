@@ -6965,6 +6965,9 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     cuts_to_apply.append((cur_time, clip_trans, td, si))
             cur_time += s_dur
 
+        # Total duration: the music mix below needs it even when no
+        # transitions apply, so it is defined unconditionally.
+        total = cur_time
         if cuts_to_apply:
             trans_filters = []
             vcur_chain = "0:v"
@@ -6972,7 +6975,6 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
             width = int(p_out.get("width", 720))
             height = int(p_out.get("height", 1280))
             fps = int(p_out.get("fps", 30))
-            total = cur_time
             _afmt = "rgba"
             _fmt = "yuv420p"
 
@@ -7433,6 +7435,7 @@ def produce_explainer(brief, output_path, review_dir=None):
             clip_entry["treatment"] = dict(look["treatment"])
         if look.get("grade"):
             clip_entry["grade"] = look["grade"]
+        clips.append(clip_entry)
         # v1.41.0, rich SFX: every scene after the first opens
         # with a whoosh, so scene changes are heard, not just seen.
         if rich and si > 0:

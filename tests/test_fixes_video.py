@@ -35,7 +35,7 @@ class TestVideoDefectsFixes(unittest.TestCase):
             "version": 1,
             "id": "test_labels",
             "output": {"width": 1280, "height": 720, "fps": 25},
-            "clips": [{"id": "c1", "kind": "image", "src": "data/ai_race_bg.png", "duration": 10.0, "track": 0}],
+            "clips": [{"id": "c1", "kind": "image", "src": "data/test_media/poster.png", "duration": 10.0, "track": 0}],
             "diagrams": [
                 {
                     "id": "d1",
