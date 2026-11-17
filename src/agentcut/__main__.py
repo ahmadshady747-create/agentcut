@@ -2,6 +2,7 @@
 import json
 import sys
 
+from .otio import export_otio
 from .package import package_project
 from .render import poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_contact_sheet, render_project, run_job_worker, split_clip, timeline_summary
 from .server import serve
@@ -55,6 +56,12 @@ def _main(argv):
         # The optional project JSON drives the smart timestamps.
         proj = _load(argv[3]) if len(argv) == 4 else None
         ok, info = render_contact_sheet(argv[1], argv[2], project=proj)
+        print(json.dumps(info, indent=2, default=str))
+        return 0 if ok else 1
+    if argv[0] == "otio" and len(argv) == 3:
+        # v1.61.0: otio <project.json> <out.otio> — export an
+        # OpenTimelineIO timeline (stdlib JSON, no dependency).
+        ok, info = export_otio(_load(argv[1]), argv[2])
         print(json.dumps(info, indent=2, default=str))
         return 0 if ok else 1
     if argv[0] == "produce-variants" and len(argv) == 3:
@@ -205,7 +212,7 @@ def _main(argv):
     if argv[0] == "package" and len(argv) in (3, 4):
         trim = len(argv) == 4 and argv[3] == "--trim-clips"
         if len(argv) == 4 and not trim:
-            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>|tts <text> <mp3> [srt] [voice]|voices [lang]|reframe <in.mp4> <out.mp4> [--aspect 9:16] [--mode blur_pad]|studio <json> [video.mp4] [-o out.html]|plugins [list|discover]|templates [category]|from-template <id> <input.json> <out.mp4>]")
+            print("usage: python3 -m agentcut [serve|validate <json>|render <json> <mp4>|preview <json> <dir>|probe <file>|poster <json> <png> [seconds]|contact-sheet <video> <out.png> [project.json]|produce <brief.json> <mp4>|produce-explainer <brief.json> <mp4>|produce-variants <brief.json> <dir>|split <json> <clip_id> <seconds>|package <json> <outdir> [--trim-clips]|worker <jobs_dir> <job_id> <out_dir>|tts <text> <mp3> [srt] [voice]|voices [lang]|reframe <in.mp4> <out.mp4> [--aspect 9:16] [--mode blur_pad]|studio <json> [video.mp4] [-o out.html]|plugins [list|discover]|templates [category]|from-template <id> <input.json> <out.mp4>|otio <project.json> <out.otio>]")
             return 2
         summary = package_project(_load(argv[1]), argv[2], trim_clips=trim)
         print(json.dumps(summary, indent=2, default=str))

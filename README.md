@@ -2,10 +2,10 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-1.60.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.61.0-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-31%20tools-purple.svg)](src/agentcut/server.py)
+[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-34%20tools-purple.svg)](src/agentcut/server.py)
 [![Content Templates](https://img.shields.io/badge/templates-8%20genres-orange.svg)](src/agentcut/templates.py)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 [![Engine: FFmpeg](https://img.shields.io/badge/engine-FFmpeg%208.1%2B-green.svg)](https://ffmpeg.org/)
@@ -54,7 +54,7 @@ agentcut reframe out.mp4 9:16 vertical.mp4 --mode blur_pad
 # 6. Launch the interactive HTML5 Web Studio & Templates Gallery
 agentcut studio examples/basic.json studio.html
 
-# 7. Start the stdio Model Context Protocol (MCP) server (30 tools)
+# 7. Start the stdio Model Context Protocol (MCP) server (34 tools)
 agentcut-mcp
 ```
 
@@ -78,6 +78,33 @@ With **v1.60.0**, AgentCut elevates visual output from basic geometry boxes to c
 3. **Active Word Karaoke Captions (`karaoke_pill`):**
    - **Real-Time Word Highlighting:** Dynamic word-by-word tracking with active word 10% font enlargement (`\fscx110\fscy110`) and vibrant accent highlight.
    - **Strict Arabic BiDi & HarfBuzz Safety:** Subtitle run-ordering specifically tuned for RTL paragraph layout without character disconnections.
+
+---
+
+## 🔀 OTIO Export (`v1.61.0`): Projects Open in Real Editors
+
+With **v1.61.0**, AgentCut is no longer an island: `export_otio`
+(MCP tool, or `agentcut otio project.json timeline.otio` on the CLI)
+writes an OpenTimelineIO (`.otio`) timeline that opens as an editable
+timeline in DaVinci Resolve (free edition), Premiere, Final Cut (via
+OTIO adapters) and Kdenlive. OTIO is Apache-2.0 and its format is
+JSON, so the exporter writes it with the stdlib `json` module only —
+no OTIO library code is copied, no new dependency is added.
+
+What the export carries: cuts, clip order, exact timing (frame
+quantized at the project fps, total duration matches exactly),
+transitions (as dissolves — wipes and slides keep their timing with
+the shape substituted), chapter markers, track-1 overlays as V2+
+tracks, audio tracks, and media references (relative paths
+preserved). Speed, speed curves, freeze frames and loops are mapped
+to OTIO time warps and repeated clips.
+
+What it does NOT carry (OTIO cannot hold it): effects, grades,
+treatments, texts, captions, diagrams, motion graphics, overlays,
+Ken Burns/camera moves, reframe, SFX and adjustments. The receiving
+editor rebuilds those by hand; every dropped feature is listed in
+the export warnings. Resolve import itself is unverified in this
+environment — open the file in Resolve to confirm.
 
 ---
 
@@ -187,21 +214,22 @@ Generate a single, zero-dependency, self-contained HTML5 file (`studio.html`) pr
 
 ---
 
-## 🧰 The 30 Model Context Protocol (MCP) Tools
+## 🧰 The 34 Model Context Protocol (MCP) Tools
 
-AgentCut exposes **30 structured tools** over stdio MCP:
+AgentCut exposes **34 structured tools** over stdio MCP:
 
 | Domain | Available MCP Tools |
 |---|---|
 | **Templates & Automation** | `list_content_templates`, `produce_from_template`, `produce_explainer`, `produce_video`, `produce_variants` |
 | **Speech & Audio** | `synthesize_speech`, `list_voices` |
-| **Design & ProCraft** | `generate_color_palette`, `analyze_text_metrics`, `generate_web_studio` |
+| **Design & ProCraft** | `generate_color_palette`, `analyze_text_metrics`, `generate_web_studio`, `generate_glass_card_preview` |
 | **Video Production & Reframing** | `render_project`, `preview_project`, `validate_project`, `reframe_video`, `split_clip`, `timeline_summary`, `check_brief`, `probe_media` |
 | **Inspection & QA** | `poster_frame`, `render_contact_sheet` (12-frame contact sheet grid) |
 | **Project Management** | `create_project`, `get_project`, `list_projects`, `patch_project` |
 | **Snapshots & Rollbacks** | `snapshot_project`, `rollback_project`, `list_snapshots` |
 | **Asynchronous Jobs** | `start_render_job`, `get_job`, `get_job_status`, `cancel_job` |
 | **Plugins** | `list_plugins` |
+| **Interchange** | `export_otio` (OpenTimelineIO `.otio` export — opens in DaVinci Resolve, Premiere, Final Cut, Kdenlive) |
 
 ---
 
@@ -257,7 +285,7 @@ AgentCut exposes **30 structured tools** over stdio MCP:
 ## 🧪 Testing & Verification
 
 AgentCut enforces a comprehensive test suite executed across every push and pull request:
-- **390+ automated tests** verifying mathematical pixel geometry, HarfBuzz text shaping, ASS karaoke timing, FFmpeg filter graph construction, EBU R128 loudness compliance, and template schema integrity.
+- **445 automated tests** verifying mathematical pixel geometry, HarfBuzz text shaping, ASS karaoke timing, FFmpeg filter graph construction, EBU R128 loudness compliance, and template schema integrity.
 - **Empirical Frame Auditing:** Contact sheet generation and pixel-difference assertions ensure zero visual artifacts, zero clipping, and 100% deterministic reproducibility.
 
 ```sh

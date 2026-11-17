@@ -836,3 +836,44 @@ AgentCut does NO analysis and NO AI. These features consume local JSON files pro
 - SRT captions clipped at 720x1280 in 1.45.0/1.46.0 because the wrap used the static weight table (tuned for Noto Naskh Arabic) while the renderer uses Noto Sans Arabic Bold, 1.305x wider at the same size. The wrap now measures with HarfBuzz on the real render font: `srt.measure_text_width()` is the single implementation (moved from render.py; render keeps `_measure_text_width` as a delegate), `wrap_lines`/`wrap_subtitle_text` take `measure=(word, size) -> px`, `validate.wrap_caption_lines` takes `font_path`, and render.py's wrapping stage + reveal expansion pass the drawtext font. The Bold unification stays.
 - Proven margins on the reference cue (fresh frames): 38/40px at 360p, 116/118px at 720p (beats 1.44.0's 62px), 149/150px at 1080p. The ASS karaoke path is unaffected (no Python wrap; libass lays out the line). `examples/basic.json` (no captions) is byte-identical across 1.46.0/1.46.1 (md5 0843b0f3…).
 - Regression test class TestLoop1461 (wrap-measured-matches-render + SRT caption fits at 360p/720p/1080p, incl. the inline caption at 720p).
+
+## OTIO export (1.61.0)
+
+- `export_otio` (MCP tool, 34th; CLI `otio <project.json> <out.otio>`)
+  writes an OpenTimelineIO (`.otio`) timeline — stdlib `json` only, no
+  OTIO library code copied, no new dependency. The file opens as an
+  editable timeline in DaVinci Resolve (free edition), Premiere, Final
+  Cut (via OTIO adapters) and Kdenlive.
+- Carries: cuts, clip order, exact timing, transitions (as dissolves),
+  chapter markers, track-1 overlays as V2+ tracks, audio tracks, media
+  references (src exactly as written in project.json — relative paths
+  preserved; keep the .otio next to the project or relink in the editor).
+- Timing is frame-quantized at the project fps by BOUNDARY
+  (round(start * fps)), never by duration, so the OTIO total is exactly
+  round(total * fps). Inside the .otio file every time is an exact
+  integer frame count (this fixes the float-time issue at the
+  interchange boundary).
+- Transitions: AgentCut's xfade ends AT the cut, so the OTIO transition
+  is in_offset=0, out_offset=td and the outgoing clip's source_range is
+  shortened by td. Every overlapping xfade maps to SMPTE_Dissolve;
+  crossfade/dissolve map exactly, wipes/slides keep exact timing with
+  the shape substituted by a dissolve (warning). "fade" and the custom
+  transitions (zoom_out/whip_pan/glitch/light_leak) export as hard cuts
+  (warning).
+- Speed maps to LinearTimeWarp; speed_curve splits into per-segment
+  warped clips; freeze_at maps to FreezeFrame; loop_count maps to N
+  consecutive clips; reverse exports forward (warning — OTIO has no
+  reverse effect). Chapters become 1-frame markers on V1 (OTIO 0.18 has
+  no markers on the Timeline object itself).
+- NOT carried (documented + warned, and recorded in the file's
+  metadata): effects, grades, treatments, texts, captions, diagrams,
+  motion graphics, overlays, Ken Burns/camera, reframe, SFX,
+  adjustments. Captions can be imported separately as .srt.
+  Clip-embedded audio is not exported as separate audio tracks (the
+  media reference still points at the same file).
+- Verification: exported files were parsed by the real `opentimelineio`
+  0.18.1 library and round-tripped with matching clip order, durations
+  and markers. The round-trip test in tests/test_otio.py skips cleanly
+  where the library is not installed (verification tooling, never a
+  dependency). Resolve import itself is UNVERIFIED in this environment
+  (Resolve cannot run here).

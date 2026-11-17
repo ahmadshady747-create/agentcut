@@ -1,3 +1,62 @@
+## 1.61.0 — OTIO Exporter: AgentCut Projects Open in DaVinci Resolve
+
+Ends AgentCut's isolation: any project now exports to an
+OpenTimelineIO (`.otio`) timeline that opens as an editable timeline
+in DaVinci Resolve (free edition), Premiere, Final Cut (via OTIO
+adapters) and Kdenlive. OTIO is Apache-2.0 and its format is JSON, so
+the exporter writes it with the stdlib `json` module only — no OTIO
+library code is copied and no new dependency is added
+(stdlib + FFmpeg, as ever).
+
+### 🔀 OTIO exporter (`src/agentcut/otio.py`, new MCP tool `export_otio`, CLI `otio <project.json> <out.otio>`)
+- **Exact timing**: float seconds become OTIO RationalTime at the
+  project fps, quantized by BOUNDARY (round(start * fps)), never by
+  duration — so the OTIO total is exactly round(total * fps) with no
+  drift. This also fixes the float-time issue at the interchange
+  boundary: inside the .otio file every time is an exact integer
+  frame count.
+- **Transitions**: AgentCut's xfade ends AT the cut (the incoming
+  clip starts transition_duration before the outgoing clip ends), so
+  the OTIO transition is in_offset=0, out_offset=td and the outgoing
+  clip's source_range is shortened by td — the dissolve covers
+  exactly the AgentCut blend window and the total duration matches.
+  Every overlapping xfade maps to SMPTE_Dissolve (the only
+  transition type OTIO adapters widely honour); crossfade/dissolve
+  map exactly, wipes/slides keep exact timing with the shape
+  substituted by a dissolve (recorded in the warnings). "fade"
+  (fade to/from black) and the custom transitions (zoom_out,
+  whip_pan, glitch, light_leak) have no OTIO equivalent and export
+  as hard cuts, with warnings.
+- **Clips**: speed maps to LinearTimeWarp; speed_curve splits into
+  per-segment warped clips; freeze_at maps to FreezeFrame;
+  loop_count maps to N consecutive clips; reverse has no OTIO
+  equivalent and exports forward, with a warning. Chapters become
+  1-frame markers on the first video track. Track-1 clips become
+  V2+ tracks (grouped so no two overlap on one track). Audio tracks
+  become one audio track each. Media references carry the src
+  exactly as written in project.json (relative paths preserved).
+- **Honest boundary (documented in the module, the README and the
+  SKILL)**: OTIO carries cuts, order, timing, transitions, markers
+  and media references ONLY. Effects, grades, treatments, texts,
+  captions, diagrams, motion graphics, overlays, Ken Burns/camera,
+  reframe, SFX and adjustments are NOT carried — the receiving
+  editor rebuilds them by hand. Every dropped feature is listed in
+  the export warnings, and the boundary is also recorded in the
+  exported file's metadata.
+- **Verification**: every exported file was parsed by the real
+  `opentimelineio` 0.18.1 library (temporary venv, verification
+  tooling only) and round-tripped with matching clip order,
+  durations and marker positions. A round-trip test ships in
+  `tests/test_otio.py` and skips cleanly where the library is not
+  installed. DaVinci Resolve import itself is UNVERIFIED in this
+  environment (Resolve cannot run here) — open the file in Resolve
+  to confirm.
+
+### 🧰 Tooling
+- MCP tools 33 → **34** (`export_otio`); CLI gains `otio`.
+- Bumped version to 1.61.0 in `pyproject.toml`, `VERSION` and
+  `agentcut.__version__`; version-pin tests updated.
+
 ## 1.60.0 — The Visual Leap: Pure-Python RGBA Glass Cards, Cinematic B-Roll & Karaoke Captions
 
 Major release bumping AgentCut to `v1.60.0`. Delivers a quantum leap in visual production quality from flat FFmpeg drawbox geometry to commercial broadcast standards (*Vox*, *Bloomberg*, *الاقتصاد الكوكبي*) while strictly maintaining our **Zero External Python Dependencies** constraint (`Python stdlib + FFmpeg` only).

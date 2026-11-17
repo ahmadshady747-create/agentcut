@@ -8612,11 +8612,11 @@ class TestLoop142(unittest.TestCase):
         self.assertIn("-b:a 192k", graph)
         self.assertIn("-ar 48000", graph)
 
-    def test_fix6_version_is_1_60_0(self):
+    def test_fix6_version_is_1_61_0(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "1.60.0")
+        self.assertEqual(agentcut.__version__, "1.61.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.60.0")
+            self.assertEqual(f.read().strip(), "1.61.0")
 
 
 class TestLoop143(unittest.TestCase):

@@ -22,6 +22,7 @@ try:
 except ImportError:  # Windows / platforms without fcntl
     fcntl = None
 
+from .otio import export_otio
 from .render import JobStore, check_brief_conformance, poster_frame, preview_project, produce_explainer, produce_variants, produce_video, render_contact_sheet, render_project, split_clip, timeline_summary
 from .validate import probe_media, validate_project
 
@@ -408,6 +409,12 @@ TOOLS = [
          "border_color": {"type": "string", "description": "Rim border color (default 'rgba(255, 255, 255, 0.25)')."},
          "drop_shadow": {"type": "boolean", "description": "Whether to include soft drop shadow (default true)."}},
          "required": ["width", "height"]}},
+    {"name": "export_otio",
+     "description": "Export a stored project (by id) or a project dict to an OpenTimelineIO (.otio) timeline file — stdlib JSON, no dependency. Carries cuts, clip order, timing, transitions (as dissolves), chapter markers and media references; effects, grades, texts, captions, diagrams and motion are NOT carried (OTIO cannot hold them). Returns the .otio path, duration, counts and warnings. DaVinci Resolve import is unverified in this environment — open the file in Resolve to confirm.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"},
+         "project": {"type": "object"},
+         "output": {"type": "string"}}}},
 ]
 
 
@@ -536,6 +543,32 @@ def call_tool(name, args):
                 return _tool_error({"code": "PROJECT_NOT_FOUND",
                                     "message": pid})
         ok, info = render_contact_sheet(video, out, project=proj)
+        if not ok:
+            return _tool_error(info)
+        return _text(info)
+    if name == "export_otio":
+        # v1.61.0 (34th tool): stored project by id, or a project
+        # dict; output defaults to data/outputs/otio/<id>.otio.
+        if args.get("project") is not None:
+            project = args["project"]
+        elif args.get("id"):
+            if _bad_id(args.get("id")):
+                return _id_error()
+            project = _load_project(args["id"])
+            if project is None:
+                return _tool_error({"code": "PROJECT_NOT_FOUND",
+                                    "message": args["id"]})
+        else:
+            return _tool_error({"code": "INVALID_SCHEMA",
+                                "message": "export_otio needs id or project",
+                                "fix": "pass id of a stored project or a project dict"})
+        out = args.get("output")
+        if not isinstance(out, str) or not out:
+            pid = project.get("id", "timeline") if isinstance(project, dict) else "timeline"
+            out_dir = os.path.join(OUTPUTS, "otio")
+            os.makedirs(out_dir, exist_ok=True)
+            out = os.path.join(out_dir, f"{pid}.otio")
+        ok, info = export_otio(project, out)
         if not ok:
             return _tool_error(info)
         return _text(info)
