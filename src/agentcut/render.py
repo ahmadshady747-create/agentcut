@@ -883,21 +883,45 @@ def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
     looped PNG costs ~0.5s. When argv is None (direct
     callers that bypass build_ffmpeg_args) or PNG generation
     fails, the per-frame geq is used as a fallback.
+
+    v1.63.0 (Task B): the pill stream is INFINITE (looped, no
+    trim) and starts at PTS 0 in main-timeline time, so the
+    overlay's enable window is the only gate. The 1.46.0
+    version trimmed the stream to the cue DURATION
+    (trim=end={end-start}, setpts=PTS-STARTPTS), so the pill
+    frames spanned PTS 0..(end-start) while the overlay
+    window was between(t,start,end): for any cue with
+    start > 0 the pill stream EOF'd before the main timeline
+    reached the cue window, and eof_action=pass dropped the
+    pill entirely — only the first cue (start ~0) ever showed
+    one. The geq fallback never had the bug (its colour
+    source is infinite); the PNG path now matches it.
+
+    v1.63.0 (Task B): the pill also fades with the text — a
+    fast alpha fade in/out (0.12s, clamped to half the cue
+    duration) so cue transitions are not abrupt. The fade
+    filters sit on the pill stream itself (timestamps are
+    main-timeline time), so they track the cue window
+    exactly; very short cues (< 0.02s) skip the fade.
     """
     br = min(int(radius), bw // 2, bh // 2)
     _pp = _pill_png_path(bw, bh, br, color, opacity) if argv is not None else None
+    _fd = min(0.12, max(0.0, (float(end) - float(start)) / 2.0))
+    _fade = ""
+    if _fd > 0.01:
+        _fade = (f",fade=t=in:st={float(start)}:d={_fd:.3f}:alpha=1,"
+                 f"fade=t=out:st={float(end) - _fd:.3f}:d={_fd:.3f}:alpha=1")
     if _pp is not None:
         _pidx = _input_count(argv)
         argv += ["-i", _pp]
         filters.append(
             f"[{_pidx}:v]fps={fps},loop=loop=-1:size=1:start=0,"
-            f"trim=end={end - start},setpts=PTS-STARTPTS,"
-            f"format=rgba[box{overlay_index}]")
+            f"format=rgba{_fade}[box{overlay_index}]")
     else:
         filters.append(
             f"color=c={_ff_color(color)}:s={bw}x{bh}:r={fps},"
             f"format={afmt},geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-            f"a='{_rounded_alpha_factor(br)}*255*{opacity}'[box{overlay_index}]")
+            f"a='{_rounded_alpha_factor(br)}*255*{opacity}'{_fade}[box{overlay_index}]")
     filters.append(
         f"[{vcur}][box{overlay_index}]overlay=x={bx}:y={by}:"
         f"eof_action=pass:enable='between(t,{start},{end})'[vbox{overlay_index}]")
@@ -2656,12 +2680,38 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if "_kb_start" in clip and "_kb_end" in clip:
                 _cs = float(clip["_kb_start"])
                 _ce = float(clip["_kb_end"])
+            # Ken Burns drift (v1.63.0, cinematic only): the
+            # compositor sets _kb_drift (±0.5) on zoom clips — a
+            # slow horizontal drift on top of the zoom, because
+            # a pure centre-anchored zoom on blurred B-roll
+            # moves too few pixels per second (the frame centre
+            # barely moves). The drift is a CONSTANT fraction
+            # of the centre-to-edge slack, so it can never push
+            # the crop out of frame: x = centre * (1 + k),
+            # where centre is exactly half the max x. The
+            # slack itself grows/shrinks with the zoom, so the
+            # drift follows the zoom naturally — an earlier
+            # s-weighted form (x = centre * (1 + k*s)) was too
+            # weak early in a zoom_in, where both the slack
+            # AND s are near zero (probe MAPD 0.465 at t=1-2).
+            # Clips without _kb_drift render byte-identical to
+            # before; pans already cross the full slack.
+            _k = 0.0
+            try:
+                _k = max(-1.0, min(1.0, float(clip.get("_kb_drift") or 0)))
+            except (TypeError, ValueError):
+                _k = 0.0
+            _cx = "iw/2-(iw/zoom/2)"
             if kb == "zoom_in":
                 z = f"{_cs!r}+({_ce!r}-{_cs!r})*{_s}" if _cs is not None else f"1+0.12*{_s}"
-                x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+                x_expr = (f"({_cx})*(1+({_k}))" if _k
+                          else _cx)
+                y_expr = "ih/2-(ih/zoom/2)"
             elif kb == "zoom_out":
                 z = f"{_cs!r}+({_ce!r}-{_cs!r})*{_s}" if _cs is not None else f"1.12-0.12*{_s}"
-                x_expr, y_expr = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+                x_expr = (f"({_cx})*(1+({_k}))" if _k
+                          else _cx)
+                y_expr = "ih/2-(ih/zoom/2)"
             elif kb == "pan_left":
                 z = f"{_cs!r}" if _cs is not None else "1.12"
                 x_expr, y_expr = f"(iw-iw/zoom)*{_s}", "(ih-ih/zoom)/2"
@@ -3229,7 +3279,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             # invisible mid-entrance). Any easing that overshoots
             # (spring, ease_out_back) needs this.
             op_expr = _interp_expr_eased(
-                [(f["time"], f["opacity"], f.get("easing", "linear"))
+                [(f["time"], f["opacity"], f.get("opacity_easing", f.get("easing", "linear")))
                  for f in kfs], f"({seg_start!r}+N/{fps})")
             filters.append(chain + f",format={_afmt}[ovpre{si}]")
             filters.append(f"[ovpre{si}]split=2[ovrgb{si}][ovkeya{si}]")
@@ -3297,7 +3347,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             if ov.get("mask"):
                 factors.append(f"({_mask_factor_expr(ov['mask'])})")
             if op_vary:
-                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
+                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("opacity_easing", f.get("easing", "linear"))) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
                 # v1.62.0: clipped to [0, 1] — geq wraps
                 # out-of-range values modulo 256 instead of
@@ -3339,7 +3389,7 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 # stream (fps-normalised), so overlay time is
                 # seg_start + N/fps. Verified against FFmpeg: geq's T
                 # does not track segment time, N does.
-                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("easing", "linear")) for f in kfs],
+                op_expr = _interp_expr_eased([(f["time"], f["opacity"], f.get("opacity_easing", f.get("easing", "linear"))) for f in kfs],
                                        f"({seg_start!r}+N/{fps})")
                 # v1.62.0: clipped to [0, 1] — geq wraps
                 # out-of-range values modulo 256 instead of
@@ -7531,6 +7581,82 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _validate_scene_word_timings(wt, sid, dur):
+    """Validate a brief scene's explicit word_timings (v1.63.0,
+    Task A): the AgentMedia bundle path — per-word timings from
+    transcription, scene-relative seconds.
+
+    Returns (cleaned_list, error_dict_or_None). cleaned_list is
+    sorted by start, with ends clamped to the scene duration.
+    Rules (documented, enforced with structured errors):
+    - Not a list, or an entry that is not a {word, start, end}
+      object with a non-empty word string and numeric start/end,
+      is INVALID_SCHEMA. end <= start and negative times are
+      INVALID_SCHEMA too.
+    - An EMPTY list means "no explicit timings" (falls back to
+      the in-tool TTS timings, if any): returns ([], None).
+    - Timings OUTSIDE the scene duration are CLAMPED, not
+      rejected: an end past dur is clamped to dur (Whisper
+      timings can overshoot the audio by a rounding epsilon),
+      and a word starting at/after dur is dropped (it has no
+      audio to highlight). Overlapping entries are dropped
+      (the first wins) so the built caption timings always pass
+      project validation (non-overlapping, in order).
+    - A list that validates to empty (every word dropped)
+      returns ([], None): the scene renders plain captions.
+    """
+    if not isinstance(wt, list):
+        return None, {"code": "INVALID_SCHEMA",
+                      "message": f"scene {sid} word_timings must be a list of "
+                                 "{word, start, end} objects",
+                      "fix": f"give scene {sid} word_timings as one "
+                             "{word, start, end} per spoken word, in order"}
+    if not wt:
+        return [], None
+    cleaned = []
+    for wi, w in enumerate(wt):
+        if (not isinstance(w, dict) or not isinstance(w.get("word"), str)
+                or not w["word"].strip()):
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} word_timings entry {wi} "
+                                     "needs a non-empty word string",
+                          "fix": "give each entry as e.g. "
+                                 "{\"word\": \"hello\", \"start\": 1.0, "
+                                 "\"end\": 1.4}"}
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} word_timings entry {wi} "
+                                     "needs numeric start and end",
+                          "fix": "set start/end to scene-relative seconds "
+                                 "inside the scene duration"}
+        if we <= ws:
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} word_timings word {wi} "
+                                     "needs end after start",
+                          "fix": "set end after start for every word"}
+        if ws < 0 or we < 0:
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} word_timings word {wi} "
+                                     "has a negative time",
+                          "fix": "keep word times at or after 0 (scene "
+                                 "start)"}
+        if ws >= dur:
+            continue
+        we = min(we, float(dur))
+        if we <= ws:
+            continue
+        cleaned.append({"word": str(w["word"]), "start": ws, "end": we})
+    cleaned.sort(key=lambda e: (e["start"], e["end"]))
+    deduped = []
+    for entry in cleaned:
+        if deduped and entry["start"] < deduped[-1]["end"] - 0.001:
+            continue
+        deduped.append(entry)
+    return deduped, None
+
+
 def produce_explainer(brief, output_path, review_dir=None):
     """One-button board explainer (v1.39.0): one brief in, one
     finished video out. No hand-written project.json: every
@@ -7615,6 +7741,28 @@ def produce_explainer(brief, output_path, review_dir=None):
     - Optional music: when "music" names a file it is added
       as a music track with deterministic 12 dB ducking
       windows = the narration spans.
+    - Scene word_timings (v1.63.0, Task A): a scene may carry
+      an explicit "word_timings" list of {word, start, end} in
+      scene-relative seconds (the AgentMedia bundle path).
+      The explicit key WINS over the in-tool TTS timings; an
+      explicit [] falls back to the TTS timings. Malformed
+      entries (not a list, missing/non-numeric fields, end <=
+      start, negative times) are INVALID_SCHEMA; ends past the
+      scene duration are clamped to it, words starting at or
+      after it are dropped, and overlapping entries are
+      dropped (first wins). With karaoke captions
+      (captions_style karaoke/karaoke_pill) the timings feed
+      the karaoke path: exact word match uses them as-is,
+      otherwise words are paired positionally with the cue
+      text (Whisper's word text is unreliable, its alignment
+      is the value); when the timing count differs from the
+      cue's word count the windows are reconciled — the
+      adjacent pair with the smallest gap merges while there
+      are too many, the longest window splits at its midpoint
+      while there are too few — so a split or joined Whisper
+      word does not lose the karaoke; a cue with no timings
+      in its window still degrades to a plain caption, never
+      a wrong highlight.
     - Pacing (v1.45.0, R8): "pacing" defaults to true. In a
       LONG scene (>= 13s) the visual beat is 5.0..7.0s: 0-5s
       the scene title appears as a lower_third (spring
@@ -7856,6 +8004,21 @@ def produce_explainer(brief, output_path, review_dir=None):
                            "message": f"scene {sid} narration has no measurable duration: {narration}",
                            "fix": f"replace scene {sid} narration with an audio file ffprobe can read"}
         dur = float(probe["duration"])
+        # v1.63.0 (Task A): an explicit scene-level word_timings
+        # key (AgentMedia bundles) wins over the in-tool TTS
+        # timings; it is validated here, once dur is known (see
+        # _validate_scene_word_timings for the clamp/drop rules).
+        # An explicit [] means "no explicit timings" — the TTS
+        # timings (if any) stand; a non-empty explicit list wins
+        # even if every word was dropped (no karaoke then).
+        _explicit_wt = scene.get("word_timings")
+        if _explicit_wt is not None:
+            _cleaned_wt, _wt_err = _validate_scene_word_timings(
+                _explicit_wt, sid, dur)
+            if _wt_err is not None:
+                return False, _wt_err
+            if _explicit_wt:
+                scene_word_timings = _cleaned_wt or None
         srt_path = scene.get("captions")
         if not isinstance(srt_path, str) or not srt_path:
             return False, {"code": "INVALID_SCHEMA",
@@ -7877,6 +8040,11 @@ def produce_explainer(brief, output_path, review_dir=None):
                       or scene.get("caption_style") in ("karaoke", "karaoke_pill")
                       or brief.get("caption_style") in ("karaoke", "karaoke_pill")
                       or bool(scene.get("kinetic")))
+        # v1.63.0 (Task A): word timings are consumed once — a
+        # word assigned to one cue is never reused by the next
+        # (a boundary word used to match two cues within the
+        # ±0.05 tolerance and break the exact match for one).
+        _used_wt = set()
         for cue in cues:
             if cue["start"] >= dur:
                 continue
@@ -7884,18 +8052,104 @@ def produce_explainer(brief, output_path, review_dir=None):
             c_end = round(start + min(cue["end"], dur), 3)
             cap_entry = {"text": cue["text"], "start": c_start, "end": c_end}
             if is_karaoke and scene_word_timings:
+                # Path 1 (unchanged): whole words inside the cue
+                # window + exact word match (the in-tool TTS
+                # case, where timings and SRT come from the same
+                # engine and the words agree exactly).
                 cue_words = []
-                for wt in scene_word_timings:
+                for wi, wt in enumerate(scene_word_timings):
+                    if wi in _used_wt:
+                        continue
                     if cue["start"] - 0.05 <= wt["start"] and wt["end"] <= cue["end"] + 0.05:
                         cue_words.append({
                             "word": wt["word"],
                             "start": round(start + wt["start"], 3),
                             "end": round(start + min(wt["end"], dur), 3),
+                            "_wis": [wi],
                         })
+                _cue_text_words = str(cue["text"]).split()
                 _w1 = [re.sub(r'[\u064B-\u065F\u0670]', '', w["word"]).strip(".,!?;:()[]\"'") for w in cue_words]
-                _w2 = [re.sub(r'[\u064B-\u065F\u0670]', '', x).strip(".,!?;:()[]\"'") for x in str(cue["text"]).split()]
-                if cue_words and (_w1 == _w2 or [w["word"] for w in cue_words] == str(cue["text"]).split()):
-                    cap_entry["word_timings"] = cue_words
+                _w2 = [re.sub(r'[\u064B-\u065F\u0670]', '', x).strip(".,!?;:()[]\"'") for x in _cue_text_words]
+                _matched = None
+                if cue_words and (_w1 == _w2 or [w["word"] for w in cue_words] == _cue_text_words):
+                    _matched = cue_words
+                else:
+                    # Path 2 (v1.63.0, Task A): positional pairing
+                    # for external timings (Whisper). Whisper's
+                    # Arabic word TEXT is unreliable (its tiny
+                    # model garbles words) but its per-word
+                    # ALIGNMENT is the value — so the WORDS come
+                    # from the cue text (authoritative) and the
+                    # WINDOWS come from the timings. Words are
+                    # assigned by midpoint (a boundary word
+                    # straddling the cue edge still belongs to
+                    # the cue it is mostly spoken in), clamped
+                    # to the cue window so the built project
+                    # passes validation, and paired positionally.
+                    # Count reconciliation (verify fix): Whisper
+                    # often splits or joins words ("السينمائية"
+                    # -> "سنما" + "ايتي"), so the timing count
+                    # rarely equals the cue's word count exactly
+                    # — the strict count match degraded a quarter
+                    # of real cues to plain captions. Instead:
+                    # merge the adjacent pair with the smallest
+                    # gap while there are too many windows (a
+                    # split word's halves are adjacent, gap ~0,
+                    # so the merge restores exactly the split
+                    # word's span), and split the longest window
+                    # at its midpoint while there are too few.
+                    # The total span is preserved either way; a
+                    # cue with NO timings in its window still
+                    # degrades to plain, never a wrong highlight.
+                    _mid_words = []
+                    for wi, wt in enumerate(scene_word_timings):
+                        if wi in _used_wt:
+                            continue
+                        _mid = (float(wt["start"]) + float(wt["end"])) / 2.0
+                        if cue["start"] - 0.05 <= _mid <= cue["end"] + 0.05:
+                            _ws = max(float(wt["start"]), cue["start"])
+                            _we = min(float(wt["end"]), cue["end"])
+                            if _we > _ws:
+                                _mid_words.append({
+                                    "start": round(start + _ws, 3),
+                                    "end": round(start + _we, 3),
+                                    "_wis": [wi],
+                                })
+                    _mw = sorted(_mid_words, key=lambda w: w["start"])
+                    while _mw and len(_mw) > len(_cue_text_words):
+                        _best = min(
+                            range(len(_mw) - 1),
+                            key=lambda i: _mw[i + 1]["start"] - _mw[i]["end"])
+                        _mw[_best:_best + 2] = [{
+                            "start": _mw[_best]["start"],
+                            "end": _mw[_best + 1]["end"],
+                            "_wis": (_mw[_best]["_wis"]
+                                     + _mw[_best + 1]["_wis"]),
+                        }]
+                    while _mw and len(_mw) < len(_cue_text_words):
+                        _longest = max(
+                            range(len(_mw)),
+                            key=lambda i: _mw[i]["end"] - _mw[i]["start"])
+                        _w = _mw[_longest]
+                        _mid_pt = round((_w["start"] + _w["end"]) / 2.0, 3)
+                        if _mid_pt <= _w["start"] or _mid_pt >= _w["end"]:
+                            break  # cannot split further; degrade
+                        _mw[_longest:_longest + 1] = [
+                            {"start": _w["start"], "end": _mid_pt,
+                             "_wis": list(_w["_wis"])},
+                            {"start": _mid_pt, "end": _w["end"],
+                             "_wis": list(_w["_wis"])},
+                        ]
+                    if _mw and len(_mw) == len(_cue_text_words):
+                        _matched = [
+                            {"word": tw, "start": mw["start"],
+                             "end": mw["end"], "_wis": mw["_wis"]}
+                            for tw, mw in zip(_cue_text_words, _mw)]
+                if _matched:
+                    for _mw in _matched:
+                        for _wi in _mw.pop("_wis"):
+                            _used_wt.add(_wi)
+                    cap_entry["word_timings"] = _matched
                     cap_entry["highlight_color"] = scene.get("highlight_color") or brief.get("highlight_color", "yellow")
                     cap_entry["highlight_mode"] = scene.get("highlight_mode", "word")
                     cap_entry["caption_style"] = (scene.get("caption_style")
@@ -8199,20 +8453,65 @@ def produce_explainer(brief, output_path, review_dir=None):
                 ktext["sfx"] = "pop"
             texts.append(ktext)
             # v1.62.0, cinematic Layer 3: a glass card behind
-            # the keyword callout (callout zone 60-70%). The
-            # card hugs the measured text width + padding; the
-            # keyword text (box=False) sits on top of it. A
-            # keyword with an explicit numeric x left-aligns
-            # its card to that x; otherwise the card centres.
+            # the keyword callout (callout zone 60-70%).
+            # v1.63.0 (Task C): the richer default template —
+            # a real card, not a button: at least 60% of the
+            # frame wide (the 1.62.0 card hugged the measured
+            # text, so a one-word keyword read as a small
+            # button), a coloured accent bar + soft shadow on
+            # the card, the keyword as the main title and a
+            # short subtitle line under it (the keyword's own
+            # "subtitle" when given, else the scene title).
+            # The subtitle only renders when the two-line card
+            # fits above the subtitle zone (bottom <= 75% of
+            # the frame); small frames fall back to the
+            # single-line card (the 1.62.0 layout).
             if cinematic:
                 from .compositor import glass_card_overlay
+                _ky = float(ktext.get("y", _kw_y))
                 _card_w = int(round(width * 0.6))
                 if kw_font:
-                    _card_w = int(round(
-                        _measure_text_width(kw_text, kw_font, kw_size)
-                        + 48))
+                    _card_w = max(
+                        _card_w,
+                        int(round(
+                            _measure_text_width(kw_text, kw_font, kw_size)
+                            + 48)))
                 _card_w = max(120, min(_card_w, int(round(0.9 * width))))
+                _sub_text = None
+                _sub_size = max(24, int(round(kw_size * 0.55)))
+                if isinstance(kw.get("subtitle"), str) and kw["subtitle"].strip():
+                    _sub_text = kw["subtitle"].strip()
+                elif (isinstance(stitle, str) and stitle.strip()
+                        and stitle.strip() != kw_text):
+                    _sub_text = stitle.strip()
                 _card_h = int(round(kw_size * 1.4 + 32))
+                _card_y = int(round(_ky - 16))
+                if _sub_text is not None:
+                    _sub_font = find_font_for_text(_sub_text)
+                    if _sub_font:
+                        _smw = _measure_text_width(
+                            _sub_text, _sub_font, _sub_size)
+                        if _smw + 48 > _card_w:
+                            _card_w = max(
+                                _card_w,
+                                min(int(round(_smw + 48)),
+                                    int(round(0.9 * width))))
+                            if _smw + 48 > _card_w:
+                                _sub_size = max(
+                                    20, int(_sub_size * _card_w
+                                            / (_smw + 48)))
+                    _two_h = int(round(kw_size * 1.4 + _sub_size * 1.4 + 40))
+                    if _card_y + _two_h <= int(round(0.75 * height)):
+                        _card_h = _two_h
+                        texts.append({
+                            "text": _sub_text,
+                            "start": round(start + ks, 3),
+                            "end": round(start + ke, 3),
+                            "size": _sub_size, "x": "center",
+                            "y": _ky + kw_size * 1.4 + 4,
+                            "color": "white", "box": False})
+                    else:
+                        _sub_text = None
                 _kx = ktext.get("x", "center")
                 if isinstance(_kx, (int, float)):
                     _card_x = int(round(float(_kx) - 24))
@@ -8220,11 +8519,10 @@ def produce_explainer(brief, output_path, review_dir=None):
                     _card_x = int(round((width - _card_w) / 2))
                 overlays.append(glass_card_overlay(
                     overlay_id=f"comp-card-{sid}-{ki}",
-                    x=_card_x,
-                    y=int(round(float(ktext.get("y", _kw_y)) - 16)),
+                    x=_card_x, y=_card_y,
                     w=_card_w, h=_card_h,
                     start=round(start + ks, 3), duration=round(ke - ks, 3),
-                    width=width,
+                    width=width, accent_bar=True, drop_shadow=True,
                     project_dir=os.path.dirname(
                         os.path.abspath(output_path))))
         scenes.append({"id": sid, "title": stitle, "start": round(start, 3),

@@ -57,10 +57,10 @@ def _v1_transitions(timeline):
 
 class TestOtioExporter(unittest.TestCase):
 
-    def test_version_is_1_62_0(self):
-        self.assertEqual(__version__, "1.62.0")
+    def test_version_is_1_63_0(self):
+        self.assertEqual(__version__, "1.63.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.62.0")
+            self.assertEqual(f.read().strip(), "1.63.0")
 
     def test_tool_count_is_34_and_export_otio_listed(self):
         names = [t["name"] for t in TOOLS]

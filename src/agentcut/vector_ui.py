@@ -151,10 +151,16 @@ def render_glass_card_png(
     shadow_opacity: float = 0.35,
     shadow_offset_y: float = 6.0,
     padding: int = 16,
+    accent_bar: bool = False,
+    accent_color: Any = "#F59E0B",
+    accent_width: float = 6.0,
 ) -> bytes:
     """Render a premium Glassmorphism Card with sub-pixel anti-aliasing and drop shadow.
 
-    Returns raw PNG bytes.
+    accent_bar (v1.63.0, Task C) draws a solid coloured bar on the
+    card's left edge, inset by the corner radius top and bottom so
+    it never sticks past the rounding — the richer default card
+    template's highlight. Returns raw PNG bytes.
     """
     pad = int(padding if drop_shadow else 0)
     total_w = width + 2 * pad
@@ -163,6 +169,7 @@ def render_glass_card_png(
     top_r, top_g, top_b, top_a = parse_color_rgba(bg_color_top, 210)
     bot_r, bot_g, bot_b, bot_a = parse_color_rgba(bg_color_bottom, 235)
     bord_r, bord_g, bord_b, bord_a = parse_color_rgba(border_color, 60)
+    acc_r, acc_g, acc_b, _acc_a = parse_color_rgba(accent_color, 255)
 
     cx = total_w / 2.0
     cy = total_h / 2.0
@@ -243,6 +250,21 @@ def render_glass_card_png(
                     ca = (bg_a * (1.0 - b_alpha_f) + bord_a * b_alpha_f) * card_mask
                 else:
                     cr, cg, cb, ca = bg_r, bg_g, bg_b, bg_a * card_mask
+                # Accent bar (v1.63.0): a solid bar on the card's
+                # left edge, card-relative x in [0, accent_width),
+                # inset by the corner radius vertically so it
+                # never crosses the rounded corners. It overrides
+                # the background (and the rim) with the accent
+                # colour at near-full opacity, masked by the card
+                # shape so the bar's own ends anti-alias with it.
+                if accent_bar:
+                    _ax = x - pad
+                    _ay = y - pad
+                    if (0 <= _ax < accent_width
+                            and border_radius <= _ay
+                            <= height - border_radius):
+                        cr, cg, cb = float(acc_r), float(acc_g), float(acc_b)
+                        ca = max(ca, 242.0 * card_mask)
             else:
                 cr, cg, cb, ca = 0.0, 0.0, 0.0, 0.0
 
@@ -462,6 +484,8 @@ def get_cached_glass_card(
     border_width: float = 1.5,
     border_color: Any = "rgba(255, 255, 255, 0.22)",
     drop_shadow: bool = True,
+    accent_bar: bool = False,
+    accent_color: Any = "#F59E0B",
     project_dir: str | Path | None = None,
 ) -> str:
     """Return absolute path to cached glass card PNG, rendering it if not cached."""
@@ -476,6 +500,8 @@ def get_cached_glass_card(
         "bw": border_width,
         "bc": str(border_color),
         "ds": drop_shadow,
+        "ab": accent_bar,
+        "ac": str(accent_color),
     }
     h = hashlib.sha256(json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     file_path = cache_dir / f"glass_card_{h}.png"
@@ -490,6 +516,8 @@ def get_cached_glass_card(
             border_width=border_width,
             border_color=border_color,
             drop_shadow=drop_shadow,
+            accent_bar=accent_bar,
+            accent_color=accent_color,
         )
         file_path.write_bytes(png_bytes)
 

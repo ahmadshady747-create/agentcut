@@ -5112,14 +5112,27 @@ def validate_project(project):
                     # the render can apply it to scale, position
                     # and opacity alike. An unknown value is a
                     # validation error with a fix, never a silent
-                    # fall back to linear.
+                    # fall back to linear. v1.63.0: a keyframe may
+                    # also set opacity_easing (default: the
+                    # keyframe's easing) so the fade can ease
+                    # differently from the move — the glass card's
+                    # entrance slides on a spring but fades
+                    # linearly over the full 0.25s (a spring fade
+                    # completes in ~0.05s, which is a pop, not a
+                    # fade).
                     ev = kf.get("easing", "linear")
                     if not isinstance(ev, str) or ev not in EASING_VALUES:
                         errors.append(err("INVALID_SCHEMA", "keyframe easing must be one of: " + ", ".join(sorted(EASING_VALUES)), field="overlays.keyframes.easing", clip_id=oid,
                                           fix="set easing to one of: " + ", ".join(sorted(EASING_VALUES)) + ", or remove it"))
                         bad_kf = True
                         break
-                    raw_kfs.append((kt, vals, ev))
+                    oev = kf.get("opacity_easing", ev)
+                    if not isinstance(oev, str) or oev not in EASING_VALUES:
+                        errors.append(err("INVALID_SCHEMA", "keyframe opacity_easing must be one of: " + ", ".join(sorted(EASING_VALUES)), field="overlays.keyframes.opacity_easing", clip_id=oid,
+                                          fix="set opacity_easing to one of: " + ", ".join(sorted(EASING_VALUES)) + ", or remove it"))
+                        bad_kf = True
+                        break
+                    raw_kfs.append((kt, vals, ev, oev))
                 if not bad_kf:
                     # Resolve base position pixels for preset positions:
                     # the overlay's display size at its base scale.
@@ -5139,12 +5152,14 @@ def validate_project(project):
                     base_x = rov.get("x", int(round(_preset_xy[rov["position"]][0])))
                     base_y = rov.get("y", int(round(_preset_xy[rov["position"]][1])))
                     filled = []
-                    cur = {"x": base_x, "y": base_y, "scale": float(rov["size"]), "opacity": float(rov["opacity"]), "easing": "linear"}
-                    for kt, vals, ev in raw_kfs:
-                        cur = {**cur, **vals, "easing": ev}
+                    cur = {"x": base_x, "y": base_y, "scale": float(rov["size"]), "opacity": float(rov["opacity"]), "easing": "linear", "opacity_easing": "linear"}
+                    for kt, vals, ev, oev in raw_kfs:
+                        cur = {**cur, **vals, "easing": ev,
+                               "opacity_easing": oev}
                         filled.append({"time": kt, "x": cur["x"], "y": cur["y"],
                                        "scale": cur["scale"], "opacity": cur["opacity"],
-                                       "easing": cur["easing"]})
+                                       "easing": cur["easing"],
+                                       "opacity_easing": cur["opacity_easing"]})
                     scales = {f["scale"] for f in filled}
                     if kind == "video" and len(scales) > 1 and rov["duration"] > rov.get("source_duration", rov["duration"]) + 0.01:
                         errors.append(err("INVALID_SCHEMA", "scale keyframes on a looping video overlay are not supported", field="overlays.keyframes.scale", clip_id=oid,

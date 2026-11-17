@@ -87,6 +87,23 @@ GRADIENT_TREATMENT: Dict[str, float] = {
 KEN_BURNS_CYCLE: Tuple[str, ...] = ("zoom_in", "zoom_out",
                                     "pan_left", "pan_right")
 
+# Ken Burns drift (v1.63.0, verify fix): a pure centre-anchored
+# zoom on a blurred dark B-roll moves too few pixels per second
+# (MAPD 1.1 between frames 1s apart, under the 1.5 bar) — the
+# centre of the frame barely moves. The classic Ken Burns move
+# is a zoom AND a drift, so zoom_in/zoom_out clips also drift
+# horizontally by up to this fraction of the available slack
+# (the centre-to-edge distance, at most 5.4% of the width at
+# 1.12x — so 0.8 means at most ~4.3% of the width, ~31px at
+# 720p, over the scene; the crop's right edge stays at 98.9%
+# of the frame, so no edge ever shows). The sign alternates by
+# scene index so consecutive scenes drift opposite ways. Pans
+# already cross the full slack, so they get no drift. render.py
+# reads the clip's _kb_drift key (the _kb_start convention);
+# non-cinematic clips never carry it, so their renders are
+# unchanged.
+KB_DRIFT_FRACTION = 0.8
+
 # Layer 2 punch timing: a punch every PUNCH_INTERVAL seconds, peaking
 # at PUNCH_PEAK x the base size, rising/falling over PUNCH_HALF_WIDTH
 # seconds each side. The entrance runs ENTRANCE_DURATION seconds.
@@ -94,6 +111,19 @@ PUNCH_INTERVAL = 5.0
 PUNCH_PEAK = 1.15
 PUNCH_HALF_WIDTH = 0.4
 ENTRANCE_DURATION = 0.6
+# Layer 2 breathing (v1.63.0, Task C): a subtle continuous
+# scale/float oscillation so the subject never freezes between
+# its entrance and its first punch (the 1.62.0 proof was static
+# 0.6–5.0s). ±2% of base size + a ±12px vertical float (at 720p,
+# scaling with width), 4s period, keyframes every 1s; punch
+# windows own their own times (breathing skips them). The float
+# is in phase with the scale sine (the subject rises as it
+# grows) and starts at the entrance landing, so the first
+# breath grows out of the entrance instead of jumping.
+BREATHE_AMPLITUDE = 0.02
+BREATHE_FLOAT_PX = 12.0
+BREATHE_PERIOD = 4.0
+BREATHE_STEP = 1.0
 # Base subject size (fraction of output width) is clamped so the punch
 # peak never exceeds the overlay scale limit (1.0) and the entrance
 # scale never drops below it (0.05): base <= 1.0/1.15, base >= 0.055.
@@ -110,8 +140,15 @@ GRADIENT_STOPS: Tuple[Tuple[float, Tuple[int, int, int]], ...] = (
 )
 GRADIENT_GLOW_CENTER = (0.30, 0.14)   # fraction of (width, height)
 GRADIENT_GLOW_COLOR = (255, 190, 120)
-GRADIENT_GLOW_PEAK = 30               # max brightness added (0..255)
-GRADIENT_GLOW_RADIUS = 0.62           # fraction of max(width, height)
+# v1.63.0 (Task C): a stronger, tighter glow (was peak 30 /
+# radius 0.62) so the mandatory Ken Burns drift over the
+# gradient is actually VISIBLE — the 1.62.0 gradient was so
+# smooth that a 1.0->1.12x zoom over 5s read as a frozen frame
+# (measured MAPD 0.38 between frames 1s apart). The glow edge
+# is now steep enough for the zoom to move it perceptibly,
+# while the gradient stays dark and legible behind text.
+GRADIENT_GLOW_PEAK = 56               # max brightness added (0..255)
+GRADIENT_GLOW_RADIUS = 0.45           # fraction of max(width, height)
 
 
 def zone_rect(zone: str, width: int, height: int) -> Tuple[int, int, int, int]:
@@ -235,30 +272,58 @@ def cinematic_layer1_clip(clip: Dict[str, Any], scene_index: int = 0,
     treatment overrides the default (the generated gradient
     background uses GRADIENT_TREATMENT — it is already dark with
     a baked vignette, so the B-roll darkening would make it
-    near-black). Returns the same dict.
+    near-black). Zoom clips also get a _kb_drift (v1.63.0): a
+    slow horizontal drift on top of the zoom, alternating
+    direction by scene index, so the background never reads as
+    frozen on blurred B-roll. Returns the same dict.
     """
     clip["treatment"] = dict(treatment if treatment is not None
                              else CINEMATIC_TREATMENT)
     if clip.get("kind") == "image" and not clip.get("ken_burns"):
         clip["ken_burns"] = KEN_BURNS_CYCLE[scene_index % len(KEN_BURNS_CYCLE)]
+    if (clip.get("kind") == "image"
+            and clip.get("ken_burns") in ("zoom_in", "zoom_out")
+            and "_kb_drift" not in clip):
+        clip["_kb_drift"] = (KB_DRIFT_FRACTION if scene_index % 2 == 0
+                             else -KB_DRIFT_FRACTION)
     return clip
+
+
+def breathe_float_y(t: float, width: int) -> float:
+    """Vertical breathing offset (px) at overlay-relative time t.
+
+    0 before the entrance landing (t < 0.6s); afterwards a sine
+    at the breathing period, in phase with the scale sine, so
+    the subject rises as it grows and settles as it shrinks.
+    Scales with the output width (6px at 720p).
+    """
+    if t < ENTRANCE_DURATION:
+        return 0.0
+    return (BREATHE_FLOAT_PX * (float(width) / 720.0)
+            * math.sin(2.0 * math.pi * (t - ENTRANCE_DURATION)
+                       / BREATHE_PERIOD))
 
 
 def subject_keyframes(duration: float, base_size: float,
                       cx: float, cy: float, aspect: float,
                       width: int) -> List[Dict[str, Any]]:
-    """Entrance + punch-in keyframes for a Layer 2 subject overlay.
+    """Entrance + breathing + punch-in keyframes for a Layer 2
+    subject overlay.
 
     Times are overlay-relative seconds. The entrance (0 -> 0.6s)
     fades opacity 0 -> 1 and grows scale 0.92x -> 1.0x base with a
     spring easing. Then a measured punch every PUNCH_INTERVAL
     seconds: scale base -> 1.15x base -> base over 0.8s with
-    ease_in_out. Every keyframe carries x/y computed from its
-    scale, so the subject grows IN PLACE around its centre
-    (cx, cy): x = cx - scale*W/2, y = cy - scale*W*aspect/2.
-    Scale values are ABSOLUTE (fraction of output width), never
-    stacked on Ken Burns (the 1.37.2 rule); the peak is at most
-    0.85 * 1.15 = 0.98 of the frame width.
+    ease_in_out. Between entrance and punches (v1.63.0, Task C)
+    the subject BREATHES: a subtle ±2% scale oscillation plus a
+    ±6px vertical float (4s period, 1s keyframe steps) so the
+    scene never freezes — the punch windows own their own times
+    and breathing skips them. Every keyframe carries x/y computed
+    from its scale, so the subject grows IN PLACE around its
+    centre (cx, cy): x = cx - scale*W/2, y = cy - scale*W*aspect/2
+    + breathe_float_y(t). Scale values are ABSOLUTE (fraction of
+    output width), never stacked on Ken Burns (the 1.37.2 rule);
+    the peak is at most 0.85 * 1.15 = 0.98 of the frame width.
     """
     dur = float(duration)
     base = min(SUBJECT_SIZE_MAX, max(SUBJECT_SIZE_MIN, float(base_size)))
@@ -268,7 +333,7 @@ def subject_keyframes(duration: float, base_size: float,
         w = scale * width
         h = w * aspect
         x = max(0, int(round(cx - w / 2.0)))
-        y = max(0, int(round(cy - h / 2.0)))
+        y = max(0, int(round(cy - h / 2.0 + breathe_float_y(t, width))))
         return {"time": round(float(t), 3), "x": x, "y": y,
                 "scale": round(float(scale), 4),
                 "opacity": round(float(opacity), 3), "easing": easing}
@@ -279,12 +344,28 @@ def subject_keyframes(duration: float, base_size: float,
                 _kf(dur, base, 1.0, "spring")]
     kfs = [_kf(0.0, base * 0.92, 0.0),
            _kf(ENTRANCE_DURATION, base, 1.0, "spring")]
+    punch_centers = []
     center = PUNCH_INTERVAL
     while center + PUNCH_HALF_WIDTH <= dur - 0.05:
+        punch_centers.append(center)
         kfs.append(_kf(center - PUNCH_HALF_WIDTH, base, 1.0))
         kfs.append(_kf(center, base * PUNCH_PEAK, 1.0, "ease_in_out"))
         kfs.append(_kf(center + PUNCH_HALF_WIDTH, base, 1.0, "ease_in_out"))
         center += PUNCH_INTERVAL
+    # Breathing (v1.63.0): 1s steps from t=1.0, skipping any step
+    # within a punch window (half-width + 0.1s margin). The sine
+    # starts at the entrance landing so the first breath grows
+    # out of the entrance instead of jumping.
+    bt = 1.0
+    while bt < dur - 0.05:
+        if all(abs(bt - pc) > PUNCH_HALF_WIDTH + 0.1
+               for pc in punch_centers):
+            bs = base * (1.0 + BREATHE_AMPLITUDE * math.sin(
+                2.0 * math.pi * (bt - ENTRANCE_DURATION)
+                / BREATHE_PERIOD))
+            kfs.append(_kf(bt, bs, 1.0))
+        bt += BREATHE_STEP
+    kfs.sort(key=lambda f: f["time"])
     if kfs[-1]["time"] < dur:
         kfs.append(_kf(dur, base, 1.0))
     return kfs
@@ -346,37 +427,93 @@ def subject_overlay(overlay_id: str, src: str, start: float,
     }
 
 
+# Glass-card entrance/exit (v1.63.0, Task C): the hard cut is
+# gone — the card slides up 18px with a spring ease and fades
+# in over 0.25s, and fades out over the last 0.20s.
+CARD_SLIDE_PX = 18
+CARD_FADE_IN = 0.25
+CARD_FADE_OUT = 0.20
+# The shadow padding render_glass_card_png adds around the card
+# when drop_shadow is on (vector_ui padding=16): the PNG grows
+# by 2*pad on each side and the card sits pad px inside it.
+CARD_SHADOW_PAD = 16
+
+
 def glass_card_overlay(overlay_id: str, x: int, y: int, w: int, h: int,
                        start: float, duration: float, width: int,
                        project_dir: Optional[str] = None,
                        bg_color_top: str = "rgba(30, 41, 59, 0.82)",
                        bg_color_bottom: str = "rgba(15, 23, 42, 0.92)",
-                       border_radius: float = 24.0) -> Dict[str, Any]:
+                       border_radius: float = 24.0,
+                       accent_bar: bool = False,
+                       accent_color: str = "#F59E0B",
+                       drop_shadow: bool = False) -> Dict[str, Any]:
     """Build a Layer 3 glass-card backdrop overlay dict.
 
     The card PNG comes from vector_ui.get_cached_glass_card
     (content-hash cached in .agentcut_cache). drop_shadow is off
-    so the PNG is exactly w x h and the overlay rect matches the
-    card rect. The overlay's size fraction is w / width; the
-    caller places a text item over the same rect separately.
+    by default, so the PNG is exactly w x h and the overlay
+    rect matches the card rect; with drop_shadow on, the PNG
+    grows by the 16px shadow padding on each side and the
+    overlay rect shifts by that padding so the CARD still lands
+    at (x, y). accent_bar draws a coloured bar on the card's
+    left edge (the richer default template). The overlay's size
+    fraction is w / width (or the shadowed PNG width / width);
+    the caller places text items over the card rect separately.
+
+    v1.63.0 (Task C): the card no longer hard-cuts in and out —
+    it carries entrance/exit keyframes: slide_up 18px with a
+    spring ease + fade in over 0.25s, fade out over 0.20s.
+    Short cards (< 0.45s) skip the exit fade; the entrance
+    shortens to half the duration instead of overrunning it.
     """
     w = max(2, int(w))
     h = max(2, int(h))
+    dur = round(float(duration), 3)
     card_path = get_cached_glass_card(
         width=w, height=h, border_radius=border_radius,
         bg_color_top=bg_color_top, bg_color_bottom=bg_color_bottom,
-        drop_shadow=False, project_dir=project_dir)
-    size = min(1.0, max(0.05, w / float(width)))
+        drop_shadow=drop_shadow, accent_bar=accent_bar,
+        accent_color=accent_color, project_dir=project_dir)
+    pad = CARD_SHADOW_PAD if drop_shadow else 0
+    png_w = w + 2 * pad
+    ox = max(0, int(x) - pad)
+    oy = max(0, int(y) - pad)
+    size = min(1.0, max(0.05, png_w / float(width)))
+    size_r = round(float(size), 4)
+    in_dur = min(CARD_FADE_IN, dur / 2.0)
+    out_dur = min(CARD_FADE_OUT, max(0.0, dur - in_dur))
+    # The entrance slides on a spring (Task C) but fades LINEARLY:
+    # a spring fade completes in ~0.05s (66% at u=0.12), which is
+    # a pop, not the specified 0.25s fade. opacity_easing (v1.63.0)
+    # lets the fade ease differently from the move.
+    kfs = [
+        {"time": 0.0, "x": ox, "y": oy + CARD_SLIDE_PX,
+         "scale": size_r, "opacity": 0.0, "easing": "linear",
+         "opacity_easing": "linear"},
+        {"time": round(in_dur, 3), "x": ox, "y": oy,
+         "scale": size_r, "opacity": 1.0, "easing": "spring",
+         "opacity_easing": "linear"},
+    ]
+    if out_dur > 0.01 and dur - out_dur > in_dur:
+        kfs.append({"time": round(dur - out_dur, 3), "x": ox, "y": oy,
+                    "scale": size_r, "opacity": 1.0, "easing": "linear"})
+        kfs.append({"time": dur, "x": ox, "y": oy,
+                    "scale": size_r, "opacity": 0.0, "easing": "linear"})
+    elif kfs[-1]["time"] < dur:
+        kfs.append({"time": dur, "x": ox, "y": oy,
+                    "scale": size_r, "opacity": 1.0, "easing": "linear"})
     return {
         "id": overlay_id,
         "kind": "image",
         "src": card_path,
         "start": round(float(start), 3),
-        "duration": round(float(duration), 3),
-        "size": round(float(size), 4),
-        "x": max(0, int(x)),
-        "y": max(0, int(y)),
+        "duration": dur,
+        "size": size_r,
+        "x": ox,
+        "y": oy,
         "opacity": 1.0,
+        "keyframes": kfs,
     }
 
 

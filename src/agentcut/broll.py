@@ -59,10 +59,21 @@ def build_broll_filter_chain(
     filters.append(f"scale={width}:{height}:force_original_aspect_ratio=increase")
     filters.append(f"crop={width}:{height}")
 
-    # 2. Camera motion for static images
+    # 2. Camera motion for static images (v1.63.0, Task C):
+    # mandatory continuous Ken Burns over the WHOLE duration —
+    # a smoothstep zoom 1.0 -> 1.12x (slow start, faster middle,
+    # slow landing), centre-anchored, matching render.py's clip
+    # chain exactly. The old linear ramp (min(zoom+0.0008,1.12),
+    # top-left anchored) started and stopped mechanically and
+    # drifted off-centre.
     if not is_video:
         num_frames = max(1, int(round(duration * fps)))
-        filters.append(f"zoompan=z='min(zoom+0.0008,1.12)':d={num_frames}:s={width}x{height}:fps={fps}")
+        _p = f"on/{num_frames}"
+        _s = f"({_p})*({_p})*(3-2*({_p}))"
+        filters.append(
+            f"zoompan=z='1+0.12*{_s}':x='iw/2-(iw/zoom/2)':"
+            f"y='ih/2-(ih/zoom/2)':d={num_frames}:"
+            f"s={width}x{height}:fps={fps}")
 
     # 3. Cinematic Depth of Field & Legibility Grading
     if blur_sigma > 0:

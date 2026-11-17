@@ -22,6 +22,10 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agentcut.compositor import (
+    BREATHE_AMPLITUDE,
+    CARD_FADE_IN,
+    CARD_FADE_OUT,
+    CARD_SLIDE_PX,
     CINEMATIC_TREATMENT,
     COMPOSITOR_ZONES,
     KEN_BURNS_CYCLE,
@@ -29,6 +33,7 @@ from agentcut.compositor import (
     PUNCH_INTERVAL,
     PUNCH_PEAK,
     apply_compositor_to_project,
+    breathe_float_y,
     cinematic_layer1_clip,
     glass_card_overlay,
     png_dimensions,
@@ -202,34 +207,56 @@ class TestCompositorUnits(unittest.TestCase):
             zone_rect("nowhere", 720, 1280)
 
     def test_subject_keyframes_entrance_and_punch(self):
+        # v1.63.0: breathing keyframes join the timeline, so the
+        # test locates keyframes by time instead of by index.
         kfs = subject_keyframes(8.0, 0.5, 360.0, 500.0, 1.0, 720)
-        times = [kf["time"] for kf in kfs]
-        self.assertEqual(times, [0.0, 0.6, 4.6, 5.0, 5.4, 8.0])
+        by_time = {kf["time"]: kf for kf in kfs}
         # Entrance: invisible and slightly small, landing at base.
-        self.assertEqual(kfs[0]["opacity"], 0.0)
-        self.assertAlmostEqual(kfs[0]["scale"], 0.46, places=3)
-        self.assertEqual(kfs[1]["opacity"], 1.0)
-        self.assertEqual(kfs[1]["scale"], 0.5)
-        self.assertEqual(kfs[1]["easing"], "spring")
+        self.assertEqual(by_time[0.0]["opacity"], 0.0)
+        self.assertAlmostEqual(by_time[0.0]["scale"], 0.46, places=3)
+        self.assertEqual(by_time[0.6]["opacity"], 1.0)
+        self.assertEqual(by_time[0.6]["scale"], 0.5)
+        self.assertEqual(by_time[0.6]["easing"], "spring")
         # Punch at 5s: base -> 1.15x base -> base over 0.8s.
-        self.assertEqual(kfs[3]["scale"], round(0.5 * PUNCH_PEAK, 4))
-        self.assertEqual(kfs[3]["time"], PUNCH_INTERVAL)
-        self.assertEqual(kfs[2]["time"], PUNCH_INTERVAL - PUNCH_HALF_WIDTH)
-        self.assertEqual(kfs[4]["time"], PUNCH_INTERVAL + PUNCH_HALF_WIDTH)
-        self.assertEqual(kfs[3]["easing"], "ease_in_out")
+        self.assertEqual(by_time[5.0]["scale"], round(0.5 * PUNCH_PEAK, 4))
+        self.assertEqual(by_time[4.6]["time"],
+                         PUNCH_INTERVAL - PUNCH_HALF_WIDTH)
+        self.assertEqual(by_time[5.4]["time"],
+                         PUNCH_INTERVAL + PUNCH_HALF_WIDTH)
+        self.assertEqual(by_time[5.0]["easing"], "ease_in_out")
+        # Breathing (v1.63.0): a +/-2% scale oscillation at 1s
+        # steps from t=1.0, skipping the punch window — there is
+        # no breathing keyframe at 5.0 (the punch owns it).
+        for t in (1.0, 2.0, 3.0, 4.0, 6.0, 7.0):
+            self.assertIn(t, by_time)
+            self.assertAlmostEqual(by_time[t]["scale"], 0.5,
+                                   delta=0.5 * BREATHE_AMPLITUDE + 0.001)
+            self.assertEqual(by_time[t]["opacity"], 1.0)
         # The peak is ABSOLUTE scale, never stacked: at most 0.85*1.15.
         self.assertLessEqual(max(kf["scale"] for kf in kfs), 0.85 * 1.15)
+        # Times strictly increase and the last keyframe lands on
+        # the duration at base scale.
+        times = [kf["time"] for kf in kfs]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(times[-1], 8.0)
+        self.assertEqual(by_time[8.0]["scale"], 0.5)
 
     def test_subject_keyframes_grow_in_place(self):
         cx, cy, width = 360.0, 500.0, 720
         kfs = subject_keyframes(12.0, 0.5, cx, cy, 1.0, width)
         for kf in kfs:
-            # The subject's centre stays fixed as its scale changes
-            # (within 1px of rounding): x + scale*W/2 == cx.
+            # The subject's centre stays fixed horizontally as
+            # its scale changes (within 1px of rounding):
+            # x + scale*W/2 == cx. Vertically the centre follows
+            # the breathing float (v1.63.0): y + scale*W/2 ==
+            # cy + breathe_float_y(t) — the float is a deliberate
+            # bob, not a drift off-centre.
             centre_x = kf["x"] + kf["scale"] * width / 2.0
             centre_y = kf["y"] + kf["scale"] * width * 1.0 / 2.0
             self.assertAlmostEqual(centre_x, cx, delta=1.0)
-            self.assertAlmostEqual(centre_y, cy, delta=1.0)
+            self.assertAlmostEqual(
+                centre_y, cy + breathe_float_y(kf["time"], width),
+                delta=1.0)
 
     def test_subject_keyframes_short_duration(self):
         kfs = subject_keyframes(1.0, 0.5, 360.0, 500.0, 1.0, 720)
@@ -292,7 +319,25 @@ class TestCompositorUnits(unittest.TestCase):
         self.assertEqual(ov["size"], round(600 / 720, 4))
         self.assertEqual(ov["start"], 1.0)
         self.assertEqual(ov["duration"], 3.0)
-        self.assertNotIn("keyframes", ov)
+        # v1.63.0: the card slides up 18px with a spring ease and
+        # fades in over 0.25s, then fades out over the last 0.20s
+        # — no more hard cut. Keyframe times are scene-relative.
+        kfs = ov["keyframes"]
+        self.assertEqual([kf["time"] for kf in kfs],
+                         [0.0, CARD_FADE_IN, 3.0 - CARD_FADE_OUT, 3.0])
+        self.assertEqual(kfs[0]["opacity"], 0.0)
+        self.assertEqual(kfs[0]["y"], 800 + CARD_SLIDE_PX)
+        self.assertEqual(kfs[1]["opacity"], 1.0)
+        self.assertEqual(kfs[1]["y"], 800)
+        self.assertEqual(kfs[1]["easing"], "spring")
+        # The slide is spring but the fade is linear: a spring
+        # fade completes in ~0.05s (a pop), not the specified
+        # 0.25s fade.
+        self.assertEqual(kfs[1]["opacity_easing"], "linear")
+        self.assertEqual(kfs[2]["opacity"], 1.0)
+        self.assertEqual(kfs[2]["y"], 800)
+        self.assertEqual(kfs[3]["opacity"], 0.0)
+        self.assertEqual(kfs[3]["y"], 800)
         # drop_shadow=False, so the PNG is exactly w x h and the
         # overlay rect matches the card rect.
         self.assertTrue(os.path.isfile(ov["src"]))

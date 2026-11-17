@@ -2,7 +2,7 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-1.62.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.63.0-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20Tools-34%20tools-purple.svg)](src/agentcut/server.py)
@@ -105,6 +105,27 @@ Ken Burns/camera moves, reframe, SFX and adjustments. The receiving
 editor rebuilds those by hand; every dropped feature is listed in
 the export warnings. Resolve import itself is unverified in this
 environment — open the file in Resolve to confirm.
+
+---
+
+## 🎬 Cinematic, Fixed and Alive (`v1.63.0`): Bundle Karaoke, the Pill on Every Cue, Continuous Motion
+
+With **v1.63.0** the cinematic compositor grows up: `produce_explainer`
+takes a scene-level `word_timings` key — the Whisper timings from an
+AgentMedia scene bundle feed the karaoke path directly (the explicit
+key wins over in-tool TTS timings; malformed timings are rejected with
+a clear error, out-of-range ends clamp to the scene duration). The
+subtitle pill that vanished after the first cue is fixed — every cue
+gets its own pill, sized to that cue's line width, with a 0.12s fade —
+and the frame never freezes: the background Ken Burns is a smoothstep
+zoom over the whole scene (the generated gradient moves too), the
+foreground subject breathes (±2% scale, 4s period), and glass cards
+slide up 18px with a spring ease + fade instead of hard-cutting in and
+out. The default keyword card is now a real card: at least 60% of the
+frame wide, a coloured accent bar, the keyword as the title, a short
+subtitle line, and a soft shadow. Verified end to end with real assets
+by `scripts/verify_real_cinematic.py` (AgentMedia bundle → two 720x1280
+renders → pill, motion, speech and karaoke assertions).
 
 ---
 

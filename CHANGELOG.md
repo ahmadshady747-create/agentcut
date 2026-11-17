@@ -1,3 +1,135 @@
+## 1.63.0 — Scene word_timings + Pill Fix + Continuous Motion + Glass-Card Upgrade
+
+The user eye-checked the 1.62.0 proof render and found real defects;
+this release fixes them and wires AgentMedia bundles into karaoke.
+
+### Task A — scene-level `word_timings` in produce_explainer
+- New scene key `word_timings`: [{word, start, end}] in seconds,
+  relative to scene start. The explicit key wins over in-tool TTS
+  timings; an explicit `[]` keeps the TTS timings; a non-empty list
+  wins even if every word was dropped (no karaoke then).
+- Validation (`_validate_scene_word_timings`): not-a-list, non-dict
+  entries, missing/empty words, non-numeric or negative times and
+  end<=start are rejected with INVALID_SCHEMA + a fix hint. Ends
+  past the scene duration CLAMP to it; words starting at/after the
+  duration are DROPPED; overlaps drop (first wins); entries sort by
+  start.
+- Cue matching, two paths: Path 1 unchanged (whole word inside the
+  cue window ±0.05 + exact word match — the TTS case). Path 2 (new):
+  positional pairing for external/Whisper timings — the cue text
+  supplies the words (authoritative; Whisper's Arabic word TEXT is
+  unreliable), the timings supply the windows; windows clamp to the
+  cue; anything else degrades to a plain caption. Count mismatches
+  are RECONCILED, not degraded: Whisper splits/joins words, so
+  while there are too many windows the adjacent pair with the
+  smallest gap merges (a split word's halves are adjacent), and
+  while there are too few the longest window splits at its
+  midpoint; the total span is preserved. A word is consumed once
+  across cues (a boundary word no longer matches two cues).
+- AgentMedia 0.12.1 wires `to_agentcut_brief()` to pass the timings
+  through and render karaoke from them.
+
+### Task B — subtitle pill on every cue (root cause found + fixed)
+- Reproduced: the pill showed on scene 1 cue 1 only. Root cause —
+  NOT a cache collision: each pill stream was trimmed to the cue
+  duration (`trim=end={end-start}`) while the overlay enable window
+  was in MAIN time, so for any cue with start > 0 the pill stream
+  EOF'd before the timeline reached the cue window and
+  `eof_action=pass` dropped it. Cue 1 worked only because its
+  window roughly aligned with the pill stream's span. Regression
+  from the v1.46.0 R4 PNG-pill optimization.
+- Fix (`_emit_text_pill`): drop the trim (infinite looped stream,
+  the enable gate controls visibility — same as the geq fallback)
+  + a 0.12s alpha fade in/out on the pill stream, on both the PNG
+  path and the geq fallback path.
+- Render test asserts pill pixels at the midpoint of EVERY cue
+  (2 scenes x 2 cues) plus the fade ramp.
+
+### Task C — continuous micro-motion + glass-card upgrade
+- Ken Burns is now a smoothstep zoom 1.0 -> 1.12x, centre-anchored,
+  over the WHOLE scene duration — in render.py's clip chain and in
+  broll.py `build_broll_filter_chain` (replacing the linear
+  min(zoom+0.0008,1.12) ramp). The generated gradient moves too:
+  its glow is stronger and tighter (peak 30 -> 56, radius 0.62 ->
+  0.45) so the drift is visible — the 1.62.0 gradient was so smooth
+  the zoom was imperceptible (MAPD 0.38 between frames 1s apart).
+- Foreground subject breathes: ±2% scale sine + a ±12px vertical
+  float (at 720p, scaling with width), 4s period, 1s steps from
+  t=1.0, skipping punch windows (compositor.py `subject_keyframes`;
+  BREATHE_AMPLITUDE / BREATHE_FLOAT_PX / BREATHE_PERIOD /
+  BREATHE_STEP). The float is in phase with the scale sine (the
+  subject rises as it grows). Entrance, punch-ins and the final
+  keyframe are unchanged.
+- Ken Burns drift: zoom_in/zoom_out clips also drift horizontally
+  by a constant fraction (KB_DRIFT_FRACTION = 0.8) of the available
+  slack, alternating direction by scene index (compositor.py sets
+  `_kb_drift`; render.py reads it). A pure centre-anchored zoom on
+  blurred dark B-roll moves too few pixels per second (verify run 2
+  measured MAPD 1.1 at t=1-2); the drift is what carries the motion
+  on real B-roll. An s-weighted drift form was tried first and was
+  too weak early in a zoom_in (probe MAPD 0.465), so the drift is a
+  constant fraction of the slack — the slack itself grows with the
+  zoom. The crop never leaves the frame (right edge at 98.9% of
+  the width at 1.12x).
+- Glass cards (compositor.py `glass_card_overlay`) no longer
+  hard-cut: slide_up 18px with a spring ease + fade in 0.25s, fade
+  out 0.20s (short cards < 0.45s skip the exit fade). New params
+  `accent_bar` / `accent_color` / `drop_shadow` (defaults preserve
+  the old behaviour).
+- vector_ui.py: `render_glass_card_png` + `get_cached_glass_card`
+  gain the accent bar (solid strip, left edge, inset by the corner
+  radius; cache-keyed).
+- Richer default keyword card in produce_explainer: at least 60%
+  of the frame wide (the 1.62.0 card hugged the measured text, so a
+  one-word keyword read as a button), accent bar + soft shadow, the
+  keyword as the title and a short subtitle line (the keyword's own
+  "subtitle", else the scene title) when the two-line card fits
+  above the subtitle zone (bottom <= 75% of the frame); small
+  frames fall back to the single-line card.
+- Measured on the repro render: MAPD t=1.0 vs t=2.0 rose 0.386 ->
+  2.091; the clean same-cue measurement (t=3.0 vs t=4.0, card
+  settled) is 2.093 — the motion is real, not just the card
+  entrance. On REAL B-roll (library bg + book fg, 720x1280):
+  MAPD t=1-2 = 1.549, above the 1.5 bar (the no-drift figure was
+  1.121; the gradient-only repro overstates the gain because the
+  gradient is sharper than blurred B-roll).
+
+### Task D — scripts/verify_real_cinematic.py (new)
+- End-to-end verification with REAL assets only: an AgentMedia
+  prepare_scene_bundle (fast_draft) 2-scene project rendered twice
+  at 720x1280 (plain + karaoke, same bundle) with automated
+  assertions — pill pixels at all four cue midpoints, MAPD > 1.5
+  twice, real-speech audio variance (never the 180 Hz sine), and
+  karaoke from bundle timings (structural + yellow-highlight frame
+  check). Two renders because karaoke captions are ASS and by
+  design carry no drawtext pill, so (a) and (d) cannot both hold
+  in one render; the renders are frame-identical except for the
+  captions, which makes the pill/highlight checks differential.
+  Run with the AgentMedia venv (faster-whisper + rembg live there).
+
+### Tests
+- New tests/test_v163.py (22 tests): word_timings validator (6),
+  explainer integration (6: karaoke render + highlight, precedence
+  over TTS, [] keeps TTS, all-dropped means no karaoke,
+  count-mismatch reconciliation, malformed rejected), pill on all
+  four cues + fade (1), continuous motion (1), broll smoothstep
+  (1), Ken Burns drift (2: flag set on zooms only + filter-graph
+  expression), glass-card template (4), richer keyword card
+  structure + entrance (1).
+- Updated (justified behaviour changes): test_v162_compositor
+  subject-keyframes test (breathing keyframes join the timeline —
+  located by time now) and glass-card test (entrance/exit
+  keyframes asserted instead of their absence).
+- Full suite: 481 -> 503 tests. Blackboard note: basic.json
+  renders DIFFERENTLY from 1.62.0 by design (md5
+  ed729e3dbe20daac2dd6ab91e52772cf vs 0843b0f31aa6f4ae8404b
+  3126dffd161) — the Task B fix makes the caption pill appear
+  (in 1.62.0 its trimmed stream EOF'd before the 3.5s cue, so
+  the pill never showed) and both pills now fade. The filter
+  graph differs ONLY in the two pill streams, and frames
+  before the first caption are byte-identical (MAPD 0.0 at
+  t<=3.0).
+
 ## 1.62.0 — 3-Layer Cinematic Compositor + Parallel Join, Draft Scaling, Cache/Reframe Unification, Grain Modes
 
 From-scratch videos no longer default to the black board + flat
