@@ -7257,51 +7257,80 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 s_end = scene["end"]
                 s_dur = scene["duration"]
 
+                # v3.2.0 CI fix (run 44769612850): scene
+                # boundaries in `scenes` are rounded to 3
+                # decimals, but project times are unrounded —
+                # so the range check compares ROUNDED starts,
+                # or an element starting in the rounding sliver
+                # lands in the wrong chunk (scene 2's title at
+                # unrounded 2.9776 fell inside scene 1's rounded
+                # range [0, 2.978)). And the +0.1s minimum
+                # duration is clamped to the chunk end AFTER
+                # the floor, or an element starting in the last
+                # 0.1s of a chunk overflows it (texts
+                # 2.978..3.078 outside timeline 2.98s). An
+                # element with no duration left in this chunk
+                # is dropped, not kept degenerate. Same rule
+                # for captions, texts, diagrams, motion and
+                # overlays below.
                 sc_captions = []
                 for c in project.get("captions", []):
-                    if s_start <= c["start"] < s_end:
+                    _c_start = round(float(c["start"]), 3)
+                    if s_start <= _c_start < s_end:
                         rebased_c = dict(c)
-                        rebased_c["start"] = max(0.0, round(c["start"] - s_start, 3))
-                        rebased_c["end"] = max(rebased_c["start"] + 0.1, min(s_dur, round(c["end"] - s_start, 3)))
+                        rebased_c["start"] = max(0.0, round(_c_start - s_start, 3))
+                        rebased_c["end"] = min(s_dur, max(rebased_c["start"] + 0.1, min(s_dur, round(float(c["end"]) - s_start, 3))))
+                        if rebased_c["end"] <= rebased_c["start"]:
+                            continue
                         if "word_timings" in c:
                             rebased_c["word_timings"] = [
                                 {
                                     "word": wt["word"],
-                                    "start": max(0.0, round(wt["start"] - s_start, 3)),
-                                    "end": min(s_dur, round(wt["end"] - s_start, 3)),
+                                    "start": max(0.0, round(float(wt["start"]) - s_start, 3)),
+                                    "end": min(s_dur, round(float(wt["end"]) - s_start, 3)),
                                 }
                                 for wt in c["word_timings"]
+                            ]
+                            rebased_c["word_timings"] = [
+                                wt for wt in rebased_c["word_timings"]
+                                if wt["end"] > wt["start"]
                             ]
                         sc_captions.append(rebased_c)
 
                 sc_texts = []
                 for t in project.get("texts", []):
-                    if t.get("start", 0.0) == 0.0 and t.get("end", 0.0) >= s_end:
+                    _t_start = round(float(t.get("start", 0.0)), 3)
+                    if _t_start == 0.0 and float(t.get("end", 0.0)) >= s_end:
                         rebased_t = dict(t)
                         rebased_t["start"] = 0.0
                         rebased_t["end"] = s_dur
                         sc_texts.append(rebased_t)
-                    elif s_start <= t.get("start", 0.0) < s_end:
+                    elif s_start <= _t_start < s_end:
                         rebased_t = dict(t)
-                        rebased_t["start"] = max(0.0, round(t["start"] - s_start, 3))
-                        rebased_t["end"] = max(rebased_t["start"] + 0.1, min(s_dur, round(t["end"] - s_start, 3)))
-                        sc_texts.append(rebased_t)
+                        rebased_t["start"] = max(0.0, round(_t_start - s_start, 3))
+                        rebased_t["end"] = min(s_dur, max(rebased_t["start"] + 0.1, min(s_dur, round(float(t["end"]) - s_start, 3))))
+                        if rebased_t["end"] > rebased_t["start"]:
+                            sc_texts.append(rebased_t)
 
                 sc_diagrams = []
                 for d in project.get("diagrams", []):
-                    if s_start <= d.get("start", 0.0) < s_end:
+                    _d_start = round(float(d.get("start", 0.0)), 3)
+                    if s_start <= _d_start < s_end:
                         rebased_d = dict(d)
-                        rebased_d["start"] = max(0.0, round(d["start"] - s_start, 3))
-                        rebased_d["end"] = max(rebased_d["start"] + 0.1, min(s_dur, round(d["end"] - s_start, 3)))
-                        sc_diagrams.append(rebased_d)
+                        rebased_d["start"] = max(0.0, round(_d_start - s_start, 3))
+                        rebased_d["end"] = min(s_dur, max(rebased_d["start"] + 0.1, min(s_dur, round(float(d["end"]) - s_start, 3))))
+                        if rebased_d["end"] > rebased_d["start"]:
+                            sc_diagrams.append(rebased_d)
 
                 sc_motion = []
                 for m in project.get("motion", []):
-                    if s_start <= m.get("start", 0.0) < s_end:
+                    _m_start = round(float(m.get("start", 0.0)), 3)
+                    if s_start <= _m_start < s_end:
                         rebased_m = dict(m)
-                        rebased_m["start"] = max(0.0, round(m["start"] - s_start, 3))
-                        rebased_m["end"] = max(rebased_m["start"] + 0.1, min(s_dur, round(m["end"] - s_start, 3)))
-                        sc_motion.append(rebased_m)
+                        rebased_m["start"] = max(0.0, round(_m_start - s_start, 3))
+                        rebased_m["end"] = min(s_dur, max(rebased_m["start"] + 0.1, min(s_dur, round(float(m["end"]) - s_start, 3))))
+                        if rebased_m["end"] > rebased_m["start"]:
+                            sc_motion.append(rebased_m)
 
                 # v1.62.0: overlays rebase like texts (the
                 # cinematic compositor's subjects + glass cards
@@ -7320,7 +7349,7 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 # video) is dropped from this chunk.
                 sc_overlays = []
                 for ov in project.get("overlays", []):
-                    _o_start = float(ov.get("start", 0.0))
+                    _o_start = round(float(ov.get("start", 0.0)), 3)
                     _o_dur = float(ov.get("duration", 0.0))
                     if _o_start == 0.0 and _o_start + _o_dur >= s_end:
                         rebased_ov = dict(ov)
@@ -7331,10 +7360,12 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                         rebased_ov = dict(ov)
                         rebased_ov["start"] = max(
                             0.0, round(_o_start - s_start, 3))
-                        rebased_ov["duration"] = max(
-                            0.1, min(s_dur - rebased_ov["start"],
-                                     round(_o_dur, 3)))
-                        sc_overlays.append(rebased_ov)
+                        rebased_ov["duration"] = min(
+                            s_dur - rebased_ov["start"],
+                            max(0.1, min(s_dur - rebased_ov["start"],
+                                         round(_o_dur, 3))))
+                        if rebased_ov["duration"] > 0:
+                            sc_overlays.append(rebased_ov)
 
                 if "clip_start" in scene and "clip_end" in scene:
                     sc_clips = [

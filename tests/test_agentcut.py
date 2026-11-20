@@ -11331,7 +11331,17 @@ class TestLoop145(unittest.TestCase):
 
         def _rows(t):
             ink = _ink_mask(out, t, 1000, 1280, 0, 680)
-            return [r for r in _ink_y_rows(ink) if r[0] < 1240]
+            # Groups under 5px tall are diacritic dots, not
+            # lines: the dots of ق/ي sit between the lines with
+            # pixel counts right on the min_count=20 bar (23px
+            # on CI's freetype, 27px locally), so on some
+            # freetype versions the dot appears as a spurious
+            # 1px "row" (CI run 44769612850: late rows
+            # [(1147,1184), (1193,1193), (1198,1226)]). A real
+            # size-36 text line is ~30px tall, so the 5px floor
+            # sits in a wide empty band.
+            return [r for r in _ink_y_rows(ink)
+                    if r[0] < 1240 and r[1] - r[0] >= 4]
 
         early = _rows(0.3)
         self.assertEqual(len(early), 1,
