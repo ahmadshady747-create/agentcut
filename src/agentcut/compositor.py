@@ -631,7 +631,8 @@ def apply_compositor_to_project(project: Dict[str, Any],
                                 clip_windows: List[Tuple[float, float]],
                                 subjects: Optional[List[Dict[str, Any]]] = None,
                                 title_cards: Optional[List[Dict[str, Any]]] = None,
-                                project_dir: Optional[str] = None) -> Dict[str, Any]:
+                                project_dir: Optional[str] = None,
+                                treatments: Optional[Dict[int, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Apply the 3-layer compositor to a built project dict (in place).
 
     Layer 1: every clip gets the cinematic treatment + cycled Ken
@@ -642,12 +643,20 @@ def apply_compositor_to_project(project: Dict[str, Any],
     project["clips"]). Layer 3: each title card spec {y, size,
     start, end} gets a glass-card backdrop overlay (0.8*W wide,
     centred, size*1.4 + 32 tall) behind the title text the caller
-    already placed. Returns the same project dict.
+    already placed. treatments (optional) maps a clip index to
+    its treatment dict, overriding the default cinematic
+    treatment for that clip only — use GRADIENT_TREATMENT for a
+    generated-gradient clip: it is already dark with a baked
+    vignette, so the B-roll darkening (brightness -0.22) would
+    make it near-black (frame mean 5.12 vs the 5.0 bar on
+    FFmpeg 8.x, 0.67 on FFmpeg 6.1.1 — CI run 44750049307).
+    Returns the same project dict.
     """
     width = int(project["output"]["width"])
     height = int(project["output"]["height"])
     for ci, clip in enumerate(project.get("clips") or []):
-        cinematic_layer1_clip(clip, ci)
+        override = (treatments or {}).get(ci)
+        cinematic_layer1_clip(clip, ci, treatment=override)
     overlays = list(project.get("overlays") or [])
     for si, subj in enumerate(subjects or []):
         ci = int(subj.get("clip_index", 0))

@@ -20,7 +20,12 @@ jobs:
       - name: Install FFmpeg & HarfBuzz
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libharfbuzz0b
       - name: Verify package install (editable)
-        run: pip install --no-build-isolation --no-deps -e .
+        # NOTE: no --no-build-isolation. The setup-python 3.12 image
+        # ships WITHOUT setuptools, so --no-build-isolation makes
+        # this step fail with "No module named 'setuptools'"
+        # (run 44750049307). With build isolation pip installs
+        # setuptools>=61.0 from pyproject.toml into the build env.
+        run: pip install --no-deps -e .
       - name: Run fast unit & v2.0.0 suites
         run: |
           PYTHONPATH=src python3 -m unittest \
@@ -38,7 +43,11 @@ jobs:
   full-integration-tests:
     name: Full Render Integration Suite
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # NOTE: shard 1 holds 476 tests (incl. test_agentcut.py) vs 98
+    # in shard 2 — it was killed by the 45-minute timeout in run
+    # 44750049307 (started 14:05:02Z, cancelled 14:50:18Z).
+    # 180 minutes gives the heavy shard room to finish.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:

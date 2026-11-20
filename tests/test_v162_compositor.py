@@ -28,6 +28,7 @@ from agentcut.compositor import (
     CARD_SLIDE_PX,
     CINEMATIC_TREATMENT,
     COMPOSITOR_ZONES,
+    GRADIENT_TREATMENT,
     KEN_BURNS_CYCLE,
     PUNCH_HALF_WIDTH,
     PUNCH_INTERVAL,
@@ -381,6 +382,30 @@ class TestCompositorUnits(unittest.TestCase):
         self.assertIn("zoompan", fc)
         self.assertEqual(total, 12.0)
 
+    def test_apply_compositor_treatments_override(self):
+        # treatments={i: t} overrides the default cinematic
+        # treatment for clip i only; other clips keep it.
+        project = {
+            "id": "comp-t", "version": 1,
+            "output": {"width": 720, "height": 1280, "fps": 30},
+            "clips": [
+                {"id": "c1", "kind": "image",
+                 "src": os.path.join(self.media, "pattern.jpg"),
+                 "duration": 6.0},
+                {"id": "c2", "kind": "image",
+                 "src": os.path.join(self.media, "pattern.jpg"),
+                 "duration": 6.0},
+            ],
+        }
+        apply_compositor_to_project(
+            project,
+            clip_windows=[(0.0, 6.0), (6.0, 6.0)],
+            treatments={1: GRADIENT_TREATMENT})
+        self.assertEqual(project["clips"][0]["treatment"],
+                         CINEMATIC_TREATMENT)
+        self.assertEqual(project["clips"][1]["treatment"],
+                         GRADIENT_TREATMENT)
+
 
 class TestCinematicWiringErrors(unittest.TestCase):
     """Structured errors from the cinematic producers — all fail
@@ -497,6 +522,11 @@ class TestCompositorRender(unittest.TestCase):
                 ],
             }],
         }
+        # The generated gradient (clip 1) gets GRADIENT_TREATMENT,
+        # not the default B-roll darkening: it is already dark with
+        # a baked vignette, and the darkening crushed its frame to
+        # a mean of 5.12 vs the 5.0 bar on FFmpeg 8.x — and 0.67
+        # (black) on FFmpeg 6.1.1 in CI run 44750049307.
         apply_compositor_to_project(
             project,
             clip_windows=[(0.0, 6.0), (6.0, 6.0)],
@@ -504,7 +534,8 @@ class TestCompositorRender(unittest.TestCase):
                        "placement": "center", "base_size": 0.5}],
             title_cards=[{"y": 100, "size": 64, "start": 0.5,
                           "end": 4.0}],
-            project_dir=self.tmp)
+            project_dir=self.tmp,
+            treatments={1: GRADIENT_TREATMENT})
         out = os.path.join(self.tmp, "comp-720p.mp4")
         ok, info = render_project(project, out, video_preset="veryfast",
                                   timeout=600)
