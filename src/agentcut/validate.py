@@ -322,6 +322,32 @@ def contains_latin(text):
 DUAL_SCRIPT_FONT_FILES = ["SegoeUI.ttf", "segoeui.ttf", "Arial.ttf", "arial.ttf", "tahoma.ttf", "Cairo.ttf"]
 
 
+# ASCII characters the bundled Arabic fonts cover (verified
+# 2026-11-17 with a fontTools cmap dump of NotoSansArabic-Bold
+# and NotoNaskhArabic-Regular): digits, space, and ! , . :
+# Every other ASCII character — notably % ? ( ) ; ' " & # and
+# all Latin letters — is MISSING from those fonts and renders
+# as a tofu box. Arabic text containing any of it must use a
+# dual-script font (Segoe UI / Arial / Cairo all cover full
+# ASCII + Arabic). The "-" is deliberately NOT in the safe set:
+# NotoSansArabic-Bold has it but NotoNaskhArabic-Regular does
+# not, and the safe set must hold for whichever Arabic font is
+# found first.
+_ARABIC_FONT_SAFE_ASCII = frozenset("0123456789 !,.:")
+
+
+def _needs_dual_script(text):
+    """True when Arabic text needs a dual-script font: it
+    contains an ASCII character outside the bundled Arabic
+    fonts' safe set (see _ARABIC_FONT_SAFE_ASCII)."""
+    if not contains_arabic(text):
+        return False
+    for ch in str(text):
+        if 0x20 <= ord(ch) <= 0x7E and ch not in _ARABIC_FONT_SAFE_ASCII:
+            return True
+    return False
+
+
 def find_font_for_text(text):
     """Font for one text: dual-script font for mixed Arabic+Latin text,
     an Arabic font for Arabic text, else the Latin font.
@@ -329,11 +355,17 @@ def find_font_for_text(text):
     the old code fell back to DejaVu when no Arabic font existed, and
     DejaVu has no Arabic glyphs, so Arabic text rendered as silent
     tofu boxes. Returning None here lets validation fail loudly with
-    FONT_NOT_FOUND instead."""
+    FONT_NOT_FOUND instead.
+    v1.64.0: "mixed" is not just Latin LETTERS — digits and the
+    safe punctuation (! , . :) render fine in the Arabic fonts,
+    but any other ASCII character (%, ?, parens, ...) is tofu
+    there, so such text takes the dual-script font too (the
+    editorial highlight card "70% من الوقت" rendered "70[box]"
+    before this fix)."""
     s = str(text)
     has_ar = contains_arabic(s)
     has_lat = contains_latin(s)
-    if has_ar and has_lat:
+    if has_ar and (has_lat or _needs_dual_script(s)):
         dual = _find_font_file(DUAL_SCRIPT_FONT_FILES)
         if dual:
             return dual

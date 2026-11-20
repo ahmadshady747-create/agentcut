@@ -37,6 +37,15 @@ AgentMedia separation: this module NEVER fetches or generates media.
 B-roll and subject PNGs ARRIVE as local files; a non-local B-roll
 spec in cinematic mode is a brief error, not a fetch.
 
+Editorial mode (v1.64.0): the clean editorial theatre for
+produce_explainer style "editorial" — full-bleed crisp visuals
+(no heavy blur, no darkening), a 4-move alternating camera
+choreography across visual beats, a bottom-32% gradient scrim
+for the captions, NO top header, NO floating foreground subject,
+and at most one highlight glass card per scene (middle third,
+2.8s). The editorial look lives here (camera cycle, treatment,
+card geometry); render.py wires it into the explainer timeline.
+
 Zero dependencies: stdlib + the sibling modules broll.py, vector_ui.py
 and cache.py (none of which import render.py, so render.py may import
 this module at top level).
@@ -149,6 +158,107 @@ GRADIENT_GLOW_COLOR = (255, 190, 120)
 # while the gradient stays dark and legible behind text.
 GRADIENT_GLOW_PEAK = 56               # max brightness added (0..255)
 GRADIENT_GLOW_RADIUS = 0.45           # fraction of max(width, height)
+
+
+# Editorial mode (v1.64.0): the clean editorial theatre.
+# Camera choreography: a 4-move cycle over the GLOBAL beat
+# counter (beat 0 zoom_in, 1 pan_right, 2 zoom_out, 3 pan_left,
+# then repeat), all smoothstep in the clip chain. Zoom moves run
+# 1.0 <-> 1.18x, pans run at a fixed 1.14x frame — inside the
+# 1.25x comfort max. Beats inside a scene crossfade (0.25s);
+# scenes hard-cut. The editorial treatment is a light vignette
+# ONLY: no blur, no darkening, no contrast/saturation change —
+# the image stays crisp and full-bleed. The bottom scrim (a
+# project-level scrims dict) darkens only the bottom 32% so the
+# caption pill reads without dimming the scene.
+EDITORIAL_CAMERA_CYCLE: Tuple[str, ...] = ("zoom_in", "pan_right",
+                                           "zoom_out", "pan_left")
+EDITORIAL_ZOOM_MAX = 1.18
+EDITORIAL_PAN_ZOOM = 1.14
+EDITORIAL_XFADE = 0.25
+EDITORIAL_TREATMENT: Dict[str, float] = {"vignette": 0.5}
+EDITORIAL_SCRIM: Dict[str, Dict[str, float]] = {
+    "bottom": {"opacity": 0.55, "depth": 0.32}}
+# Highlight card: shown in the middle third for 2.8s only, then
+# gone — the screen stays clean the rest of the time.
+HIGHLIGHT_CARD_DURATION = 2.8
+HIGHLIGHT_CARD_WIDTH_FRAC = 0.72
+
+
+def editorial_camera_for_beat(beat_index: int) -> Tuple[str, float, float]:
+    """(ken_burns, kb_start, kb_end) for a global beat index.
+
+    The cycle alternates zoom and pan so no two consecutive
+    shots move the same way. The values ride the existing
+    ken_burns machinery via the clip's _kb_start/_kb_end keys
+    (render.py reads them; validate.py only overwrites them
+    when clips share a scene_id, which explainer clips never
+    carry — so explicit values survive untouched).
+    """
+    move = EDITORIAL_CAMERA_CYCLE[beat_index % len(EDITORIAL_CAMERA_CYCLE)]
+    if move == "zoom_in":
+        return (move, 1.0, EDITORIAL_ZOOM_MAX)
+    if move == "zoom_out":
+        return (move, EDITORIAL_ZOOM_MAX, 1.0)
+    return (move, EDITORIAL_PAN_ZOOM, EDITORIAL_PAN_ZOOM)
+
+
+def editorial_layer1_clip(clip: Dict[str, Any],
+                          beat_index: int = 0,
+                          camera_move: Optional[str] = None,
+                          cinema_look: Optional[str] = None) -> Dict[str, Any]:
+    """Apply the editorial Layer 1 look to one beat clip (in place).
+
+    v2.5.0: Honors optional director-assigned `camera_move` (from
+    cinematography.CAMERA_MOVES with organic handheld drift) and `cinema_look`
+    when provided; otherwise falls back to the deterministic 4-move cycle for
+    100% backward compatibility with v1.64.0.
+    """
+    clip["treatment"] = dict(EDITORIAL_TREATMENT)
+    if cinema_look:
+        from .cinematography import apply_cinema_look_to_clip
+        apply_cinema_look_to_clip(clip, cinema_look, move_name=camera_move)
+        if clip.get("kind") == "image" and not camera_move:
+            kb, ks, ke = editorial_camera_for_beat(beat_index)
+            clip["ken_burns"] = kb
+            clip["_kb_start"] = ks
+            clip["_kb_end"] = ke
+        return clip
+
+    if clip.get("kind") == "image":
+        if camera_move:
+            from .cinematography import CAMERA_MOVES
+            spec = CAMERA_MOVES.get(camera_move)
+            if spec:
+                clip["camera_move"] = camera_move
+                clip["ken_burns"] = (
+                    spec["kind"]
+                    if spec["kind"] in ("zoom_in", "zoom_out", "pan_left", "pan_right")
+                    else "zoom_in"
+                )
+                clip["_kb_start"] = float(spec["z_start"])
+                clip["_kb_end"] = float(spec["z_end"])
+                clip["_kb_drift"] = bool(spec["handheld_amp"] > 0)
+                return clip
+        kb, ks, ke = editorial_camera_for_beat(beat_index)
+        clip["ken_burns"] = kb
+        clip["_kb_start"] = ks
+        clip["_kb_end"] = ke
+    return clip
+
+
+def editorial_card_rect(width: int, height: int, card_w: int,
+                        card_h: int) -> Tuple[int, int, int, int]:
+    """(x, y, w, h) of the editorial highlight card: centred in
+    the middle third (33%..66% of the frame height)."""
+    x = int(round((width - card_w) / 2))
+    third_top = int(round(0.33 * height))
+    third_h = int(round(0.33 * height))
+    # A too-tall card clamps into the band instead of spilling
+    # past it (the middle-third contract in the docstring).
+    card_h = min(int(card_h), third_h)
+    y = third_top + max(0, (third_h - card_h) // 2)
+    return (x, y, int(card_w), int(card_h))
 
 
 def zone_rect(zone: str, width: int, height: int) -> Tuple[int, int, int, int]:

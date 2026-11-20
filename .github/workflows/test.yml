@@ -4,17 +4,63 @@ on:
   push:
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  fast-unit-tests:
+    name: Fast Unit & Core Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Run test suite
-        run: PYTHONPATH=src python3 -m unittest discover -s tests -v
+      - name: Install FFmpeg & HarfBuzz
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libharfbuzz0b
+      - name: Verify package install (editable)
+        run: pip install --no-build-isolation --no-deps -e .
+      - name: Run fast unit & v2.0.0 suites
+        run: |
+          PYTHONPATH=src python3 -m unittest \
+            tests/test_otio.py \
+            tests/test_templates.py \
+            tests/test_procraft_integration.py \
+            tests/test_v200.py \
+            tests/test_v250.py \
+            tests/test_v300.py \
+            tests/test_v310.py \
+            tests/test_v320.py -v
       - name: Render smoke test
         run: ./run.sh render examples/basic.json /tmp/agentcut-smoke.mp4
+
+  full-integration-tests:
+    name: Full Render Integration Suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg & HarfBuzz
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libharfbuzz0b
+      - name: Run sharded integration tests
+        run: |
+          python3 - <<'PY'
+          import glob, os, subprocess, sys
+          shard = int(os.environ.get("SHARD", "1"))
+          files = sorted(glob.glob("tests/test_*.py"))
+          selected = [f for i, f in enumerate(files) if (i % 2) + 1 == shard]
+          print(f"Shard {shard} running {len(selected)} test modules:", selected)
+          env = dict(os.environ, PYTHONPATH="src")
+          rc = subprocess.call([sys.executable, "-m", "unittest", *selected, "-v"], env=env)
+          sys.exit(rc)
+          PY
+        env:
+          SHARD: ${{ matrix.shard }}

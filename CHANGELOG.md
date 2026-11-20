@@ -1,3 +1,175 @@
+## 3.2.0 — Native Modular Skills Pack & Agent Integration Layer
+
+Bundles 4 focused, token-efficient agent skills (`skills/*/SKILL.md`) with a stdlib registry, MCP self-discovery tools, and one-command export into any external agent's skills directory.
+
+### Bundled Skills Pack (`skills/` & `skills_registry.py`)
+- **`agentcut-autopilot`:** Single-call workflow from raw text or rough JSON to blueprint or finished MP4.
+- **`agentcut-editorial-director`:** Human-directed Arabic/English documentary pacing, Style Bibles, cinema looks, chapter cards, and parallax.
+- **`agentcut-agentmedia-bridge`:** Seamless AgentMedia `bundle.json` validation, pause-aware beat splitting, and batch production.
+- **`agentcut-qc-healer`:** Pre-render craft auditing, post-render FFprobe/FFmpeg QC, silence cutting, and closed-loop self-healing.
+- **MCP & CLI Discovery (60 -> 62 MCP Tools):** Added `list_agentcut_skills`, `get_agentcut_skill`, and `agentcut skills [list | show <name> | export <dest_dir>]`.
+
+---
+
+## 3.1.0 — Model-Agnostic Autopilot, Brief Auto-Repair & Deterministic Art Director
+
+Removes dependence on frontier LLM strength so even small, free, or local models (or raw Arabic text with no LLM) produce cohesive, cinema-grade documentaries on the first try. Zero external dependencies.
+
+### Model-Proof Engine Upgrades (55 -> 60 MCP Tools)
+- **Forgiving Brief Coercer (`brief_repair.py`):** Repairs markdown-fenced JSON, trailing commas, wrong key aliases (`script`/`audio`/`image`/`ratio`), typos in `cinema_look`/`render_profile`/`style`, stringified durations (`"3.5s"`), plain-string scenes, and strips forbidden editorial keys automatically.
+- **Deterministic Art Director (`art_director.py`):** 6 locked visual Style Bibles (`chiaroscuro_doc`, `kodak_warm`, `noir_slate`, `warm_archive`, `midnight_tech`, `editorial_clean`) with automatic shot-scale alternation (`wide` -> `medium` -> `close-up` -> `silhouette`), Arabic/English visual motif mapping, and strict anti-artifact negative prompts.
+- **Script Sculptor & Auto-SRT (`script_polisher.py`):** Strips Markdown/URL noise, splits run-on walls of text into rhythmic bites, and auto-generates proportionally timed UTF-8 `.srt` files when a model omits captions.
+- **Single-Call Autopilot (`autopilot.py`):** One tool (`autopilot_produce` / `agentcut autopilot`) running repair -> polish -> Style Bible prompts -> humanize -> auto-heal render + live soundscape in a single deterministic pass.
+
+---
+
+## 3.0.0 — Full Cinematic Documentary Engine (Visual Intelligence, Live Soundscape Mixing, 2.5D Parallax & Auto-Heal Pipeline)
+
+Completes the transition to a full autonomous cinematic documentary engine while staying 100% zero-dependency (`Python stdlib + FFmpeg`) and optimized for CPU-only / 8GB RAM / HDD systems.
+
+### Visual Intelligence (`vision.py`)
+- **Auto Focal-Point Detection (`detect_focal_point`):** Extracts a tiny 48x48 grayscale frame via FFmpeg pipe (~20ms) and computes gradient-energy centroid `(focal_x, focal_y)` in pure Python so organic camera moves lock onto real subjects instead of dead center.
+- **Shot-to-Shot Exposure Matching (`measure_shot_exposure`, `compute_exposure_match_filter`):** Reads luminance (`signalstats YAVG`) across shots and injects subtle `eq` brightness/gamma harmonization to eliminate jarring exposure jumps across cuts.
+
+### Documentary Language & 2.5D Depth (`parallax.py`)
+- **Documentary Chapter Title Cards (`render_chapter_card`):** Renders atmospheric chapter dividers with HarfBuzz/BiDi Arabic typography, cinema look, fade in/out, and procedural `chapter_boom` SFX.
+- **2.5D Parallax Renderer (`render_parallax_clip`):** Composites background and foreground RGBA layers at differential camera speeds with optical background depth-of-field blur.
+- **Video-Beat Motion (`build_video_beat_motion_filter`):** CPU-friendly smooth scale/crop camera motion for live video beats.
+
+### Modular Compiler Pipeline & Live Soundscape Mixing (`src/agentcut/pipeline/`)
+- **`pipeline/ir.py` (`TimelineIR`):** Typed, inspectable compiler intermediate representation with focal-point and exposure-matching compilation.
+- **`pipeline/filtergraph.py` (`-filter_complex_script`):** UTF-8 script-based FFmpeg filter execution avoiding OS command-line length limits.
+- **`pipeline/audio_mixer.py` (Live Soundscape Mixing):** Automatically synthesizes `room_tone` and timestamped SFX cues (`adelay` + `amix` + `alimiter`) and mixes them directly into rendered videos using `-c:v copy` (zero video re-encoding), wired live into `produce_explainer`.
+- **`pipeline/auto_heal.py` (`produce_cinematic_auto_heal`):** Closed-loop self-healing pipeline chaining craft audit -> auto-humanize -> focal/exposure intelligence -> render with live soundscape -> post-render QC -> automatic repair retry.
+
+### 55 MCP Tools & Expanded CLI
+- Added 6 new MCP tools (49 -> 55): `detect_focal_point`, `match_shot_exposure`, `render_chapter_card`, `render_parallax_clip`, `compile_timeline_ir`, and `produce_cinematic_auto_heal`, plus matching CLI commands.
+
+---
+
+## 2.5.0 — Human-Feel Narrative Director, Cinema Color Science & Procedural Soundscape
+
+Transforms AgentCut from a deterministic renderer into an editorial cinema director that breaks the robotic, metronomic feel of automated video editors — while remaining 100% zero-dependency (`Python stdlib + FFmpeg`) and CPU-safe on 8GB RAM / HDD systems.
+
+### Cinema Color Science & Organic Camera Choreography (`cinematography.py`, `compositor.py`, `render.py`)
+- **6 Built-In Zero-LUT Cinema Grades:** `chiaroscuro_doc`, `kodak_warm`, `noir_slate`, `editorial_clean`, `warm_archive`, and `midnight_tech` — pure FFmpeg `eq` + `colorbalance` + `unsharp` + `vignette` chains injected seamlessly per clip.
+- **Organic Handheld Micro-Drift & Focal Framing:** `build_organic_zoompan_filter()` adds subtle dual-frequency lens breathing and rule-of-thirds focal anchoring (`focal_x`, `focal_y`) so still frames feel shot on a real camera.
+- **Narrative-Driven Camera Choreography:** `choose_narrative_camera_move()` selects from 7 moves (`slow_push_in`, `dramatic_push_in`, `pull_back_reveal`, `pan_right_drift`, `pan_left_drift`, `contemplative_hold`, `handheld_breathe`) based on beat intent and duration, preventing consecutive duplicate moves.
+
+### Procedural Soundscape & J/L-Cut Engine (`soundscape.py`)
+- **5 Zero-Asset Procedural Cinema SFX:** `chapter_boom`, `soft_whoosh`, `card_tick`, `shimmer_reveal`, and `tension_riser` synthesized cleanly via FFmpeg `lavfi`.
+- **3 Documentary Room-Tone Beds:** `warm_studio`, `soft_vinyl`, and `night_air` at `-38 dB` so speech pauses never drop into dead digital silence.
+- **J-Cut / L-Cut Planner:** `plan_jl_cut_audio()` schedules natural audio lead/trail overlaps across scene cuts.
+
+### Adaptive Human-Feel Narrative Director (`director.py`)
+- **Arabic & English Script Intent Classifier:** `analyze_narrative_beat()` detects `hook`, `question`, `revelation`, `quote`, `data_point`, `reflection`, `climax`, and `narrative` moments from punctuation and rhetorical cues.
+- **One-Call Brief Humanizer (`humanize_brief`) & Raw Script Director (`direct_from_script`):** Varies transition types (punchy hard cuts vs. soft crossfades), prevents camera repetition, enforces HUD restraint (spaces `highlight_card`s >= 2 scenes apart), and attaches soundscape + cinema look automatically.
+
+### Anti-Robotic Craft Auditor (`qc.py`) & 49 MCP Tools (`server.py`, `__main__.py`)
+- **`audit_editorial_craft()`:** Pre-render human-feel audit (0–100 score + fixes) flagging metronomic pacing, overlong static holds, repetitive camera moves, uniform transitions, card spam, and flat soundscapes.
+- **6 New MCP Tools (43 -> 49):** `list_cinema_looks`, `humanize_brief`, `direct_from_script`, `audit_editorial_craft`, `synthesize_sfx`, and `generate_room_tone` + matching CLI commands (`looks`, `humanize`, `direct`, `craft-audit`, `sfx`, `room-tone`).
+
+---
+
+## 2.0.0 — Engine Hardening, Parallel Editorial, Auto-QC, AgentMedia Bridge & Batch Production
+
+A major reliability, performance, and capability leap while remaining 100% zero-dependency (`Python stdlib + FFmpeg`).
+
+### Batch 1 — Core Bug Fixes & Performance Hardening
+- **Safe package installation (`server.py`):** Replaced hard-coded repo-relative `BASE/data` import-time creation with `AGENTCUT_HOME` -> writable source checkout -> XDG/LocalAppData fallback, preventing `PermissionError` when installed into `site-packages`. Switched `_atomic_write_json` to UTF-8 (`ensure_ascii=False`) and wired `parallel` in `produce_from_template`.
+- **Bulletproof incremental cache (`cache.py`):** Recursive source-asset file-stat hashing (covers nested clips, beats, overlays, fonts, LUTs), includes `agentcut.__version__` in every scene hash, atomic `os.replace()` writes (eliminates corrupt partial MP4 cache hits), configurable LRU eviction (`AGENTCUT_CACHE_MAX_MB`), and `get_cache_stats()`.
+- **HarfBuzz face caching & thread safety (`srt.py`):** Added `_HB_LOCK` and persistent in-memory `_HB_FONT_CACHE` keyed by `(path, mtime_ns, size)` to eliminate repeated HDD font reads; preserved explicit `\n` breaks in `wrap_lines`; replaced OOM/IndexError-prone loop in `batch_captions_by_window` with sparse clamped buckets.
+- **Arabic text metrics (`text_metrics.py`):** Preserved Unicode Arabic diacritics (tashkeel) inside word tokens and fixed `is_arabic_predominant` for pure numeric/symbol strings.
+- **CLI hardening (`__main__.py`):** Enforced `encoding="utf-8"` on JSON reads (fixes Windows `run.bat` Arabic crashes), routed errors to `sys.stderr`, fixed dropped `--parallel` flag in `from-template`, and added `--help` / `--version`.
+- **Fast sharded CI (`.github/workflows/test.yml`):** Split fast unit tests + smoke test from 2-way sharded integration tests on `ubuntu-24.04` with `libharfbuzz0b`.
+
+### Batch 2 & 3 — Major v2.0.0 Capabilities (34 -> 43 MCP Tools)
+- **Multi-beat parallel editorial rendering (`render.py`):** Lifted the v1.64.0 serial-only limitation for `style="editorial"`. Each scene chunk now preserves its intra-scene beat `crossfade` transitions while rendering scenes concurrently with atomic scene caching.
+- **Hardware-aware render profiles (`profiles.py`):** Added `proxy`, `draft`, `low_spec` (8GB RAM / HDD / CPU-only), `master`, and `cinema` profiles plus `detect_hardware_profile()` auto-throttling.
+- **Automated Media Quality Control (`qc.py`):** New `audit_video_quality` engine inspecting SAR, FPS, duration drift, A/V sync drift (ms), black frames (`blackdetect`), silence gaps (`silencedetect`), loudness, and clipping — returning a 0–100 score, grade, and actionable fixes for AI self-healing loops.
+- **AgentMedia Bundle Bridge (`bundle.py`):** Pause-aware `auto_split_beats()` from Whisper `word_timings`, strict `validate_media_bundle()`, `bundle_to_editorial_brief()`, and one-shot `produce_from_bundle()`.
+- **Smart Silence Trimmer (`smart_cut.py`):** Audio-driven jump-cut engine removing dead-air pauses with natural speech padding.
+- **Batch Production Orchestrator (`batch.py`):** Multi-project/client runner with concurrency throttling, resume-if-done skipping, error isolation, optional QC audit, and `batch_report.json`.
+- **Production `Dockerfile`:** Reproducible Python 3.11 + FFmpeg + HarfBuzz + Noto fonts container image.
+
+---
+
+## 1.64.0 — Editorial Mode: Beats, Alternating Camera, Clean Screen
+
+The user eye-checked the 1.63.0 proof and found it still reads as
+"automated slides": floating rembg cutouts, an over-blurred
+background that kills the camera feel, a huge permanent header,
+and slow image changes. This release answers with the editorial
+theatre — a new `produce_explainer` style "editorial" (AgentMedia
+0.13.0 bundles feed it).
+
+### Visual beats instead of one image per scene
+- A scene carries "beats": [{start, end, broll?}] (AgentMedia
+  splits the narration at natural speech pauses, 2.5–4.0s per
+  beat). Each beat is its own clip: a 0.25s crossfade between
+  beats inside a scene, a hard cut between scenes. Beat clips
+  carry slot+0.25s durations (except the last beat of a scene)
+  so each fade starts exactly on its slot boundary and the
+  visual timeline stays in sync with the narration. Beat slots
+  must tile the scene duration (validated, 0.05s tolerance); a
+  scene without beats is one beat for the whole scene; a beat
+  without an image falls back to the scene broll, then the
+  cinematic gradient.
+- Camera choreography: a 4-move cycle on the GLOBAL beat counter
+  — zoom_in 1.0→1.18x, pan_right at 1.14x, zoom_out 1.18→1.0x,
+  pan_left at 1.14x — all smoothstep, via the existing ken_burns
+  machinery (_kb_start/_kb_end; validate.py never overwrites
+  them on explainer clips, which carry no scene_id).
+
+### Full-bleed crisp visuals
+- Editorial Layer 1 treatment is a light vignette ONLY — no
+  Gaussian blur, no darkening, no contrast/saturation change.
+  The image fills the frame 100% (cover) at full detail. A
+  gradient scrim covers the bottom 32% only (project scrims
+  {"bottom": {opacity 0.55, depth 0.32}}) so the caption pill
+  reads without dimming the scene; there is no top scrim.
+- broll.py's build_broll_filter_chain gains style="editorial"
+  + camera_move (same zoompan values, no blur/darkening,
+  subtle vignette) so the B-roll pipeline matches the clip
+  chain.
+
+### Minimalist HUD
+- NO header in editorial: no fixed title, no scene titles, no
+  pacing lower-thirds. NO floating subject. Keywords, diagrams,
+  subject and karaoke are REJECTED in editorial with structured
+  errors (the highlight_card is the only overlay vocabulary).
+- highlight_card {title, subtitle?, trigger_word?, start?,
+  duration?}: one glass card (thin border, real shadow, no
+  accent bar) in the middle third for 2.8s (default), slide+fade
+  entrance, then gone. Start: explicit start wins, else the
+  trigger word's time in the scene's word_timings, else the
+  scene middle (with a warning when the trigger word is not
+  found). Card texts are inset by the 0.25s/0.20s fades so text
+  only shows while the card is opaque.
+- Captions are the full-sentence pill ONLY (plain SRT+drawtext);
+  karaoke/karaoke_pill/kinetic are rejected in editorial (the
+  word highlight moved punctuation mid-line).
+
+### Join fix (found by the editorial render test)
+- "fade" is a fade-to-black that CONCATENATES; the beat
+  crossfade uses "crossfade" (an XFADE_TRANSITIONS member),
+  the only transition that overlaps the timeline.
+- A second xfade after a concat failed to configure: xfade
+  outputs AVTB (1/1000000) while a raw clip chain is 1/fps,
+  and xfade requires matching timebases ("First input link
+  main timebase (1/1000000) do not match ... (1/30)"). When a
+  project has any xfade transition, every join input is now
+  normalised with settb=AVTB first (xfade outputs AVTB
+  natively, concat passes the first input's timebase through).
+  Projects without xfades are untouched (byte-identical).
+
+### Limits
+- Parallel rendering is forced OFF for editorial: the parallel
+  path assumes one clip per scene and would drop beats 2+.
+  Serial only (documented limitation).
+- Video beats get the vignette but no camera move (ken_burns
+  is image-only, as in cinematic mode).
+
 ## 1.63.0 — Scene word_timings + Pill Fix + Continuous Motion + Glass-Card Upgrade
 
 The user eye-checked the 1.62.0 proof render and found real defects;

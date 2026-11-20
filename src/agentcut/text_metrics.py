@@ -2,6 +2,13 @@
 
 Inspired by ProCraft's text tools, adapted for AgentCut automated scene pacing,
 kinetic caption timing, and script verification. Zero external dependencies.
+
+v2.0.0 fixes:
+- Preserves Arabic diacritics/tashkeel (Unicode combining marks U+064B..U+065F,
+  U+0670, U+06D6..U+06ED) inside word tokens so vocalized Arabic words are not
+  split into fragments.
+- Fixes `is_arabic_predominant` so pure numeric/punctuation strings (0 Arabic
+  words, 0 Latin words) return False instead of True.
 """
 
 from __future__ import annotations
@@ -9,6 +16,11 @@ from __future__ import annotations
 import difflib
 import re
 from typing import Any
+
+# Word token regex that keeps Arabic diacritics (tashkeel) attached to their base word
+_WORD_RE = re.compile(r"[\w\u064B-\u065F\u0670\u06D6-\u06ED]+", re.UNICODE)
+_ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+_LATIN_CHAR_RE = re.compile(r"[a-zA-Z]")
 
 
 def analyze_text(text: str) -> dict[str, Any]:
@@ -26,9 +38,9 @@ def analyze_text(text: str) -> dict[str, Any]:
         }
 
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    tokens = re.findall(r"\b\w+\b", text, re.UNICODE)
-    arabic_tokens = [tok for tok in tokens if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", tok)]
-    latin_tokens = [tok for tok in tokens if re.search(r"[a-zA-Z]", tok)]
+    tokens = _WORD_RE.findall(text)
+    arabic_tokens = [tok for tok in tokens if _ARABIC_CHAR_RE.search(tok)]
+    latin_tokens = [tok for tok in tokens if _LATIN_CHAR_RE.search(tok)]
     digits = re.findall(r"\d+", text)
 
     return {
@@ -39,7 +51,7 @@ def analyze_text(text: str) -> dict[str, Any]:
         "arabic_words": len(arabic_tokens),
         "latin_words": len(latin_tokens),
         "digits": len(digits),
-        "is_arabic_predominant": len(arabic_tokens) >= len(latin_tokens),
+        "is_arabic_predominant": len(arabic_tokens) > 0 and len(arabic_tokens) >= len(latin_tokens),
     }
 
 

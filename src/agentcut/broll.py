@@ -22,6 +22,46 @@ from .cache import get_cache_dir
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
+# Editorial camera moves (v1.64.0, shared with compositor.py's
+# EDITORIAL_CAMERA_CYCLE): zoom 1.0 <-> 1.18x, pans at a fixed
+# 1.14x frame. The values live here as the filter-chain source
+# of truth; compositor.py carries the cycle order.
+EDITORIAL_MOVES = ("zoom_in", "pan_right", "zoom_out", "pan_left")
+EDITORIAL_ZOOM_MAX = 1.18
+EDITORIAL_PAN_ZOOM = 1.14
+
+
+def editorial_zoompan_filter(move, duration, width, height, fps=30):
+    """The zoompan filter for one editorial camera move (v1.64.0).
+
+    Smoothstep-eased, matching render.py's clip-chain Ken Burns
+    expressions exactly (same s curve, same x/y forms), so the
+    B-roll pipeline and the clip chain produce the same motion
+    for the same move name. move is one of EDITORIAL_MOVES.
+    """
+    if move not in EDITORIAL_MOVES:
+        raise ValueError(
+            f"editorial camera move must be one of {EDITORIAL_MOVES}, "
+            f"got {move!r}")
+    num_frames = max(1, int(round(duration * fps)))
+    _p = f"on/{num_frames}"
+    _s = f"({_p})*({_p})*(3-2*({_p}))"
+    _cx = "iw/2-(iw/zoom/2)"
+    if move == "zoom_in":
+        z = f"1+{EDITORIAL_ZOOM_MAX - 1.0:g}*{_s}"
+        x_expr, y_expr = _cx, "ih/2-(ih/zoom/2)"
+    elif move == "zoom_out":
+        z = f"{EDITORIAL_ZOOM_MAX:g}-{EDITORIAL_ZOOM_MAX - 1.0:g}*{_s}"
+        x_expr, y_expr = _cx, "ih/2-(ih/zoom/2)"
+    elif move == "pan_left":
+        z = f"{EDITORIAL_PAN_ZOOM:g}"
+        x_expr, y_expr = f"(iw-iw/zoom)*{_s}", "(ih-ih/zoom)/2"
+    else:  # pan_right
+        z = f"{EDITORIAL_PAN_ZOOM:g}"
+        x_expr, y_expr = f"(iw-iw/zoom)*(1-{_s})", "(ih-ih/zoom)/2"
+    return (f"zoompan=z='{z}':x='{x_expr}':y='{y_expr}':"
+            f"d={num_frames}:s={width}x{height}:fps={fps}")
+
 
 def is_video_file(path_or_url: str) -> bool:
     """Return True if path or url points to a video file format."""
@@ -46,13 +86,34 @@ def build_broll_filter_chain(
     contrast: float = 1.12,
     saturation: float = 0.85,
     vignette: bool = True,
+    style: str = "cinematic",
+    camera_move: str | None = None,
 ) -> str:
     """Build the cinematic FFmpeg filter chain for B-roll background media.
 
     Scales and crops media to target dimensions, applies gentle Ken Burns camera
     motion if static image, and applies atmospheric darkening + depth of field
     to guarantee foreground Arabic text and diagrams remain razor-sharp.
+
+    style "editorial" (v1.64.0): the clean editorial theatre —
+    NO blur, NO darkening/contrast/saturation change, a subtle
+    vignette only, and the camera move comes from the editorial
+    4-move cycle (camera_move, default "zoom_in") with the
+    editorial zoom values (1.18x / 1.14x). The explicit
+    blur/brightness/contrast/saturation arguments are ignored
+    in editorial mode (the look is fixed by the style).
     """
+    if style not in ("cinematic", "editorial"):
+        raise ValueError(
+            f"broll style must be 'cinematic' or 'editorial', got {style!r}")
+    editorial = (style == "editorial")
+    if editorial:
+        if camera_move is None:
+            camera_move = "zoom_in"
+        if camera_move not in EDITORIAL_MOVES:
+            raise ValueError(
+                f"editorial camera_move must be one of {EDITORIAL_MOVES}, "
+                f"got {camera_move!r}")
     filters = []
 
     # 1. Scale and smart crop to fill target dimensions
@@ -65,15 +126,29 @@ def build_broll_filter_chain(
     # slow landing), centre-anchored, matching render.py's clip
     # chain exactly. The old linear ramp (min(zoom+0.0008,1.12),
     # top-left anchored) started and stopped mechanically and
-    # drifted off-centre.
+    # drifted off-centre. Editorial (v1.64.0) uses the cycled
+    # move instead (1.18x zooms / 1.14x pans).
     if not is_video:
-        num_frames = max(1, int(round(duration * fps)))
-        _p = f"on/{num_frames}"
-        _s = f"({_p})*({_p})*(3-2*({_p}))"
-        filters.append(
-            f"zoompan=z='1+0.12*{_s}':x='iw/2-(iw/zoom/2)':"
-            f"y='ih/2-(ih/zoom/2)':d={num_frames}:"
-            f"s={width}x{height}:fps={fps}")
+        if editorial:
+            filters.append(editorial_zoompan_filter(
+                camera_move, duration, width, height, fps))
+        else:
+            num_frames = max(1, int(round(duration * fps)))
+            _p = f"on/{num_frames}"
+            _s = f"({_p})*({_p})*(3-2*({_p}))"
+            filters.append(
+                f"zoompan=z='1+0.12*{_s}':x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':d={num_frames}:"
+                f"s={width}x{height}:fps={fps}")
+
+    if editorial:
+        # 3. Editorial: crisp full-bleed image, subtle vignette
+        # only. No blur, no darkening — the bottom scrim (a
+        # project-level scrims dict in render.py) carries the
+        # caption legibility instead.
+        if vignette:
+            filters.append("vignette=PI/8")
+        return ",".join(filters)
 
     # 3. Cinematic Depth of Field & Legibility Grading
     if blur_sigma > 0:

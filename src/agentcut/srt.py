@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import re
 
 _TIME_RE = re.compile(
@@ -91,99 +92,127 @@ class _HBPosition(ctypes.Structure):
                 ("var", ctypes.c_int32)]
 
 
+_HB_LOCK = threading.Lock()
+_HB_FONT_CACHE: dict[tuple[str, int, int], tuple[bytes, int, int, int, int]] = {}
+
+
 def _load_harfbuzz():
-    """Load HarfBuzz once (ctypes); None when unavailable."""
+    """Load HarfBuzz once (ctypes, thread-safe); None when unavailable."""
     global _HB, _HB_TRIED
     if _HB_TRIED:
         return _HB
-    _HB_TRIED = True
-    candidates = [
-        "libharfbuzz.so.0",
-        "libharfbuzz.so",
-        "libharfbuzz.dylib",
-        "libharfbuzz.0.dylib",
-        "harfbuzz.dll",
-        "libharfbuzz-0.dll",
-        "libHarfBuzzSharp.dll",
-    ]
-    if os.name == "nt":
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        prog_files = os.environ.get("ProgramFiles", "")
-        candidates.extend([
-            os.path.join(base_dir, "harfbuzz.dll"),
-            os.path.join(local_app, "agy", "bin", "harfbuzz.dll"),
-            os.path.join(local_app, "Programs", "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
-            os.path.join(prog_files, "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
-            os.path.join(local_app, "Programs", "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
-            os.path.join(prog_files, "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
-        ])
-    for cand in candidates:
-        if not cand:
-            continue
-        try:
-            hb = ctypes.CDLL(cand)
-            hb.hb_blob_create.restype = ctypes.c_void_p
-            hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
-                                          ctypes.c_int, ctypes.c_void_p,
-                                          ctypes.c_void_p]
-            hb.hb_blob_destroy.restype = None
-            hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
-            hb.hb_face_create.restype = ctypes.c_void_p
-            hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            hb.hb_face_destroy.restype = None
-            hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
-            hb.hb_face_get_upem.restype = ctypes.c_uint
-            hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
-            hb.hb_font_create.restype = ctypes.c_void_p
-            hb.hb_font_create.argtypes = [ctypes.c_void_p]
-            hb.hb_font_destroy.restype = None
-            hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
-            hb.hb_ot_font_set_funcs.restype = None
-            hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
-            hb.hb_font_set_scale.restype = None
-            hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                             ctypes.c_int]
-            hb.hb_buffer_create.restype = ctypes.c_void_p
-            hb.hb_buffer_create.argtypes = []
-            hb.hb_buffer_destroy.restype = None
-            hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
-            hb.hb_buffer_add_utf8.restype = None
-            hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
-                                              ctypes.c_char_p, ctypes.c_int,
-                                              ctypes.c_uint, ctypes.c_int]
-            hb.hb_buffer_guess_segment_properties.restype = None
-            hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
-            hb.hb_shape.restype = None
-            hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                    ctypes.c_void_p, ctypes.c_uint]
-            hb.hb_buffer_get_length.restype = ctypes.c_uint
-            hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
-            hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
-                _HBPosition)
-            hb.hb_buffer_get_glyph_positions.argtypes = [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
-            _HB = hb
-            break
-        except Exception:
-            continue
-    return _HB
+    with _HB_LOCK:
+        if _HB_TRIED:
+            return _HB
+        _HB_TRIED = True
+        candidates = [
+            "libharfbuzz.so.0",
+            "libharfbuzz.so",
+            "libharfbuzz.dylib",
+            "libharfbuzz.0.dylib",
+            "harfbuzz.dll",
+            "libharfbuzz-0.dll",
+            "libHarfBuzzSharp.dll",
+        ]
+        if os.name == "nt":
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            local_app = os.environ.get("LOCALAPPDATA", "")
+            prog_files = os.environ.get("ProgramFiles", "")
+            candidates.extend([
+                os.path.join(base_dir, "harfbuzz.dll"),
+                os.path.join(local_app, "agy", "bin", "harfbuzz.dll"),
+                os.path.join(local_app, "Programs", "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
+                os.path.join(prog_files, "Git", "ucrt64", "bin", "libHarfBuzzSharp.dll"),
+                os.path.join(local_app, "Programs", "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
+                os.path.join(prog_files, "Git", "mingw64", "bin", "libharfbuzz-0.dll"),
+            ])
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                hb = ctypes.CDLL(cand)
+                hb.hb_blob_create.restype = ctypes.c_void_p
+                hb.hb_blob_create.argtypes = [ctypes.c_char_p, ctypes.c_uint,
+                                              ctypes.c_int, ctypes.c_void_p,
+                                              ctypes.c_void_p]
+                hb.hb_blob_destroy.restype = None
+                hb.hb_blob_destroy.argtypes = [ctypes.c_void_p]
+                hb.hb_face_create.restype = ctypes.c_void_p
+                hb.hb_face_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                hb.hb_face_destroy.restype = None
+                hb.hb_face_destroy.argtypes = [ctypes.c_void_p]
+                hb.hb_face_get_upem.restype = ctypes.c_uint
+                hb.hb_face_get_upem.argtypes = [ctypes.c_void_p]
+                hb.hb_font_create.restype = ctypes.c_void_p
+                hb.hb_font_create.argtypes = [ctypes.c_void_p]
+                hb.hb_font_destroy.restype = None
+                hb.hb_font_destroy.argtypes = [ctypes.c_void_p]
+                hb.hb_ot_font_set_funcs.restype = None
+                hb.hb_ot_font_set_funcs.argtypes = [ctypes.c_void_p]
+                hb.hb_font_set_scale.restype = None
+                hb.hb_font_set_scale.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_int]
+                hb.hb_buffer_create.restype = ctypes.c_void_p
+                hb.hb_buffer_create.argtypes = []
+                hb.hb_buffer_destroy.restype = None
+                hb.hb_buffer_destroy.argtypes = [ctypes.c_void_p]
+                hb.hb_buffer_add_utf8.restype = None
+                hb.hb_buffer_add_utf8.argtypes = [ctypes.c_void_p,
+                                                  ctypes.c_char_p, ctypes.c_int,
+                                                  ctypes.c_uint, ctypes.c_int]
+                hb.hb_buffer_guess_segment_properties.restype = None
+                hb.hb_buffer_guess_segment_properties.argtypes = [ctypes.c_void_p]
+                hb.hb_shape.restype = None
+                hb.hb_shape.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_void_p, ctypes.c_uint]
+                hb.hb_buffer_get_length.restype = ctypes.c_uint
+                hb.hb_buffer_get_length.argtypes = [ctypes.c_void_p]
+                hb.hb_buffer_get_glyph_positions.restype = ctypes.POINTER(
+                    _HBPosition)
+                hb.hb_buffer_get_glyph_positions.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+                _HB = hb
+                break
+            except Exception:
+                continue
+        return _HB
+
+
+def _get_cached_hb_font(hb, font_path):
+    """Return a cached (data, blob, face, hbfont, upem) tuple for font_path.
+
+    Eliminates repeated full font-file disk reads on HDDs across parallel renders.
+    Keyed by (abspath, mtime_ns, size) so modified fonts reload cleanly.
+    """
+    abs_path = os.path.abspath(font_path)
+    st = os.stat(abs_path)
+    fkey = (abs_path, st.st_mtime_ns, st.st_size)
+    with _HB_LOCK:
+        entry = _HB_FONT_CACHE.get(fkey)
+        if entry is not None:
+            return entry
+        with open(abs_path, "rb") as fh:
+            data = fh.read()
+        blob = hb.hb_blob_create(data, len(data), 1, None, None)
+        face = hb.hb_face_create(blob, 0)
+        hbfont = hb.hb_font_create(face)
+        upem = hb.hb_face_get_upem(face)
+        hb.hb_ot_font_set_funcs(hbfont)
+        hb.hb_font_set_scale(hbfont, upem, upem)
+        entry = (data, blob, face, hbfont, upem)
+        _HB_FONT_CACHE[fkey] = entry
+        return entry
 
 
 def measure_text_width(text, font, size, cache=None):
-    """Shaped text width (px) at one size/font.
+    """Shaped text width (px) at one size/font (v2.0.0: cached HarfBuzz face).
 
     Measured against the old cropdetect ink width on 12 Arabic+Latin
     words (sizes 48-60): the shaped width is always >= the ink width
     (ratio 1.020-1.208), so a bar or pill sized by this width always
-    covers its text, with at most ~21% slack on short words
-    (absorbed by the 12px padding). The direction does not matter
-    for the total: advances sum the same in logical or display
-    order, so the logical text is shaped directly. Returns the
-    0.6 x size per-character estimate (never None) when HarfBuzz
-    or the font file is unavailable, so callers need no fallback
-    of their own. Results are cached by (text, font, size) when a
-    cache dict is passed.
+    covers its text. Returns the 0.6 x size per-character estimate
+    (never None) when HarfBuzz or the font file is unavailable.
+    Results are cached by (text, font, size) when a cache dict is passed.
     """
     text = str(text)
     key = (text, font, size)
@@ -193,27 +222,17 @@ def measure_text_width(text, font, size, cache=None):
     width = fallback
     hb = _load_harfbuzz()
     if hb is not None and font and os.path.isfile(font):
-        blob = face = hbfont = buf = None
+        buf = None
         try:
-            with open(font, "rb") as fh:
-                data = fh.read()
-            # READONLY blob: no copy, no ownership — `data` must
-            # stay alive until the face is destroyed (it is a
-            # local, destroyed in the finally below).
-            blob = hb.hb_blob_create(data, len(data), 1, None, None)
-            face = hb.hb_face_create(blob, 0)
-            hbfont = hb.hb_font_create(face)
-            upem = hb.hb_face_get_upem(face)
-            hb.hb_ot_font_set_funcs(hbfont)
-            hb.hb_font_set_scale(hbfont, upem, upem)
+            _data, _blob, _face, hbfont, upem = _get_cached_hb_font(hb, font)
             buf = hb.hb_buffer_create()
             raw = text.encode("utf-8")
             hb.hb_buffer_add_utf8(buf, raw, len(raw), 0, -1)
             hb.hb_buffer_guess_segment_properties(buf)
-            hb.hb_shape(hbfont, buf, None, 0)
+            with _HB_LOCK:
+                hb.hb_shape(hbfont, buf, None, 0)
             count = ctypes.c_uint(0)
-            pos = hb.hb_buffer_get_glyph_positions(buf,
-                                                   ctypes.byref(count))
+            pos = hb.hb_buffer_get_glyph_positions(buf, ctypes.byref(count))
             total = 0
             for i in range(count.value):
                 total += pos[i].x_advance
@@ -223,12 +242,6 @@ def measure_text_width(text, font, size, cache=None):
         finally:
             if buf is not None:
                 hb.hb_buffer_destroy(buf)
-            if hbfont is not None:
-                hb.hb_font_destroy(hbfont)
-            if face is not None:
-                hb.hb_face_destroy(face)
-            if blob is not None:
-                hb.hb_blob_destroy(blob)
     if cache is not None:
         cache[key] = width
     return width
@@ -251,26 +264,31 @@ def wrap_lines(text, size, max_width_px, measure=None):
     one line. This is the single source of truth for wrapping;
     see wrap_subtitle_text for the video-width-based wrapper.
     """
-    words = str(text).split()
-    if not words:
-        return [str(text)]
+    raw_text = str(text)
+    if not raw_text.strip():
+        return [raw_text]
     if measure is None:
         def measure(word, size=size):
             return _word_width(word, size)
-    lines, cur, cur_w = [], "", 0.0
+    lines = []
     space_w = measure(" ", size)
-    for word in words:
-        word_w = measure(word, size)
-        new_w = word_w if not cur else cur_w + space_w + word_w
-        if cur and new_w > max_width_px:
+    for para in raw_text.splitlines():
+        words = para.split()
+        if not words:
+            continue
+        cur, cur_w = "", 0.0
+        for word in words:
+            word_w = measure(word, size)
+            new_w = word_w if not cur else cur_w + space_w + word_w
+            if cur and new_w > max_width_px:
+                lines.append(cur)
+                cur, cur_w = word, word_w
+            else:
+                cur = (cur + " " + word) if cur else word
+                cur_w = new_w
+        if cur:
             lines.append(cur)
-            cur, cur_w = word, word_w
-        else:
-            cur = (cur + " " + word) if cur else word
-            cur_w = new_w
-    if cur:
-        lines.append(cur)
-    return lines
+    return lines if lines else [raw_text]
 
 
 def wrap_subtitle_text(text, width, font_size, max_width_frac=0.8,
@@ -306,16 +324,20 @@ def batch_captions_by_window(cues, window_seconds=60.0):
     if window_seconds <= 0:
         raise ValueError("window_seconds must be positive")
     ordered = sorted(cues or [], key=lambda c: float(c.get("start", 0)))
-    windows = []
+    buckets: dict[int, dict] = {}
     for cue in ordered:
-        start = float(cue.get("start", 0))
+        start = max(0.0, float(cue.get("start", 0)))
         idx = int(start // window_seconds)
-        while len(windows) <= idx:
-            wstart = len(windows) * window_seconds
-            windows.append({"index": len(windows), "start": wstart,
-                            "end": wstart + window_seconds, "cues": []})
-        windows[idx]["cues"].append(cue)
-    return [w for w in windows if w["cues"]]
+        if idx not in buckets:
+            wstart = idx * window_seconds
+            buckets[idx] = {
+                "index": idx,
+                "start": wstart,
+                "end": wstart + window_seconds,
+                "cues": [],
+            }
+        buckets[idx]["cues"].append(cue)
+    return [buckets[i] for i in sorted(buckets)]
 
 
 def _ass_timestamp(seconds):

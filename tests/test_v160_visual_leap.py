@@ -232,15 +232,15 @@ class TestV160VisualLeap(unittest.TestCase):
         content = pyproject_path.read_text(encoding="utf-8")
 
         self.assertIn('name = "agentcut"', content)
-        self.assertIn('version = "1.63.0"', content)
+        self.assertIn('version = "3.2.0"', content)
         self.assertIn("dependencies = []", content)
         self.assertIn('agentcut = "agentcut.__main__:main"', content)
         self.assertIn('agentcut-mcp = "agentcut.server:main"', content)
 
         # Verify version alignment
         version_file = Path("VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(version_file, "1.63.0")
-        self.assertEqual(__version__, "1.63.0")
+        self.assertEqual(version_file, "3.2.0")
+        self.assertEqual(__version__, "3.2.0")
 
     def test_mcp_glass_card_preview_tool(self):
         """Verify MCP server exposes and executes generate_glass_card_preview."""

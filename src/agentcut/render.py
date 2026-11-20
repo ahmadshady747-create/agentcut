@@ -2817,6 +2817,13 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 _tr = f"{_tr},{_inline}" if _tr else _inline
         if _tr:
             vf += "," + _tr
+        if clip.get("exposure_vf"):
+            vf += "," + str(clip["exposure_vf"])
+        if clip.get("cinema_look"):
+            from .cinematography import CINEMA_LOOKS
+            _clook = CINEMA_LOOKS.get(str(clip["cinema_look"]).strip().lower())
+            if _clook and _clook.get("vf"):
+                vf += "," + _clook["vf"]
         fades = []
         if clip.get("transition") == "fade":
             ftd = float(clip.get("transition_duration", 0.3))
@@ -2981,8 +2988,23 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
     # before, filter for filter.
     _joined_idx = [i for i, _c in enumerate(clips) if _c.get("track", 0) == 0]
     vjoin = {}
+    # v1.64.0: xfade requires both inputs to share a timebase,
+    # but xfade outputs AVTB (1/1000000) while a raw clip chain
+    # is 1/fps — so a second xfade after a concat failed to
+    # configure ("First input link main timebase (1/1000000)
+    # do not match ... (1/30)"). When the project has any xfade
+    # transition, normalise every join input to AVTB first;
+    # xfade outputs AVTB natively and concat passes the first
+    # input's timebase through, so every xfade then sees AVTB
+    # on both sides. Projects without xfades are untouched
+    # (byte-identical).
+    _has_xfade = any(clips[i].get("transition") in XFADE_TRANSITIONS
+                     for i in _joined_idx[1:])
     for i in _joined_idx:
-        filters.append(f"[{vlabels[i]}]setsar=1[vs{i}]")
+        if _has_xfade:
+            filters.append(f"[{vlabels[i]}]setsar=1,settb=AVTB[vs{i}]")
+        else:
+            filters.append(f"[{vlabels[i]}]setsar=1[vs{i}]")
         vjoin[i] = f"vs{i}"
     vcur_chain = vjoin[_joined_idx[0]]
     cur_dur = clips[_joined_idx[0]]["duration"]
@@ -7201,7 +7223,7 @@ def _explainer_pacing_beats(start, dur, title, si, nscenes,
 
 def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                                video_codec="auto", video_preset=None, timeout=600,
-                               use_cache=True):
+                               use_cache=True, max_workers=None):
     """Render multiple explainer scenes concurrently across CPU/GPU cores (Phase 3),
     joining them with the concat FILTER via a render_project assembly (v1.62.0).
     The concat DEMUXER used to join here (-f concat -c copy) offsets each chunk
@@ -7228,7 +7250,8 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         fps = int(project.get("output", {}).get("fps", 30) or 30)
         cache_parent = os.path.dirname(os.path.abspath(output_path))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(scenes))) as executor:
+        _worker_cap = int(max_workers) if max_workers else 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(_worker_cap, len(scenes)))) as executor:
             for si, scene in enumerate(scenes):
                 s_start = scene["start"]
                 s_end = scene["end"]
@@ -7313,15 +7336,24 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                                      round(_o_dur, 3)))
                         sc_overlays.append(rebased_ov)
 
-                clip_i = dict(project["clips"][si])
-                clip_i["transition"] = "none"
-                clip_i.pop("transition_duration", None)
+                if "clip_start" in scene and "clip_end" in scene:
+                    sc_clips = [
+                        dict(project["clips"][ci])
+                        for ci in range(int(scene["clip_start"]), int(scene["clip_end"]))
+                    ]
+                else:
+                    sc_clips = [dict(project["clips"][si])]
+                # Strip inter-scene incoming transition on the first clip of this
+                # chunk, while preserving intra-scene beat crossfades on clips[1:].
+                sc_clips[0]["transition"] = "none"
+                sc_clips[0].pop("transition_duration", None)
+                clip_i = sc_clips[0]
 
                 chunk_proj = {
                     "id": f"{project.get('id', 'proj')}_chunk_{si}",
                     "version": 1,
                     "output": dict(project["output"]),
-                    "clips": [clip_i],
+                    "clips": sc_clips,
                     "audio": [{"src": scene["narration"], "kind": "voice", "volume": 1.0, "start": 0.0}],
                     "captions": sc_captions,
                     "texts": sc_texts,
@@ -7581,6 +7613,74 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _validate_editorial_beats(scene, sid, dur):
+    """Validate + normalize a scene's editorial beats (v1.64.0).
+
+    Returns (beats, error_dict_or_None). beats is a list of
+    {start, end, broll} (broll None when the beat has no image —
+    the caller falls back to the scene background/gradient).
+    A scene without a beats key is ONE beat for the whole scene.
+    Rules: beats must be a non-empty list of objects with
+    numeric start/end, end > start, both inside 0..dur; the
+    slots must TILE the scene duration (sum == dur within
+    0.05s) so the visual timeline stays in sync with the
+    narration; a beat broll must be a string when present (the
+    caller checks the file exists, like cinematic broll).
+    Rounding epsilon: a beat end past dur by at most 0.05s is
+    CLAMPED to dur, not rejected — Whisper's scene duration
+    (rounded to 3 decimals in the bundle manifest) can
+    overshoot ffprobe's exact narration duration by
+    microseconds, and the last beat ends at the Whisper
+    duration (same rule as _validate_scene_word_timings).
+    """
+    raw = scene.get("beats")
+    if raw is None:
+        return [{"start": 0.0, "end": float(dur), "broll": None}], None
+    if not isinstance(raw, list) or not raw:
+        return None, {"code": "INVALID_SCHEMA",
+                      "message": f"scene {sid} beats must be a non-empty list",
+                      "fix": f"give scene {sid} beats as [{{start, end, broll?}}] tiling 0..{dur:.2f}s, or remove beats for one shot per scene"}
+    beats = []
+    total = 0.0
+    for bi, b in enumerate(raw):
+        if not isinstance(b, dict):
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} beat {bi} must be an object",
+                          "fix": f"give scene {sid} beat {bi} as {{start, end, broll?}}"}
+        try:
+            bs, be = float(b["start"]), float(b["end"])
+        except (KeyError, TypeError, ValueError):
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} beat {bi} needs numeric start/end (scene-relative seconds)",
+                          "fix": f"set scene {sid} beat {bi} start/end inside 0..{dur:.2f}"}
+        if be > dur + 1e-9:
+            if be - dur <= 0.05:
+                # Whisper/ffprobe rounding epsilon (see the
+                # docstring): clamp the overshoot, don't reject.
+                be = dur
+            else:
+                return None, {"code": "CLIP_OUT_OF_RANGE",
+                              "message": f"scene {sid} beat {bi} window {bs}..{be}s is outside its scene (0..{dur:.2f}s)",
+                              "fix": f"keep scene {sid} beat {bi} start/end inside 0..{dur:.2f} with end after start"}
+        if bs < 0 or be <= bs:
+            return None, {"code": "CLIP_OUT_OF_RANGE",
+                          "message": f"scene {sid} beat {bi} window {bs}..{be}s is outside its scene (0..{dur:.2f}s)",
+                          "fix": f"keep scene {sid} beat {bi} start/end inside 0..{dur:.2f} with end after start"}
+        bb = b.get("broll")
+        if bb is not None and not isinstance(bb, str):
+            return None, {"code": "INVALID_SCHEMA",
+                          "message": f"scene {sid} beat {bi} broll must be a local file path string",
+                          "fix": f"set scene {sid} beat {bi} broll to a local image file, or remove it for the gradient"}
+        beats.append({"start": round(bs, 3), "end": round(be, 3),
+                      "broll": bb})
+        total += be - bs
+    if abs(total - dur) > 0.05:
+        return None, {"code": "INVALID_SCHEMA",
+                      "message": f"scene {sid} beat slots sum to {total:.2f}s but the scene is {dur:.2f}s",
+                      "fix": f"make scene {sid} beats tile the whole scene (0..{dur:.2f}s) so the visuals stay in sync with the narration"}
+    return beats, None
+
+
 def _validate_scene_word_timings(wt, sid, dur):
     """Validate a brief scene's explicit word_timings (v1.63.0,
     Task A): the AgentMedia bundle path — per-word timings from
@@ -7724,6 +7824,34 @@ def produce_explainer(brief, output_path, review_dir=None):
       explicit Ken Burns, so default_image_motion stays off.
       Note: style "cinematic" and look "cinematic" are
       separate keys and combine freely.
+    - style "editorial" (v1.64.0) opts into the clean
+      editorial theatre (compositor.py): full-bleed crisp
+      visuals (no heavy blur, no darkening — a light vignette
+      only, plus a bottom-32% gradient scrim for the captions),
+      visual BEATS instead of one image per scene (a scene
+      "beats" list of {start, end, broll?} — AgentMedia
+      0.13.0 bundles carry it; a scene without beats is one
+      beat for the whole scene), a 4-move alternating camera
+      choreography across beats (zoom_in 1.0->1.18x, pan_right
+      @1.14x, zoom_out 1.18->1.0x, pan_left @1.14x, smoothstep,
+      global beat counter), a 0.25s crossfade between beats
+      inside a scene and a hard cut between scenes, NO top
+      header (no fixed title, no scene titles, no pacing
+      lower-thirds), NO floating subject, and full-sentence
+      pill captions ONLY — karaoke is rejected in editorial
+      (its word highlight moves punctuation mid-line), as are
+      scene subject/keywords/diagrams (the highlight_card is
+      the only overlay vocabulary). A scene "highlight_card"
+      {title, subtitle?, trigger_word?, start?, duration?}
+      shows a glass card in the middle third for 2.8s (default)
+      with a slide+fade entrance; its start is the explicit
+      start when given, else the trigger word's time in the
+      scene's word_timings, else the scene middle. Beat clips
+      carry slot+0.25s durations (except the last beat of a
+      scene) so the xfade overlaps land exactly on the slot
+      boundaries and the visual timeline stays in sync with
+      the narration. Parallel rendering is forced off for
+      editorial (the parallel path assumes one clip per scene).
     - look (v1.40.0, optional) picks a profile from
       EXPLAINER_LOOKS — clean, cinematic, vintage, bold,
       still, modern — combining clip treatment + grade +
@@ -7795,11 +7923,19 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"punch_in is not allowed in a one-button explainer (found at {punched})",
                        "fix": "remove punch_in from the brief; gentle motion (default_image_motion) is the only motion in this path"}
+    if brief.get("humanize") and not brief.get("humanized"):
+        from .director import humanize_brief
+        brief = humanize_brief(
+            brief,
+            cinema_look=str(brief.get("cinema_look") or "chiaroscuro_doc"),
+            add_soundscape=bool(brief.get("add_soundscape", True)),
+            auto_cards=bool(brief.get("auto_cards", True)),
+        )
     style = brief.get("style", "blackboard")
-    if style not in ("blackboard", "cinematic"):
+    if style not in ("blackboard", "cinematic", "editorial"):
         return False, {"code": "INVALID_SCHEMA",
-                       "message": f"explainer style must be 'blackboard' or 'cinematic', got {style!r}",
-                       "fix": "set style to 'blackboard' (the classic board) or 'cinematic' (the 3-layer compositor), or remove it for the blackboard default"}
+                       "message": f"explainer style must be 'blackboard', 'cinematic' or 'editorial', got {style!r}",
+                       "fix": "set style to 'blackboard' (the classic board), 'cinematic' (the 3-layer compositor) or 'editorial' (the clean editorial theatre), or remove it for the blackboard default"}
     # v1.62.0: the 3-layer cinematic compositor (compositor.py).
     # style "cinematic" opts a brief into it; "blackboard" (or
     # absent) renders exactly as before. Cinematic is the new
@@ -7808,7 +7944,11 @@ def produce_explainer(brief, output_path, review_dir=None):
     # separate keys — look "cinematic" is a treatment/grade
     # profile that applies on ANY background, while style
     # "cinematic" is the compositor; they combine freely.
+    # v1.64.0: style "editorial" opts into the clean editorial
+    # theatre (beats, alternating camera, no header, pill
+    # captions only) — see the docstring above.
     cinematic = (style == "cinematic")
+    editorial = (style == "editorial")
     # v1.40.0: look profiles (EXPLAINER_LOOKS above). Unknown
     # looks are rejected with the known list; a brief field
     # always wins over its look counterpart (motion below).
@@ -7838,14 +7978,16 @@ def produce_explainer(brief, output_path, review_dir=None):
                        "fix": "set output width and height, e.g. 720 and 1280, or remove output for the 720x1280 default"}
     background = brief.get("background")
     _bg_is_gradient = False
-    if cinematic and (not isinstance(background, str) or not background
-                      or background == "canvas"):
-        # v1.62.0, cinematic Layer 1 fallback: no board image
-        # (or the "canvas" sentinel) means a rich cinematic
-        # gradient background, generated beside the output (it
-        # must outlive this call, since the project references
-        # it by path) — never a flat solid colour, never the
-        # black board.
+    if (cinematic or editorial) and (not isinstance(background, str)
+                                     or not background
+                                     or background == "canvas"):
+        # v1.62.0, cinematic Layer 1 fallback (v1.64.0: also the
+        # editorial fallback for beats without an image): no
+        # board image (or the "canvas" sentinel) means a rich
+        # cinematic gradient background, generated beside the
+        # output (it must outlive this call, since the project
+        # references it by path) — never a flat solid colour,
+        # never the black board.
         from .compositor import write_cinematic_gradient
         _grad_path = os.path.join(
             os.path.dirname(os.path.abspath(output_path)),
@@ -7889,6 +8031,14 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_SCHEMA",
                        "message": f"captions_style must be 'plain', 'karaoke', or 'karaoke_pill', got {captions_style!r}",
                        "fix": "set captions_style to 'karaoke_pill', 'karaoke', or 'plain'"}
+    # v1.64.0, editorial: full-sentence pill captions ONLY —
+    # the karaoke word highlight moves punctuation mid-line.
+    # (Scene-level overrides are rejected in the scene loop via
+    # is_karaoke below.)
+    if editorial and captions_style in ("karaoke", "karaoke_pill"):
+        return False, {"code": "INVALID_SCHEMA",
+                       "message": "captions_style must be 'plain' in editorial mode",
+                       "fix": "set captions_style to 'plain' (editorial uses the full-sentence pill; karaoke word-highlight is rejected)"}
     scenes_in = brief.get("scenes")
     if not isinstance(scenes_in, list) or not scenes_in:
         return False, {"code": "EMPTY_TIMELINE",
@@ -7956,6 +8106,13 @@ def produce_explainer(brief, output_path, review_dir=None):
         if _ts else 52
     _scene_y = max(190, _fixed_y + int(round(60 * 1.4)) + 16) \
         if _safe else 190
+    # v1.64.0, editorial: the camera cycle runs on a GLOBAL beat
+    # counter across the whole video (not per scene), so no two
+    # consecutive shots move the same way; _ed_warnings collects
+    # soft editorial notes (e.g. a highlight trigger word the
+    # timings never spoke) for the result.
+    _ed_beat_index = 0
+    _ed_warnings = []
     total = 0.0
     for si, scene in enumerate(scenes_in):
         if not isinstance(scene, dict):
@@ -8040,6 +8197,30 @@ def produce_explainer(brief, output_path, review_dir=None):
                       or scene.get("caption_style") in ("karaoke", "karaoke_pill")
                       or brief.get("caption_style") in ("karaoke", "karaoke_pill")
                       or bool(scene.get("kinetic")))
+        # v1.64.0, editorial: karaoke (brief-level, scene-level
+        # or kinetic) is rejected — the full-sentence pill is
+        # the only caption path (the brief-level case already
+        # failed fast above; this catches scene overrides).
+        if editorial and is_karaoke:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} uses karaoke/kinetic captions, rejected in editorial mode",
+                           "fix": f"remove the karaoke/kinetic caption style from scene {sid} (editorial uses the full-sentence pill)"}
+        # v1.64.0, editorial: the strict-mode rejections — the
+        # highlight_card is the only overlay vocabulary, so a
+        # floating subject, keyword callouts or diagrams have
+        # no place on the clean screen.
+        if editorial and scene.get("subject"):
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} subject is rejected in editorial mode",
+                           "fix": f"remove subject from scene {sid} (editorial has no floating foreground subjects)"}
+        if editorial and scene.get("keywords"):
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} keywords are rejected in editorial mode",
+                           "fix": f"remove keywords from scene {sid} (use highlight_card for a stat or key line instead)"}
+        if editorial and scene.get("diagram") is not None:
+            return False, {"code": "INVALID_SCHEMA",
+                           "message": f"scene {sid} diagram is rejected in editorial mode",
+                           "fix": f"remove diagram from scene {sid} (editorial keeps the screen clean)"}
         # v1.63.0 (Task A): word timings are consumed once — a
         # word assigned to one cue is never reused by the next
         # (a boundary word used to match two cues within the
@@ -8172,11 +8353,11 @@ def produce_explainer(brief, output_path, review_dir=None):
         scene_kind = "image"
         is_broll = False
         if scene_broll and scene_broll != "canvas":
-            if cinematic:
+            if cinematic or editorial:
                 if not isinstance(scene_broll, str) or not os.path.isfile(
                         resolve_path(scene_broll)):
                     return False, {"code": "FILE_NOT_FOUND",
-                                   "message": f"scene {sid} broll must be a local file in cinematic mode: {scene_broll!r}",
+                                   "message": f"scene {sid} broll must be a local file in {style} mode: {scene_broll!r}",
                                    "fix": f"set scene {sid} broll to a local image/video file from AgentMedia, or remove it for the gradient background"}
                 from .broll import is_video_file
                 scene_src = resolve_path(scene_broll)
@@ -8190,41 +8371,116 @@ def produce_explainer(brief, output_path, review_dir=None):
                     scene_kind = "video" if is_video_file(res_broll) else "image"
                     is_broll = True
 
-        clip_entry = {"id": sid, "kind": scene_kind, "src": scene_src,
-                      "duration": dur, "transition": scene_trans}
-        if scene_trans != "none":
-            clip_entry["transition_duration"] = float(
-                scene.get("transition_duration", brief.get("transition_duration", 0.5))
-            )
+        _scene_clip_start = len(clips)
+        if editorial:
+            # v1.64.0, editorial beats: one clip per beat, a
+            # 0.25s crossfade between beats inside the scene,
+            # a hard cut between scenes. Timeline math (the
+            # xfade join overlaps by transition_duration and
+            # the fade runs over the LAST 0.25s of the outgoing
+            # span): every beat except the last carries +0.25s,
+            # so each fade starts exactly on its slot boundary
+            # and the visual span equals the scene duration —
+            # the narration and captions (absolute timeline)
+            # stay in sync. The camera cycles on the GLOBAL
+            # beat counter. A beat without an image falls back
+            # to the scene broll, then the gradient background.
+            from .compositor import (EDITORIAL_XFADE,
+                                     editorial_layer1_clip)
+            from .broll import is_video_file as _ed_is_video
+            _beats, _beats_err = _validate_editorial_beats(
+                scene, sid, dur)
+            if _beats_err is not None:
+                return False, _beats_err
+            _scene_first_clip = len(clips)
+            for _bi, _beat in enumerate(_beats):
+                _slot = _beat["end"] - _beat["start"]
+                _is_last_beat = (_bi == len(_beats) - 1)
+                _clip_dur = (_slot if _is_last_beat
+                             else _slot + EDITORIAL_XFADE)
+                _beat_broll = _beat.get("broll") or scene_broll
+                if _beat_broll and _beat_broll != "canvas":
+                    if not isinstance(_beat_broll, str) or not os.path.isfile(
+                            resolve_path(_beat_broll)):
+                        return False, {"code": "FILE_NOT_FOUND",
+                                       "message": f"scene {sid} beat {_bi + 1} broll must be a local file in editorial mode: {_beat_broll!r}",
+                                       "fix": f"set scene {sid} beat {_bi + 1} broll to a local image file from AgentMedia, or remove it for the gradient background"}
+                    _beat_src = resolve_path(_beat_broll)
+                    _beat_kind = ("video" if _ed_is_video(_beat_src)
+                                  else "image")
+                else:
+                    _beat_src = background
+                    _beat_kind = "image"
+                _beat_clip = {"id": f"{sid}-beat{_bi + 1:02d}",
+                              "kind": _beat_kind, "src": _beat_src,
+                              "duration": round(_clip_dur, 3),
+                              # "crossfade" (not "fade"): "fade" is a
+                              # fade-to-black that CONCATENATES —
+                              # only XFADE_TRANSITIONS overlap the
+                              # timeline (validate._recompute_clip_starts).
+                              "transition": ("crossfade" if _bi > 0
+                                             else scene_trans)}
+                if _bi > 0:
+                    _beat_clip["transition_duration"] = EDITORIAL_XFADE
+                elif scene_trans != "none":
+                    _beat_clip["transition_duration"] = float(
+                        scene.get("transition_duration",
+                                  brief.get("transition_duration", 0.5)))
+                editorial_layer1_clip(
+                    _beat_clip,
+                    _ed_beat_index,
+                    camera_move=_beat.get("camera_move") or scene.get("camera_move"),
+                    cinema_look=brief.get("cinema_look"),
+                )
+                _exp_vf = _beat.get("exposure_vf") or scene.get("exposure_vf")
+                if _exp_vf:
+                    _beat_clip["exposure_vf"] = str(_exp_vf)
+                if look.get("grade"):
+                    _beat_clip["grade"] = look["grade"]
+                clips.append(_beat_clip)
+                _ed_beat_index += 1
+            # v1.41.0, rich SFX: the scene-change whoosh marks
+            # the scene START (its first beat clip), not the
+            # last beat (the generic whoosh below is skipped
+            # for editorial).
+            if rich and si > 0:
+                clips[_scene_first_clip]["sfx"] = "whoosh"
+        else:
+            clip_entry = {"id": sid, "kind": scene_kind, "src": scene_src,
+                          "duration": dur, "transition": scene_trans}
+            if scene_trans != "none":
+                clip_entry["transition_duration"] = float(
+                    scene.get("transition_duration", brief.get("transition_duration", 0.5))
+                )
 
-        # v1.62.0, cinematic Layer 1: the cinematic treatment
-        # (blur + darkening + contrast + vignette) and cycled
-        # slow Ken Burns on stills — the compositor owns the
-        # look, so it replaces the look treatment (the look's
-        # grade still applies below). A scene on the GENERATED
-        # gradient gets the lighter gradient treatment (no
-        # darkening — the gradient is already dark).
-        if cinematic:
-            from .compositor import GRADIENT_TREATMENT, cinematic_layer1_clip
-            if _bg_is_gradient and not is_broll:
-                cinematic_layer1_clip(clip_entry, si,
-                                      treatment=GRADIENT_TREATMENT)
-            else:
-                cinematic_layer1_clip(clip_entry, si)
-        # v1.60.0: B-roll cinematic legibility grading (depth of field, vignette, darkening)
-        elif is_broll:
-            clip_entry["treatment"] = {
-                "blur": 6.0,
-                "brightness": -0.22,
-                "contrast": 1.12,
-                "saturation": 0.85,
-                "vignette": 1.0,
-            }
-        elif look.get("treatment"):
-            clip_entry["treatment"] = dict(look["treatment"])
-        if look.get("grade"):
-            clip_entry["grade"] = look["grade"]
-        clips.append(clip_entry)
+            # v1.62.0, cinematic Layer 1: the cinematic treatment
+            # (blur + darkening + contrast + vignette) and cycled
+            # slow Ken Burns on stills — the compositor owns the
+            # look, so it replaces the look treatment (the look's
+            # grade still applies below). A scene on the GENERATED
+            # gradient gets the lighter gradient treatment (no
+            # darkening — the gradient is already dark).
+            if cinematic:
+                from .compositor import GRADIENT_TREATMENT, cinematic_layer1_clip
+                if _bg_is_gradient and not is_broll:
+                    cinematic_layer1_clip(clip_entry, si,
+                                          treatment=GRADIENT_TREATMENT)
+                else:
+                    cinematic_layer1_clip(clip_entry, si)
+            # v1.60.0: B-roll cinematic legibility grading (depth of field, vignette, darkening)
+            elif is_broll:
+                clip_entry["treatment"] = {
+                    "blur": 6.0,
+                    "brightness": -0.22,
+                    "contrast": 1.12,
+                    "saturation": 0.85,
+                    "vignette": 1.0,
+                }
+            elif look.get("treatment"):
+                clip_entry["treatment"] = dict(look["treatment"])
+            if look.get("grade"):
+                clip_entry["grade"] = look["grade"]
+            clips.append(clip_entry)
         # v1.62.0, cinematic Layer 2: a background-removed
         # foreground subject (transparent PNG from AgentMedia
         # remove_background) with a spring entrance + measured
@@ -8259,7 +8515,8 @@ def produce_explainer(brief, output_path, review_dir=None):
                                "fix": "set subject_placement to 'center', 'left' or 'right'"}
         # v1.41.0, rich SFX: every scene after the first opens
         # with a whoosh, so scene changes are heard, not just seen.
-        if rich and si > 0:
+        # (Editorial marks its first beat clip above instead.)
+        if rich and si > 0 and not editorial:
             clips[-1]["sfx"] = "whoosh"
         audio.append({"src": narration, "kind": "voice", "volume": 1.0,
                       "start": start})
@@ -8268,11 +8525,14 @@ def produce_explainer(brief, output_path, review_dir=None):
         # a lower_third (beat 0, spring) instead of the static
         # yellow text — the static text would duplicate it.
         # Short scenes and pacing=false keep the static text.
-        _long_paced = bool(pacing) and dur >= 13.0
+        # v1.64.0, editorial: NO titles at all (no lower-third,
+        # no static scene title) — the screen stays clean.
+        _long_paced = bool(pacing) and dur >= 13.0 and not editorial
         if _long_paced:
             motion_els.extend(_explainer_pacing_beats(
                 start, dur, stitle, si, len(scenes_in), width, height))
-        if isinstance(stitle, str) and stitle.strip() and not _long_paced:
+        if (isinstance(stitle, str) and stitle.strip()
+                and not _long_paced and not editorial):
             st_text = stitle.strip()
             st_size = _scene_title_size if look.get("title_style") else 52
             st_font = find_font_for_text(st_text)
@@ -8525,11 +8785,130 @@ def produce_explainer(brief, output_path, review_dir=None):
                     width=width, accent_bar=True, drop_shadow=True,
                     project_dir=os.path.dirname(
                         os.path.abspath(output_path))))
+        # v1.64.0, editorial highlight_card: a glass card in the
+        # middle third for 2.8s (default) at a stat / key line,
+        # then gone — the screen stays clean the rest of the
+        # time. Start: the explicit start wins; else the trigger
+        # word's time in the scene's word_timings (explicit key
+        # or TTS timings); else the scene middle. The card fades
+        # in 0.25s / out 0.20s (glass_card_overlay) while texts
+        # hard-cut, so the text window is inset by the fades —
+        # text only shows while the card is opaque.
+        _hc = scene.get("highlight_card")
+        if _hc is not None:
+            if not editorial:
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} highlight_card is only supported in editorial mode",
+                               "fix": f"remove highlight_card from scene {sid}, or set style to 'editorial'"}
+            if (not isinstance(_hc, dict)
+                    or not str(_hc.get("title", "")).strip()):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} highlight_card must be an object with a non-empty title",
+                               "fix": f"give scene {sid} highlight_card as {{title, subtitle?, trigger_word?, start?, duration?}}"}
+            from .compositor import (HIGHLIGHT_CARD_DURATION,
+                                     HIGHLIGHT_CARD_WIDTH_FRAC,
+                                     editorial_card_rect,
+                                     glass_card_overlay)
+            _hc_title = str(_hc["title"]).strip()
+            _hc_sub = _hc.get("subtitle")
+            _hc_sub = (str(_hc_sub).strip()
+                       if isinstance(_hc_sub, str) and _hc_sub.strip()
+                       else None)
+            try:
+                _hc_dur = float(_hc.get("duration",
+                                        HIGHLIGHT_CARD_DURATION))
+            except (TypeError, ValueError):
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} highlight_card duration must be a number",
+                               "fix": f"set scene {sid} highlight_card duration to e.g. 2.8, or remove it for the 2.8s default"}
+            if _hc_dur <= 0:
+                return False, {"code": "INVALID_SCHEMA",
+                               "message": f"scene {sid} highlight_card duration must be positive",
+                               "fix": f"set scene {sid} highlight_card duration to e.g. 2.8"}
+            _hc_dur = min(_hc_dur, dur)
+            _hc_start = None
+            if _hc.get("start") is not None:
+                try:
+                    _hc_start = float(_hc["start"])
+                except (TypeError, ValueError):
+                    return False, {"code": "INVALID_SCHEMA",
+                                   "message": f"scene {sid} highlight_card start must be a number (scene-relative seconds)",
+                                   "fix": f"set scene {sid} highlight_card start inside 0..{dur:.2f}, or remove it to derive it from the trigger word"}
+            elif _hc.get("trigger_word"):
+                _trig = re.sub(r'[\u064B-\u065F\u0670]', '',
+                               str(_hc["trigger_word"])).strip(
+                                   ".,!?;:()[]\"' ")
+                if scene_word_timings:
+                    for _wt in scene_word_timings:
+                        _ww = re.sub(r'[\u064B-\u065F\u0670]', '',
+                                     str(_wt.get("word", ""))).strip(
+                                         ".,!?;:()[]\"' ")
+                        if _ww and (_ww == _trig or _trig in _ww):
+                            _hc_start = float(_wt["start"])
+                            break
+                if _hc_start is None:
+                    _ed_warnings.append(
+                        f"scene {sid}: highlight trigger word "
+                        f"{_hc['trigger_word']!r} not found in word "
+                        f"timings; card placed mid-scene")
+            if _hc_start is None:
+                _hc_start = max(0.0, dur / 2.0 - _hc_dur / 2.0)
+            _hc_start = max(0.0, min(_hc_start, dur - _hc_dur))
+            _hc_title_size = 64
+            _hc_sub_size = 30
+            _hc_w = int(round(width * HIGHLIGHT_CARD_WIDTH_FRAC))
+            _hc_font = find_font_for_text(_hc_title)
+            if _hc_font:
+                _tw = _measure_text_width(_hc_title, _hc_font,
+                                          _hc_title_size)
+                if _tw > _hc_w - 48:
+                    _hc_title_size = max(
+                        28, int(_hc_title_size * (_hc_w - 48) / _tw))
+                if _hc_sub:
+                    _sf = find_font_for_text(_hc_sub)
+                    if _sf:
+                        _sw = _measure_text_width(_hc_sub, _sf,
+                                                  _hc_sub_size)
+                        if _sw > _hc_w - 48:
+                            _hc_sub_size = max(
+                                20, int(_hc_sub_size * (_hc_w - 48) / _sw))
+            _hc_h = int(round(_hc_title_size * 1.4 + 32))
+            if _hc_sub:
+                _hc_h = int(round(_hc_title_size * 1.4
+                                  + _hc_sub_size * 1.4 + 40))
+            _hc_x, _hc_y, _hc_w2, _hc_h2 = editorial_card_rect(
+                width, height, _hc_w, _hc_h)
+            _hc_abs_start = round(start + _hc_start, 3)
+            overlays.append(glass_card_overlay(
+                overlay_id=f"ed-card-{sid}",
+                x=_hc_x, y=_hc_y, w=_hc_w2, h=_hc_h2,
+                start=_hc_abs_start, duration=round(_hc_dur, 3),
+                width=width, accent_bar=False, drop_shadow=True,
+                project_dir=os.path.dirname(
+                    os.path.abspath(output_path))))
+            _tx0 = _hc_abs_start + 0.25
+            _tx1 = _hc_abs_start + _hc_dur - 0.20
+            if _tx1 - _tx0 < 0.5:
+                _tx0, _tx1 = _hc_abs_start, _hc_abs_start + _hc_dur
+            texts.append({"text": _hc_title, "start": round(_tx0, 3),
+                          "end": round(_tx1, 3), "size": _hc_title_size,
+                          "x": "center", "y": _hc_y + 16,
+                          "color": "yellow", "box": False})
+            if _hc_sub:
+                texts.append({
+                    "text": _hc_sub, "start": round(_tx0, 3),
+                    "end": round(_tx1, 3), "size": _hc_sub_size,
+                    "x": "center",
+                    "y": _hc_y + 16 + int(round(_hc_title_size * 1.4)) + 4,
+                    "color": "white", "box": False})
         scenes.append({"id": sid, "title": stitle, "start": round(start, 3),
                        "end": round(end, 3), "duration": round(dur, 3),
-                       "narration": narration, "captions": srt_path})
+                       "narration": narration, "captions": srt_path,
+                       "clip_start": _scene_clip_start, "clip_end": len(clips)})
         total = end
-    if title:
+    # v1.64.0, editorial: NO fixed title — the screen stays
+    # clean (no header at all in editorial mode).
+    if title and not editorial:
         t_text = str(title).strip()
         t_size = 60
         t_font = find_font_for_text(t_text)
@@ -8545,6 +8924,13 @@ def produce_explainer(brief, output_path, review_dir=None):
         texts.insert(0, {"text": t_text, "start": 0.0, "end": round(total, 3),
                          "size": t_size, "x": "center", "y": _fixed_y,
                          "color": "white", "box": False})
+    # v1.64.0, editorial: bottom-32% scrim only (no top scrim —
+    # there is no header to keep legible).
+    if editorial:
+        from .compositor import EDITORIAL_SCRIM
+        _scrims = dict(EDITORIAL_SCRIM)
+    else:
+        _scrims = {"top": True, "bottom": True}
     project = {
         "id": brief.get("id", "explainer"),
         "title": title or "Explainer",
@@ -8558,11 +8944,13 @@ def produce_explainer(brief, output_path, review_dir=None):
         "diagrams": diagrams,
         "motion": motion_els,
         "overlays": overlays,
-        "scrims": {"top": True, "bottom": True},
+        "scrims": _scrims,
         # v1.62.0: cinematic clips carry explicit Ken Burns
         # (Layer 1), so the default image motion stays off —
-        # the compositor owns the camera.
-        "default_image_motion": motion == "gentle" and not cinematic,
+        # the compositor owns the camera. Same for editorial
+        # (v1.64.0): every beat clip carries its own move.
+        "default_image_motion": (motion == "gentle" and not cinematic
+                                 and not editorial),
     }
     if brief.get("chapters"):
         project["chapters"] = [{"title": s["title"] or s["id"],
@@ -8591,7 +8979,7 @@ def produce_explainer(brief, output_path, review_dir=None):
         return False, {"code": "INVALID_PROJECT", "errors": errors}
     # v1.41.0: bed audibility, same check as produce QA (the
     # explainer result has no qa block, so warnings ride here).
-    explainer_warnings = []
+    explainer_warnings = list(_ed_warnings)
     _bed = check_music_bed(info)
     if _bed is not None and _bed["warn"]:
         explainer_warnings.append(
@@ -8605,25 +8993,57 @@ def produce_explainer(brief, output_path, review_dir=None):
     # load (the failed run left no partial file — renders
     # are atomic — so the retry is still one finished
     # video from one call).
-    # Phase 3: Hardware acceleration, Parallel chunking, and Ultra-Fast Draft Mode
+    # Phase 3 / v2.0.0: Hardware profiles, multi-beat parallel chunking, and Draft/Proxy Mode
+    if brief.get("render_profile"):
+        from .profiles import get_render_profile
+        _prof = get_render_profile(brief["render_profile"])
+        if "scale_factor" not in brief and not brief.get("draft"):
+            brief = dict(brief)
+            brief["scale_factor"] = _prof["scale_factor"]
+        if "video_preset" not in brief:
+            brief = dict(brief)
+            brief["video_preset"] = _prof["video_preset"]
+        if "max_workers" not in brief:
+            brief = dict(brief)
+            brief["max_workers"] = _prof["max_workers"]
+
     video_codec = brief.get("video_codec", "auto")
     is_draft = bool(brief.get("draft") or brief.get("mode") == "draft")
-    scale_factor = 0.5 if is_draft else float(brief.get("scale_factor", 1.0))
-    video_preset = "ultrafast" if is_draft else brief.get("video_preset")
+    scale_factor = float(brief.get("scale_factor", 0.5 if is_draft else 1.0))
+    video_preset = brief.get("video_preset") or ("ultrafast" if is_draft else None)
     is_parallel = bool(brief.get("parallel") or brief.get("render_mode") == "parallel")
+    max_workers = brief.get("max_workers")
 
     timeout = max(600, int(total * 20))
+    # v2.0.0: parallel rendering now supports multi-beat editorial scenes!
+    # Each scene chunk preserves its intra-scene beat crossfades while
+    # hard-cutting cleanly between scenes via concat filter.
     if is_parallel and len(scenes) >= 2:
         ok, rinfo = _render_explainer_parallel(
             project, scenes, output_path, scale_factor=scale_factor,
             video_codec=video_codec, video_preset=video_preset, timeout=timeout,
-            use_cache=bool(brief.get("cache_scenes", True)))
+            use_cache=bool(brief.get("cache_scenes", True)),
+            max_workers=max_workers)
     else:
         ok, rinfo = render_project(
             project, output_path, scale_factor=scale_factor,
             video_codec=video_codec, video_preset=video_preset, timeout=timeout)
     if not ok:
         return False, rinfo
+    soundscape_mix = None
+    if brief.get("soundscape") and brief.get("mix_soundscape", True):
+        try:
+            from .pipeline.audio_mixer import mix_soundscape_into_video
+            _ok_mix, _mix_info = mix_soundscape_into_video(
+                output_path,
+                output_path,
+                brief["soundscape"],
+                total_duration=float(info["total_duration"]),
+            )
+            if _ok_mix:
+                soundscape_mix = _mix_info
+        except Exception:
+            soundscape_mix = None
     if review_dir is None:
         review_dir = output_path + ".review"
     os.makedirs(review_dir, exist_ok=True)
@@ -8646,7 +9066,9 @@ def produce_explainer(brief, output_path, review_dir=None):
         "parallel": is_parallel and len(scenes) >= 2,
         # v1.62.0: scene-cache hits from the parallel render
         # (0 for the serial path, which has no scene cache).
+        "parallel_chunks": rinfo.get("parallel_chunks", 0),
         "cache_hits": rinfo.get("cache_hits", 0),
+        "soundscape_mix": soundscape_mix,
         "scenes": scenes,
         "chapters": info.get("chapters", []),
         "warnings": explainer_warnings,

@@ -1469,6 +1469,26 @@ class TestAgentCut(unittest.TestCase):
         self.assertTrue(arabic_font and "Noto" in arabic_font, arabic_font)
         self.assertEqual(find_font_for_text("Hello world"), find_font())
 
+    def test_arabic_with_percent_uses_dual_script_font(self):
+        # Editorial essay run 2: the highlight card "70% من الوقت"
+        # rendered "70[box]" — NotoSansArabic-Bold has no % glyph
+        # (nor ? ( ) etc.). Arabic text with ASCII outside the
+        # safe set (digits, space, ! , . :) must take a
+        # dual-script font; digits alone stay on the Arabic font.
+        from agentcut.validate import (DUAL_SCRIPT_FONT_FILES,
+                                       find_font_for_text)
+        import os
+        dual = find_font_for_text("70% من الوقت")
+        self.assertTrue(
+            dual and os.path.basename(dual) in DUAL_SCRIPT_FONT_FILES,
+            dual)
+        dual2 = find_font_for_text("نص (بين قوسين)")
+        self.assertTrue(
+            dual2 and os.path.basename(dual2) in DUAL_SCRIPT_FONT_FILES,
+            dual2)
+        arabic = find_font_for_text("العام 2026")
+        self.assertTrue(arabic and "Noto" in arabic, arabic)
+
     def test_arabic_text_renders(self):
         # Visual shaping was verified by eye on a frame (joined
         # letters, correct RTL order) with this FFmpeg build
@@ -8624,9 +8644,9 @@ class TestLoop142(unittest.TestCase):
 
     def test_fix6_version_is_1_63_0(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "1.63.0")
+        self.assertEqual(agentcut.__version__, "3.2.0")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.63.0")
+            self.assertEqual(f.read().strip(), "3.2.0")
 
 
 class TestLoop143(unittest.TestCase):

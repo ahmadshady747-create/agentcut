@@ -27,13 +27,53 @@ from .render import JobStore, check_brief_conformance, poster_frame, preview_pro
 from .validate import probe_media, validate_project
 
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA = os.path.join(BASE, "data")
+
+
+def _resolve_data_dir() -> str:
+    """Resolve writable AgentCut data directory safely (v2.0.0).
+
+    Priority:
+      1. AGENTCUT_HOME environment variable (if set).
+      2. Source checkout `<repo>/data` when running from a writable repo tree
+         (detected by pyproject.toml next to src/).
+      3. User data dir (~/.local/share/agentcut or %LOCALAPPDATA%\agentcut)
+         so `pip install` into read-only site-packages never raises PermissionError.
+    """
+    env_home = os.environ.get("AGENTCUT_HOME", "").strip()
+    if env_home:
+        return os.path.abspath(os.path.expanduser(env_home))
+    repo_data = os.path.join(BASE, "data")
+    if os.path.isfile(os.path.join(BASE, "pyproject.toml")):
+        try:
+            os.makedirs(repo_data, exist_ok=True)
+            if os.access(repo_data, os.W_OK):
+                return repo_data
+        except OSError:
+            pass
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(root, "agentcut", "data")
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(xdg, "agentcut", "data")
+
+
+DATA = _resolve_data_dir()
 PROJECTS = os.path.join(DATA, "projects")
 SNAPSHOTS = os.path.join(DATA, "snapshots")
 JOBS_DIR = os.path.join(DATA, "jobs")
 OUTPUTS = os.path.join(DATA, "outputs")
-for _d in (PROJECTS, JOBS_DIR, OUTPUTS, SNAPSHOTS):
-    os.makedirs(_d, exist_ok=True)
+
+
+def _ensure_data_dirs() -> None:
+    """Create data subdirectories lazily on first use (safe on read-only installs)."""
+    for _d in (PROJECTS, JOBS_DIR, OUTPUTS, SNAPSHOTS):
+        try:
+            os.makedirs(_d, exist_ok=True)
+        except OSError:
+            pass
+
+
+_ensure_data_dirs()
 
 JOBS = JobStore(JOBS_DIR)
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -73,8 +113,8 @@ def _atomic_write_json(path, data):
             fd, tmp = tempfile.mkstemp(prefix=".agentcut-tmp-",
                                        suffix=".json", dir=directory)
             try:
-                with os.fdopen(fd, "w") as fh:
-                    json.dump(data, fh, indent=2)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, ensure_ascii=False)
                 for _attempt in range(10):
                     try:
                         os.replace(tmp, path)
@@ -415,6 +455,197 @@ TOOLS = [
          "id": {"type": "string"},
          "project": {"type": "object"},
          "output": {"type": "string"}}}},
+    {"name": "list_render_profiles",
+     "description": "List all built-in hardware-aware render profiles (proxy, draft, low_spec, master, cinema) with resolution scaling, FPS, preset, CRF, grain mode, and safe worker counts.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "detect_hardware_profile",
+     "description": "Inspect host CPU cores and available RAM to recommend the safest render profile and max_workers count without OOM or swap thrashing.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "audit_video_quality",
+     "description": "Run automated FFprobe/FFmpeg quality control (QC) on a rendered video: checks SAR=1:1, A/V sync drift, black frames, silence gaps, loudness, and audio clipping, returning a 0-100 score, grade, pass verdict, and actionable fixes.",
+     "inputSchema": {"type": "object", "properties": {
+         "video": {"type": "string", "description": "Path to rendered MP4/MOV video file."},
+         "expected_duration": {"type": "number", "description": "Optional target duration in seconds."},
+         "check_black": {"type": "boolean", "description": "Detect black-frame segments (default true)."},
+         "check_silence": {"type": "boolean", "description": "Detect long silence gaps (default true)."},
+         "require_audio": {"type": "boolean", "description": "Warn if audio stream is missing (default true)."}},
+         "required": ["video"]}},
+    {"name": "validate_media_bundle",
+     "description": "Validate an AgentMedia scene bundle manifest (audio, images, word_timings) before converting to an editorial explainer brief.",
+     "inputSchema": {"type": "object", "properties": {
+         "bundle": {"type": "object", "description": "AgentMedia bundle JSON object."},
+         "check_files": {"type": "boolean", "description": "Verify local file paths exist (default true)."}},
+         "required": ["bundle"]}},
+    {"name": "import_media_bundle",
+     "description": "Convert an AgentMedia bundle into an editorial explainer brief (auto-splitting 2.5-4.0s visual beats at natural speech pauses) and optionally render + QC audit it in one call.",
+     "inputSchema": {"type": "object", "properties": {
+         "bundle": {"type": "object", "description": "AgentMedia bundle JSON object."},
+         "output": {"type": "string", "description": "Optional MP4 output path; if omitted, returns the generated brief without rendering."},
+         "aspect": {"type": "string", "description": "Target aspect ratio (default '9:16')."},
+         "profile": {"type": "string", "description": "Render profile name (proxy, draft, low_spec, master, cinema)."},
+         "parallel": {"type": "boolean", "description": "Enable multi-beat parallel editorial rendering (default true)."},
+         "qc_audit": {"type": "boolean", "description": "Run audit_video_quality after rendering (default false)."}},
+         "required": ["bundle"]}},
+    {"name": "smart_cut_silence",
+     "description": "Analyze a video/audio file with FFmpeg silencedetect to remove dead-air pauses and generate either a jump-cut AgentCut project JSON or a rendered tightened MP4.",
+     "inputSchema": {"type": "object", "properties": {
+         "input": {"type": "string", "description": "Input video/audio file path."},
+         "output": {"type": "string", "description": "Optional output MP4 path; if omitted, returns speech segments and jump-cut project JSON."},
+         "noise_db": {"type": "number", "description": "Silence threshold in dB (default -35.0)."},
+         "min_silence": {"type": "number", "description": "Minimum silence gap to cut in seconds (default 0.55)."}},
+         "required": ["input"]}},
+    {"name": "batch_produce",
+     "description": "Execute a multi-project batch production manifest (explainer, project, bundle, or smart_cut jobs) with concurrency throttling, resume-if-done skipping, error isolation, and optional QC audit.",
+     "inputSchema": {"type": "object", "properties": {
+         "manifest": {"type": "object", "description": "Batch manifest with 'jobs' array and optional 'default_profile' and 'max_concurrency'."},
+         "max_concurrency": {"type": "integer", "description": "Max concurrent jobs (auto-throttled if omitted)."},
+         "resume": {"type": "boolean", "description": "Skip jobs whose output MP4 already exists (default true)."},
+         "qc_audit": {"type": "boolean", "description": "Run QC audit on each completed output (default false)."},
+         "report_path": {"type": "string", "description": "Optional path to write batch_report.json."}},
+         "required": ["manifest"]}},
+    {"name": "get_cache_stats",
+     "description": "Return scene & segment render cache statistics (file counts, total MB, max LRU cap) for a project directory or default temp cache.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_dir": {"type": "string", "description": "Optional project directory containing .agentcut_cache."}}}},
+    {"name": "clear_render_cache",
+     "description": "Clear cached scene MP4s, segment MKVs, and stale temp files from .agentcut_cache and return the count removed.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_dir": {"type": "string", "description": "Optional project directory containing .agentcut_cache."}}}},
+    {"name": "list_cinema_looks",
+     "description": "List all built-in zero-LUT cinema color grades (chiaroscuro_doc, kodak_warm, noir_slate, editorial_clean, warm_archive, midnight_tech) with moods and FFmpeg filter chains.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "humanize_brief",
+     "description": "Transform a mechanical explainer brief into a human-directed editorial documentary brief: applies a cinema_look, narrative-driven non-repetitive organic camera moves, varied transitions, restrained highlight cards, and soundscape/J-cut plan.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Explainer brief JSON object."},
+         "cinema_look": {"type": "string", "description": "Built-in cinema look name (default 'chiaroscuro_doc')."},
+         "add_soundscape": {"type": "boolean", "description": "Attach room tone, SFX cues, and J-cut schedule (default true)."},
+         "auto_cards": {"type": "boolean", "description": "Auto-place restrained highlight cards on key moments (default true)."}},
+         "required": ["brief"]}},
+    {"name": "direct_from_script",
+     "description": "Convert raw Arabic or English essay prose into a complete human-directed editorial brief with reading-time scene pacing, organic camera choreography, varied transitions, restrained highlight cards, and soundscape cues.",
+     "inputSchema": {"type": "object", "properties": {
+         "script": {"type": "string", "description": "Raw Arabic or English script text."},
+         "title": {"type": "string", "description": "Video title (default 'Editorial Essay')."},
+         "cinema_look": {"type": "string", "description": "Cinema look preset (default 'chiaroscuro_doc')."},
+         "aspect": {"type": "string", "description": "Aspect ratio (default '9:16')."},
+         "profile": {"type": "string", "description": "Render profile (default 'low_spec')."}},
+         "required": ["script"]}},
+    {"name": "audit_editorial_craft",
+     "description": "Audit a brief BEFORE rendering for robotic/automated patterns (metronomic beat durations, repetitive camera moves, uniform transitions, card spam, flat soundscape) and return a 0-100 human-feel score with fixes.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Explainer/editorial brief JSON object."}},
+         "required": ["brief"]}},
+    {"name": "synthesize_sfx",
+     "description": "Synthesize organic cinema SFX (chapter_boom, soft_whoosh, card_tick, shimmer_reveal, tension_riser) using pure FFmpeg lavfi with zero external assets.",
+     "inputSchema": {"type": "object", "properties": {
+         "kind": {"type": "string", "description": "SFX kind: chapter_boom, soft_whoosh, card_tick, shimmer_reveal, tension_riser."},
+         "output": {"type": "string", "description": "Output WAV/MP3 path."},
+         "duration": {"type": "number", "description": "Optional duration in seconds."},
+         "volume_db": {"type": "number", "description": "Optional volume in dB."}},
+         "required": ["kind", "output"]}},
+    {"name": "generate_room_tone",
+     "description": "Generate a subtle documentary room-tone ambience bed (warm_studio, soft_vinyl, night_air) so speech pauses never drop into dead digital silence.",
+     "inputSchema": {"type": "object", "properties": {
+         "output": {"type": "string", "description": "Output WAV/MP3 path."},
+         "duration": {"type": "number", "description": "Duration in seconds."},
+         "preset": {"type": "string", "description": "Preset: warm_studio, soft_vinyl, or night_air (default 'warm_studio')."},
+         "volume_db": {"type": "number", "description": "Optional volume in dB (default -38.0)."}},
+         "required": ["output", "duration"]}},
+    {"name": "detect_focal_point",
+     "description": "Detect the subject focal point (focal_x, focal_y) in an image or video frame using zero-dependency gradient-energy centroid analysis so camera moves anchor on the real subject.",
+     "inputSchema": {"type": "object", "properties": {
+         "media": {"type": "string", "description": "Path to local image or video file."},
+         "sample_time": {"type": "number", "description": "Optional timestamp in seconds for video inputs (default 0.0)."}},
+         "required": ["media"]}},
+    {"name": "match_shot_exposure",
+     "description": "Measure average luminance (YAVG) across a sequence of images/shots and compute gentle FFmpeg eq filters to harmonize exposure across cuts.",
+     "inputSchema": {"type": "object", "properties": {
+         "media_paths": {"type": "array", "items": {"type": "string"}, "description": "List of local image/video paths."},
+         "target_yavg": {"type": "number", "description": "Optional target luminance 0-255 (defaults to clamped sequence median)."}},
+         "required": ["media_paths"]}},
+    {"name": "render_chapter_card",
+     "description": "Render a documentary chapter title divider MP4 with Arabic/English BiDi typography, cinema look, fade in/out, and optional procedural chapter_boom SFX.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Chapter title text."},
+         "output": {"type": "string", "description": "Output MP4 path."},
+         "subtitle": {"type": "string", "description": "Optional subtitle."},
+         "chapter_label": {"type": "string", "description": "Optional eyebrow label (e.g. 'الفصل الأول')."},
+         "duration": {"type": "number", "description": "Duration in seconds (default 2.0)."},
+         "width": {"type": "integer", "description": "Video width (default 1080)."},
+         "height": {"type": "integer", "description": "Video height (default 1920)."},
+         "cinema_look": {"type": "string", "description": "Cinema look name (default 'chiaroscuro_doc')."},
+         "with_boom": {"type": "boolean", "description": "Include procedural chapter_boom SFX (default true)."}},
+         "required": ["title", "output"]}},
+    {"name": "render_parallax_clip",
+     "description": "Render a 2.5D depth-of-field parallax shot from a background image and foreground RGBA layer moving at different camera speeds.",
+     "inputSchema": {"type": "object", "properties": {
+         "background": {"type": "string", "description": "Background image path."},
+         "foreground": {"type": "string", "description": "Foreground RGBA image path."},
+         "output": {"type": "string", "description": "Output MP4 path."},
+         "duration": {"type": "number", "description": "Duration in seconds (default 3.5)."},
+         "width": {"type": "integer", "description": "Width (default 1080)."},
+         "height": {"type": "integer", "description": "Height (default 1920)."},
+         "bg_blur": {"type": "number", "description": "Background Gaussian blur sigma (default 2.5)."},
+         "cinema_look": {"type": "string", "description": "Cinema look preset (default 'chiaroscuro_doc')."}},
+         "required": ["background", "foreground", "output"]}},
+    {"name": "compile_timeline_ir",
+     "description": "Compile an explainer/editorial brief into a typed TimelineIR (with optional auto focal-point detection and shot exposure matching) for fast inspection before rendering.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Explainer brief JSON object."},
+         "auto_focal": {"type": "boolean", "description": "Detect focal points on local beat images (default false)."},
+         "match_exposure": {"type": "boolean", "description": "Compute exposure matching filters across beat images (default false)."}},
+         "required": ["brief"]}},
+    {"name": "produce_cinematic_auto_heal",
+     "description": "Run the closed-loop self-healing documentary pipeline: craft audit -> auto-humanize -> auto focal-point & exposure match -> render with live soundscape mixing -> post-render QC -> auto-repair retry if needed.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Explainer/editorial brief JSON object."},
+         "output": {"type": "string", "description": "Output MP4 path."},
+         "cinema_look": {"type": "string", "description": "Cinema look (default 'chiaroscuro_doc')."},
+         "profile": {"type": "string", "description": "Render profile (default 'low_spec')."},
+         "auto_focal": {"type": "boolean", "description": "Auto-detect focal points (default true)."},
+         "match_exposure": {"type": "boolean", "description": "Auto-harmonize exposure across shots (default true)."},
+         "mix_soundscape": {"type": "boolean", "description": "Mix room tone + SFX into final video (default true)."}},
+         "required": ["brief", "output"]}},
+    {"name": "repair_brief",
+     "description": "Deterministically repair messy or weak-LLM inputs (markdown-fenced JSON, trailing commas, wrong key aliases, typos in look/profile/aspect, string durations, plain string scenes) into a clean AgentCut brief.",
+     "inputSchema": {"type": "object", "properties": {
+         "input": {"description": "Dict, loose JSON string, or raw essay text."}},
+         "required": ["input"]}},
+    {"name": "polish_script",
+     "description": "Strip Markdown/URL noise, split run-on scenes into rhythmic documentary beats, and optionally auto-generate UTF-8 .srt subtitle files.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Brief JSON object."},
+         "max_words_per_scene": {"type": "integer", "description": "Max words per scene before splitting (default 24)."},
+         "srt_dir": {"type": "string", "description": "Optional directory to write generated .srt files."}},
+         "required": ["brief"]}},
+    {"name": "list_style_bibles",
+     "description": "List all 6 deterministic visual Style Bibles (chiaroscuro_doc, kodak_warm, noir_slate, warm_archive, midnight_tech, editorial_clean) for consistent image generation.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "generate_visual_prompts",
+     "description": "Deterministically compile Style-Bible-locked, shot-scale-alternating image prompts for every scene/beat so even small LLMs get cohesive documentary visuals.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Brief JSON object."},
+         "style_bible": {"type": "string", "description": "Style Bible name (default from brief.cinema_look or 'chiaroscuro_doc')."},
+         "aspect": {"type": "string", "description": "Aspect ratio (default '9:16')."}},
+         "required": ["brief"]}},
+    {"name": "autopilot_produce",
+     "description": "Single-call model-agnostic autopilot: accepts raw Arabic/English text, messy JSON, or a partial brief -> auto-repairs -> polishes script & generates missing SRTs -> compiles Style Bible visual prompts -> humanizes -> renders with auto-heal & live soundscape when narration audio is present.",
+     "inputSchema": {"type": "object", "properties": {
+         "input": {"description": "Raw essay text, messy JSON string, or brief dict."},
+         "output": {"type": "string", "description": "Optional output MP4 path (renders automatically if scenes have local narration audio)."},
+         "cinema_look": {"type": "string", "description": "Cinema look / Style Bible (default 'chiaroscuro_doc')."},
+         "aspect": {"type": "string", "description": "Aspect ratio (default '9:16')."},
+         "profile": {"type": "string", "description": "Render profile (default 'low_spec')."}},
+         "required": ["input"]}},
+    {"name": "list_agentcut_skills",
+     "description": "List all modular AgentCut v3.2.0 skills bundled in skills/*/SKILL.md (autopilot, editorial-director, agentmedia-bridge, qc-healer) with descriptions.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_agentcut_skill",
+     "description": "Load the full SKILL.md instructions for a bundled AgentCut v3.2.0 skill by name so any connected MCP agent can follow the exact workflow on demand.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Skill name (e.g. 'agentcut-autopilot', 'agentcut-editorial-director')."}},
+         "required": ["name"]}},
 ]
 
 
@@ -764,6 +995,8 @@ def call_tool(name, args):
             brief = _build_tpl(tid, title, scenes, aspect=aspect)
         except Exception as e:
             return _tool_error({"code": "TEMPLATE_ERROR", "message": str(e)})
+        if parallel:
+            brief["parallel"] = True
 
         ok, info = _prod_exp(brief, out_p)
         if not ok:
@@ -792,6 +1025,284 @@ def call_tool(name, args):
             "border_radius": rx,
             "ui_style": "glass_vector",
         })
+    if name == "list_render_profiles":
+        from .profiles import list_render_profiles
+        return _text({"profiles": list_render_profiles()})
+    if name == "detect_hardware_profile":
+        from .profiles import detect_hardware_profile
+        return _text(detect_hardware_profile())
+    if name == "audit_video_quality":
+        from .qc import audit_video_quality
+        vpath = args.get("video")
+        if not isinstance(vpath, str) or not vpath:
+            return _tool_error({"code": "MISSING_FIELD", "message": "video is required"})
+        report = audit_video_quality(
+            vpath,
+            expected_duration=args.get("expected_duration"),
+            check_black=bool(args.get("check_black", True)),
+            check_silence=bool(args.get("check_silence", True)),
+            require_audio=bool(args.get("require_audio", True)),
+        )
+        return _text(report)
+    if name == "validate_media_bundle":
+        from .bundle import validate_media_bundle
+        ok_b, errs_b = validate_media_bundle(
+            args.get("bundle"),
+            check_files=bool(args.get("check_files", True)),
+        )
+        return _text({"valid": ok_b, "errors": errs_b})
+    if name == "import_media_bundle":
+        from .bundle import bundle_to_editorial_brief, produce_from_bundle, validate_media_bundle
+        bundle = args.get("bundle")
+        out_mp4 = args.get("output")
+        if out_mp4:
+            ok_p, info_p = produce_from_bundle(
+                bundle,
+                out_mp4,
+                aspect=args.get("aspect"),
+                profile=args.get("profile"),
+                parallel=bool(args.get("parallel", True)),
+                qc_audit=bool(args.get("qc_audit", False)),
+            )
+            if not ok_p:
+                return _tool_error(info_p)
+            info_p = dict(info_p)
+            info_p.pop("project", None)
+            return _text(info_p)
+        ok_b, errs_b = validate_media_bundle(bundle, check_files=False)
+        if not ok_b:
+            return _tool_error({"code": "INVALID_BUNDLE", "errors": errs_b})
+        brief = bundle_to_editorial_brief(
+            bundle,
+            aspect=args.get("aspect"),
+            profile=args.get("profile"),
+            parallel=bool(args.get("parallel", True)),
+        )
+        return _text({"brief": brief})
+    if name == "smart_cut_silence":
+        from .smart_cut import build_jump_cut_project, smart_cut_media
+        inp = args.get("input")
+        if not isinstance(inp, str) or not inp:
+            return _tool_error({"code": "MISSING_FIELD", "message": "input is required"})
+        noise_db = float(args.get("noise_db", -35.0))
+        min_silence = float(args.get("min_silence", 0.55))
+        out_mp4 = args.get("output")
+        try:
+            if out_mp4:
+                ok_s, info_s = smart_cut_media(
+                    inp, out_mp4, noise_db=noise_db, min_silence=min_silence
+                )
+                if not ok_s:
+                    return _tool_error(info_s)
+                return _text(info_s)
+            proj, analysis = build_jump_cut_project(
+                inp, noise_db=noise_db, min_silence=min_silence
+            )
+            analysis = dict(analysis)
+            analysis.pop("probe", None)
+            return _text({"project": proj, "analysis": analysis})
+        except (OSError, ValueError) as exc:
+            return _tool_error({"code": "SMART_CUT_ERROR", "message": str(exc)})
+    if name == "batch_produce":
+        from .batch import run_batch_production
+        manifest = args.get("manifest")
+        try:
+            summary = run_batch_production(
+                manifest,
+                max_concurrency=args.get("max_concurrency"),
+                resume=bool(args.get("resume", True)),
+                qc_audit=bool(args.get("qc_audit", False)),
+                report_path=args.get("report_path"),
+            )
+            return _text(summary)
+        except (OSError, ValueError) as exc:
+            return _tool_error({"code": "BATCH_ERROR", "message": str(exc)})
+    if name == "get_cache_stats":
+        from .cache import get_cache_stats
+        return _text(get_cache_stats(args.get("project_dir")))
+    if name == "clear_render_cache":
+        from .cache import clear_cache
+        return _text({"removed": clear_cache(args.get("project_dir"))})
+    if name == "list_cinema_looks":
+        from .cinematography import list_cinema_looks
+        return _text({"looks": list_cinema_looks()})
+    if name == "humanize_brief":
+        from .director import humanize_brief
+        brief = args.get("brief")
+        if not isinstance(brief, dict):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "brief must be an object"})
+        try:
+            directed = humanize_brief(
+                brief,
+                cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
+                add_soundscape=bool(args.get("add_soundscape", True)),
+                auto_cards=bool(args.get("auto_cards", True)),
+            )
+            return _text(directed)
+        except ValueError as exc:
+            return _tool_error({"code": "DIRECTOR_ERROR", "message": str(exc)})
+    if name == "direct_from_script":
+        from .director import direct_from_script
+        script = args.get("script")
+        if not isinstance(script, str) or not script.strip():
+            return _tool_error({"code": "MISSING_FIELD", "message": "script is required"})
+        try:
+            directed = direct_from_script(
+                script,
+                title=str(args.get("title") or "Editorial Essay"),
+                cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
+                aspect=str(args.get("aspect") or "9:16"),
+                profile=args.get("profile", "low_spec"),
+            )
+            return _text(directed)
+        except ValueError as exc:
+            return _tool_error({"code": "DIRECTOR_ERROR", "message": str(exc)})
+    if name == "audit_editorial_craft":
+        from .qc import audit_editorial_craft
+        return _text(audit_editorial_craft(args.get("brief")))
+    if name == "synthesize_sfx":
+        from .soundscape import synthesize_sfx
+        ok_s, info_s = synthesize_sfx(
+            str(args.get("kind") or ""),
+            str(args.get("output") or ""),
+            duration=args.get("duration"),
+            volume_db=args.get("volume_db"),
+        )
+        if not ok_s:
+            return _tool_error(info_s)
+        return _text(info_s)
+    if name == "generate_room_tone":
+        from .soundscape import generate_room_tone
+        ok_r, info_r = generate_room_tone(
+            str(args.get("output") or ""),
+            float(args.get("duration") or 5.0),
+            preset=str(args.get("preset") or "warm_studio"),
+            volume_db=args.get("volume_db"),
+        )
+        if not ok_r:
+            return _tool_error(info_r)
+        return _text(info_r)
+    if name == "detect_focal_point":
+        from .vision import detect_focal_point
+        try:
+            return _text(detect_focal_point(str(args.get("media") or ""), sample_time=float(args.get("sample_time", 0.0))))
+        except (OSError, ValueError) as exc:
+            return _tool_error({"code": "VISION_ERROR", "message": str(exc)})
+    if name == "match_shot_exposure":
+        from .vision import compute_exposure_match_filter
+        paths = args.get("media_paths") or []
+        return _text(compute_exposure_match_filter(paths, target_yavg=args.get("target_yavg")))
+    if name == "render_chapter_card":
+        from .parallax import render_chapter_card
+        ok_c, info_c = render_chapter_card(
+            title=str(args.get("title") or ""),
+            output_path=str(args.get("output") or ""),
+            subtitle=args.get("subtitle"),
+            chapter_label=args.get("chapter_label"),
+            duration=float(args.get("duration", 2.0)),
+            width=int(args.get("width", 1080)),
+            height=int(args.get("height", 1920)),
+            cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
+            with_boom=bool(args.get("with_boom", True)),
+        )
+        if not ok_c:
+            return _tool_error(info_c)
+        return _text(info_c)
+    if name == "render_parallax_clip":
+        from .parallax import render_parallax_clip
+        ok_p, info_p = render_parallax_clip(
+            bg_path=str(args.get("background") or ""),
+            fg_path=str(args.get("foreground") or ""),
+            output_path=str(args.get("output") or ""),
+            duration=float(args.get("duration", 3.5)),
+            width=int(args.get("width", 1080)),
+            height=int(args.get("height", 1920)),
+            bg_blur=float(args.get("bg_blur", 2.5)),
+            cinema_look=args.get("cinema_look", "chiaroscuro_doc"),
+        )
+        if not ok_p:
+            return _tool_error(info_p)
+        return _text(info_p)
+    if name == "compile_timeline_ir":
+        from .pipeline.ir import compile_brief_to_ir
+        brief = args.get("brief")
+        if not isinstance(brief, dict):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "brief must be an object"})
+        ir = compile_brief_to_ir(
+            brief,
+            auto_focal=bool(args.get("auto_focal", False)),
+            match_exposure=bool(args.get("match_exposure", False)),
+        )
+        return _text(ir.to_dict())
+    if name == "produce_cinematic_auto_heal":
+        from .pipeline.auto_heal import produce_cinematic_auto_heal
+        brief = args.get("brief")
+        out_p = args.get("output")
+        if not isinstance(brief, dict) or not out_p:
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "brief and output are required"})
+        ok_h, info_h = produce_cinematic_auto_heal(
+            brief,
+            str(out_p),
+            cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
+            profile=args.get("profile", "low_spec"),
+            auto_focal=bool(args.get("auto_focal", True)),
+            match_exposure=bool(args.get("match_exposure", True)),
+            mix_soundscape=bool(args.get("mix_soundscape", True)),
+        )
+        if not ok_h:
+            return _tool_error(info_h)
+        return _text(info_h)
+    if name == "repair_brief":
+        from .brief_repair import repair_brief
+        try:
+            rep, changes = repair_brief(args.get("input"))
+            return _text({"brief": rep, "repairs_made": changes})
+        except ValueError as exc:
+            return _tool_error({"code": "REPAIR_ERROR", "message": str(exc)})
+    if name == "polish_script":
+        from .script_polisher import polish_script_scenes
+        brief = args.get("brief")
+        if not isinstance(brief, dict):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "brief must be an object"})
+        pol, stats = polish_script_scenes(
+            brief,
+            max_words_per_scene=int(args.get("max_words_per_scene", 24)),
+            srt_dir=args.get("srt_dir"),
+        )
+        return _text({"brief": pol, "stats": stats})
+    if name == "list_style_bibles":
+        from .art_director import list_style_bibles
+        return _text({"style_bibles": list_style_bibles()})
+    if name == "generate_visual_prompts":
+        from .art_director import generate_visual_prompts
+        brief = args.get("brief")
+        if not isinstance(brief, dict):
+            return _tool_error({"code": "INVALID_SCHEMA", "message": "brief must be an object"})
+        return _text(generate_visual_prompts(brief, style_bible=args.get("style_bible"), aspect=args.get("aspect")))
+    if name == "autopilot_produce":
+        from .autopilot import autopilot_produce
+        try:
+            ok_a, res_a = autopilot_produce(
+                args.get("input"),
+                output_path=args.get("output"),
+                cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
+                aspect=args.get("aspect"),
+                profile=str(args.get("profile") or "low_spec"),
+            )
+            if not ok_a:
+                return _tool_error(res_a)
+            return _text(res_a)
+        except (OSError, ValueError) as exc:
+            return _tool_error({"code": "AUTOPILOT_ERROR", "message": str(exc)})
+    if name == "list_agentcut_skills":
+        from .skills_registry import list_agentcut_skills
+        return _text({"skills": list_agentcut_skills()})
+    if name == "get_agentcut_skill":
+        from .skills_registry import get_agentcut_skill
+        sk = get_agentcut_skill(str(args.get("name") or ""))
+        if sk is None:
+            return _tool_error({"code": "SKILL_NOT_FOUND", "message": f"unknown skill {args.get('name')!r}"})
+        return _text(sk)
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 
