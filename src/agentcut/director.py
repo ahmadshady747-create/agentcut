@@ -74,8 +74,9 @@ def analyze_narrative_beat(
     intent = "narrative"
     energy = 0.55
     ideal_beat_range = (2.8, 3.8)
-    transition = "crossfade"
-    transition_dur = 0.25
+    # v3.3.1: Hard cuts by default (~80% of edits) to avoid PowerPoint ghosting
+    transition = "none"
+    transition_dur = 0.0
     sfx_cue: str | None = None
 
     if beat_index == 0 and is_scene_start:
@@ -110,8 +111,8 @@ def analyze_narrative_beat(
         intent = "data_point"
         energy = 0.68
         ideal_beat_range = (2.6, 3.5)
-        transition = "crossfade"
-        transition_dur = 0.22
+        transition = "none"
+        transition_dur = 0.0
         sfx_cue = "card_tick"
     elif any(c in raw for c in _ARABIC_HOOK_CUES) or any(c in low for c in _ENGLISH_HOOK_CUES):
         intent = "hook"
@@ -195,6 +196,12 @@ def humanize_brief(
     out["captions_style"] = "plain"
     out["cinema_look"] = look["name"]
     out["humanized"] = True
+    out.setdefault("beat_transition", "none")
+    out.setdefault("clean_tts", True)
+    out.setdefault("auto_tech_cards", True)
+    out.setdefault("j_cut", True)
+    from .subtitles_style import theme_for_cinema_look
+    out.setdefault("subtitle_theme", theme_for_cinema_look(look["name"]))
 
     scenes_in = list(out.get("scenes") or [])
     directed_scenes: list[dict[str, Any]] = []
@@ -289,10 +296,28 @@ def humanize_brief(
         cursor_time += dur
 
     out["scenes"] = directed_scenes
+    if out.get("auto_chapter_cards") or any(
+        isinstance(s, dict) and (s.get("chapter_card") or s.get("chapter_title") or s.get("act"))
+        for s in directed_scenes
+    ):
+        from .parallax import auto_attach_chapter_cards
+        out = auto_attach_chapter_cards(out)
     if add_soundscape:
+        _mb_map = {
+            "midnight_tech": "tech_pulse",
+            "noir_slate": "tech_pulse",
+            "warm_archive": "contemplative_pad",
+            "kodak_warm": "contemplative_pad",
+        }
         out["soundscape"] = {
-            "room_tone": "warm_studio" if look["name"] in ("chiaroscuro_doc", "kodak_warm", "editorial_clean") else "night_air",
+            "room_tone": "warm_studio" if look["name"] in ("chiaroscuro_doc", "kodak_warm", "editorial_clean", "crisp_cinema") else "night_air",
             "room_tone_db": -38.0,
+            "music_bed": out.get("music") or _mb_map.get(look["name"], "documentary_drone"),
+            "music_bed_db": -22.0,
+            "sidechain_ducking": True,
+            "duck_ratio": 4.5,
+            "duck_attack_ms": 35,
+            "duck_release_ms": 420,
             "sfx_events": sfx_events,
             "jl_cuts": plan_jl_cut_audio(directed_scenes, mode=jl_cut_mode, overlap_sec=jl_overlap_sec),
         }

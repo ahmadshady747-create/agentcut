@@ -18,9 +18,9 @@ from .director import analyze_narrative_beat
 STYLE_BIBLES: dict[str, dict[str, str]] = {
     "chiaroscuro_doc": {
         "name": "chiaroscuro_doc",
-        "aesthetic": "cinematic documentary photography, dramatic chiaroscuro lighting, rich deep shadows, warm amber key light, 35mm anamorphic lens, shallow depth of field, atmospheric haze, museum-grade composition",
+        "aesthetic": "crisp 35mm documentary photography, clean natural blacks, subtle warm tungsten key light, sharp architectural and object focus, zero color fog, Leica 50mm f/1.4",
         "palette": "deep charcoal, obsidian shadows, warm antique gold and amber highlights",
-        "negative": "no text, no letters, no watermark, no logo, no split screen, no cartoon, no clipart, no floating cutout, no white background",
+        "negative": "no human faces, no close-up portraits, no distorted eyes, no text, no letters, no arabic script, no documents with writing, no watermark, no logo, no split screen, no collage, no cartoon, no clipart, no floating cutout",
     },
     "kodak_warm": {
         "name": "kodak_warm",

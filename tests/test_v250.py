@@ -175,8 +175,8 @@ class TestHumanizedEditorialRenderV25(unittest.TestCase):
 
 class TestMcpAndCliV25(unittest.TestCase):
     def test_49_mcp_tools_and_v25_cli(self):
-        self.assertEqual(__version__, "3.2.0")
-        self.assertEqual(len(TOOLS), 62)
+        self.assertEqual(__version__, "3.3.13")
+        self.assertEqual(len(TOOLS), 73)
 
         r1 = call_tool("list_cinema_looks", {})
         self.assertFalse(r1.get("isError"))

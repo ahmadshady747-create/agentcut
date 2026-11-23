@@ -484,7 +484,9 @@ TOOLS = [
          "aspect": {"type": "string", "description": "Target aspect ratio (default '9:16')."},
          "profile": {"type": "string", "description": "Render profile name (proxy, draft, low_spec, master, cinema)."},
          "parallel": {"type": "boolean", "description": "Enable multi-beat parallel editorial rendering (default true)."},
-         "qc_audit": {"type": "boolean", "description": "Run audit_video_quality after rendering (default false)."}},
+         "qc_audit": {"type": "boolean", "description": "Run audit_video_quality after rendering (default false)."},
+         "align_script": {"type": "boolean", "description": "Align ASR word_timings to original script via character-level LCS (default true)."},
+         "timing_provider": {"type": "string", "description": "Word-timing provider: 'whisper' (free default) or optional 'deepgram'."}},
          "required": ["bundle"]}},
     {"name": "smart_cut_silence",
      "description": "Analyze a video/audio file with FFmpeg silencedetect to remove dead-air pauses and generate either a jump-cut AgentCut project JSON or a rendered tightened MP4.",
@@ -630,22 +632,119 @@ TOOLS = [
          "aspect": {"type": "string", "description": "Aspect ratio (default '9:16')."}},
          "required": ["brief"]}},
     {"name": "autopilot_produce",
-     "description": "Single-call model-agnostic autopilot: accepts raw Arabic/English text, messy JSON, or a partial brief -> auto-repairs -> polishes script & generates missing SRTs -> compiles Style Bible visual prompts -> humanizes -> renders with auto-heal & live soundscape when narration audio is present.",
+     "description": "Model-agnostic autopilot with optional stage approval gates: accepts raw Arabic/English text, messy JSON, or a partial brief -> auto-repairs -> polishes script & generates missing SRTs -> optional pause at stop_at='script' / 'preview' / 'pre_render' -> compiles Style Bible visual prompts -> humanizes -> renders with auto-heal & live soundscape.",
      "inputSchema": {"type": "object", "properties": {
          "input": {"description": "Raw essay text, messy JSON string, or brief dict."},
          "output": {"type": "string", "description": "Optional output MP4 path (renders automatically if scenes have local narration audio)."},
          "cinema_look": {"type": "string", "description": "Cinema look / Style Bible (default 'chiaroscuro_doc')."},
          "aspect": {"type": "string", "description": "Aspect ratio (default '9:16')."},
-         "profile": {"type": "string", "description": "Render profile (default 'low_spec')."}},
+         "profile": {"type": "string", "description": "Render profile (default 'low_spec', or 'auto' / 'muse_vm')."},
+         "stop_at": {"type": "string", "description": "Optional approval gate to pause at: 'none' (default full auto), 'script' (after polished script), 'preview' (after proxy preview & contact sheet), or 'pre_render' (before final master render)."},
+         "checkpoint_path": {"type": "string", "description": "Optional file path to save the approval checkpoint JSON."}},
          "required": ["input"]}},
+    {"name": "publish_youtube_video",
+     "description": "Optionally publish a rendered video to YouTube via YouTube Data API v3 resumable upload (stdlib urllib + http.server local OAuth). Never publishes by default: confirm_publish=true is strictly required on every call.",
+     "inputSchema": {"type": "object", "properties": {
+         "video_path": {"type": "string", "description": "Local path to the rendered MP4 file."},
+         "brief": {"type": "object", "description": "Optional AgentCut brief dict to extract title, description, tags, and privacy_status."},
+         "title": {"type": "string", "description": "Optional YouTube video title override (max 100 chars)."},
+         "description": {"type": "string", "description": "Optional YouTube description override."},
+         "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional list of YouTube tags."},
+         "privacy_status": {"type": "string", "description": "Privacy status: 'private' (default), 'unlisted', or 'public'."},
+         "category_id": {"type": "string", "description": "YouTube category ID (default '27' for Education/Documentary)."},
+         "confirm_publish": {"type": "boolean", "description": "Explicit user confirmation required to execute the upload (default false)."},
+         "access_token": {"type": "string", "description": "Optional OAuth 2.0 access token (or uses YOUTUBE_ACCESS_TOKEN / cached local token)."},
+         "token_path": {"type": "string", "description": "Optional path to cached OAuth token JSON."}},
+         "required": ["video_path"]}},
+    {"name": "align_word_timings",
+     "description": "Align Whisper (free default) or optional Deepgram word timings to original Arabic/English script via character-level LCS, preserving original spelling and flagging low-confidence words.",
+     "inputSchema": {"type": "object", "properties": {
+         "script_text": {"type": "string", "description": "Original Arabic or English script text whose spelling must be preserved."},
+         "asr_words": {"type": "array", "items": {"type": "object"}, "description": "Optional pre-computed ASR word timings [{word, start, end, confidence}]."},
+         "audio_path": {"type": "string", "description": "Optional local audio file path (used with provider='deepgram' or Whisper sidecar JSON)."},
+         "provider": {"type": "string", "description": "Timing provider: 'whisper' (free default), 'deepgram' (optional, requires DEEPGRAM_API_KEY), or 'auto'."},
+         "language": {"type": "string", "description": "Language code (default 'ar')."},
+         "low_confidence_threshold": {"type": "number", "description": "Confidence threshold below which words are flagged (default 0.72)."},
+         "audio_duration": {"type": "number", "description": "Optional audio duration in seconds for tail clamping."}},
+         "required": ["script_text"]}},
+    {"name": "resume_autopilot",
+     "description": "Resume, edit, or cancel a paused autopilot approval-gate checkpoint (from stop_at='script', 'preview', or 'pre_render').",
+     "inputSchema": {"type": "object", "properties": {
+         "checkpoint": {"type": "string", "description": "Checkpoint ID or JSON path returned by autopilot_produce."},
+         "action": {"type": "string", "description": "'continue' (default) to advance/render, or 'cancel' to abort cleanly."},
+         "edits": {"type": "object", "description": "Optional edits to apply before resuming (e.g. {title, cinema_look, scenes: [{id, text, broll}]})."},
+         "output": {"type": "string", "description": "Optional output MP4 path override."},
+         "stop_at": {"type": "string", "description": "Optional next approval gate to stop at ('preview', 'pre_render', or 'none' for full render)."}},
+         "required": ["checkpoint"]}},
     {"name": "list_agentcut_skills",
      "description": "List all modular AgentCut v3.2.0 skills bundled in skills/*/SKILL.md (autopilot, editorial-director, agentmedia-bridge, qc-healer) with descriptions.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_agentcut_skill",
-     "description": "Load the full SKILL.md instructions for a bundled AgentCut v3.2.0 skill by name so any connected MCP agent can follow the exact workflow on demand.",
+     "description": "Load the full SKILL.md instructions for a bundled AgentCut skill by name so any connected MCP agent can follow the exact workflow on demand.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Skill name (e.g. 'agentcut-autopilot', 'agentcut-editorial-director')."}},
          "required": ["name"]}},
+    {"name": "clean_tts_audio",
+     "description": "Strip TTS voice-cloning tail hallucinations (breath spikes, whistles, snorts), sub-75Hz rumble, and dead silence from narration audio with smooth micro fade-out and optional duration preservation.",
+     "inputSchema": {"type": "object", "properties": {
+         "input": {"type": "string", "description": "Input narration WAV/MP3 path."},
+         "output": {"type": "string", "description": "Output cleaned WAV/MP3 path."},
+         "trim_tail_sec": {"type": "number", "description": "Optional safety tail trim in seconds (default 0.15)."},
+         "preserve_duration": {"type": "boolean", "description": "Keep exact original file duration by padding clean silence after tail fade-out so beat tiling never desyncs (default false)."}},
+         "required": ["input", "output"]}},
+    {"name": "render_tech_card",
+     "description": "Render a crisp, zero-dependency technical visual PNG (IDE code/JSON window, hero KPI statistic card, or horizontal bar chart infographic) to replace random AI-hallucinated B-roll on technical and data scenes.",
+     "inputSchema": {"type": "object", "properties": {
+         "kind": {"type": "string", "description": "Card type: 'code', 'kpi', or 'chart' (default 'kpi')."},
+         "output": {"type": "string", "description": "Optional output PNG path (cached automatically if omitted)."},
+         "title": {"type": "string", "description": "Window or chart title."},
+         "subtitle": {"type": "string", "description": "Optional subtitle."},
+         "value": {"type": "string", "description": "Hero metric value for kind='kpi' (e.g. '64 أداة', '576')."},
+         "label": {"type": "string", "description": "Metric label for kind='kpi'."},
+         "lines": {"type": "array", "items": {"type": "string"}, "description": "Code/JSON lines for kind='code'."},
+         "items": {"type": "array", "items": {"type": "object"}, "description": "Chart items [{label, value}] for kind='chart'."},
+         "width": {"type": "integer", "description": "Image width (default 1080)."},
+         "height": {"type": "integer", "description": "Image height (default 1920)."}},
+         "required": ["kind"]}},
+    {"name": "generate_music_bed",
+     "description": "Synthesize a warm, zero-asset generative ambient music bed WAV/MP3 (documentary_drone, contemplative_pad, or tech_pulse) using pure FFmpeg lavfi for sidechain-ducked documentary background scoring.",
+     "inputSchema": {"type": "object", "properties": {
+         "output": {"type": "string", "description": "Output WAV/MP3 path."},
+         "duration": {"type": "number", "description": "Duration in seconds."},
+         "preset": {"type": "string", "description": "Music preset: documentary_drone, contemplative_pad, or tech_pulse (default 'documentary_drone')."},
+         "volume_db": {"type": "number", "description": "Optional volume in dB (default -22.0)."}},
+         "required": ["output", "duration"]}},
+    {"name": "audit_subtitle_legibility",
+     "description": "Audit and compute high-contrast Arabic subtitle capsule placement, WCAG AAA contrast ratio, asymmetric horizontal/vertical padding, and bottom-edge breathing room.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Optional explainer brief or project dict."},
+         "theme": {"type": "string", "description": "Subtitle theme: editorial_cinema, gold_documentary, or high_contrast_broadcast."},
+         "width": {"type": "integer", "description": "Frame width (default 720)."},
+         "height": {"type": "integer", "description": "Frame height (default 1280)."}},
+         "required": []}},
+    {"name": "auto_chapter_cards",
+     "description": "Automatically detect act and chapter boundaries in an explainer brief and attach structured documentary chapter_card slates for in-render chapter card generation.",
+     "inputSchema": {"type": "object", "properties": {
+         "brief": {"type": "object", "description": "Explainer brief dict."},
+         "interval_scenes": {"type": "integer", "description": "Periodic chapter interval when auto_chapter_cards=true (default 3)."}},
+         "required": ["brief"]}},
+    {"name": "benchmark_render_speed",
+     "description": "Run a zero-dependency hardware speed benchmark measuring RAM-disk (/dev/shm) scratch routing, pure-Python PNG/WAV fast-probing, cached gradient generation, and CPU thread governor throughput.",
+     "inputSchema": {"type": "object", "properties": {
+         "width": {"type": "integer", "description": "Benchmark frame width (default 720)."},
+         "height": {"type": "integer", "description": "Benchmark frame height (default 1280)."}},
+         "required": []}},
+    {"name": "inspect_video_frames",
+     "description": "Decode and inspect actual rendered MP4 video frames at the pixel level to verify visual contrast, zero muddy color cast, visible Arabic subtitle ink, clean bottom margin, non-empty highlight cards, and camera motion.",
+     "inputSchema": {"type": "object", "properties": {
+         "video_path": {"type": "string", "description": "Path to rendered MP4 video."},
+         "project": {"type": "object", "description": "Optional project or brief dict for subtitle/card window alignment."},
+         "sample_count": {"type": "integer", "description": "Number of frames to sample (default 4)."},
+         "save_frames_dir": {"type": "string", "description": "Optional directory to save extracted full-resolution PNG frames."}},
+         "required": ["video_path"]}},
+    {"name": "audit_font_compliance",
+     "description": "Audit bundled fonts and script-resolution mappings to verify 100% open-licensed font compliance (SIL OFL 1.1 Cairo, Noto Sans/Naskh Arabic, and Bitstream Vera DejaVu) with zero proprietary font binaries.",
+     "inputSchema": {"type": "object", "properties": {}, "required": []}},
 ]
 
 
@@ -1063,6 +1162,8 @@ def call_tool(name, args):
                 profile=args.get("profile"),
                 parallel=bool(args.get("parallel", True)),
                 qc_audit=bool(args.get("qc_audit", False)),
+                align_script=bool(args.get("align_script", True)),
+                timing_provider=str(args.get("timing_provider") or "whisper"),
             )
             if not ok_p:
                 return _tool_error(info_p)
@@ -1077,6 +1178,8 @@ def call_tool(name, args):
             aspect=args.get("aspect"),
             profile=args.get("profile"),
             parallel=bool(args.get("parallel", True)),
+            align_script=bool(args.get("align_script", True)),
+            timing_provider=str(args.get("timing_provider") or "whisper"),
         )
         return _text({"brief": brief})
     if name == "smart_cut_silence":
@@ -1288,12 +1391,61 @@ def call_tool(name, args):
                 cinema_look=str(args.get("cinema_look") or "chiaroscuro_doc"),
                 aspect=args.get("aspect"),
                 profile=str(args.get("profile") or "low_spec"),
+                stop_at=args.get("stop_at"),
+                checkpoint_path=args.get("checkpoint_path"),
             )
             if not ok_a:
                 return _tool_error(res_a)
             return _text(res_a)
         except (OSError, ValueError) as exc:
             return _tool_error({"code": "AUTOPILOT_ERROR", "message": str(exc)})
+    if name == "publish_youtube_video":
+        from .youtube_publisher import publish_video_to_youtube
+        ok_yt, res_yt = publish_video_to_youtube(
+            video_path=str(args.get("video_path") or ""),
+            brief=args.get("brief") if isinstance(args.get("brief"), dict) else None,
+            title=args.get("title"),
+            description=args.get("description"),
+            tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
+            privacy_status=args.get("privacy_status"),
+            category_id=args.get("category_id"),
+            confirm_publish=bool(args.get("confirm_publish", False)),
+            access_token=args.get("access_token"),
+            token_path=args.get("token_path"),
+        )
+        if not ok_yt:
+            return _tool_error(res_yt)
+        return _text(res_yt)
+    if name == "align_word_timings":
+        from .deepgram_align import align_scene_audio
+        try:
+            res_al = align_scene_audio(
+                script_text=str(args.get("script_text") or ""),
+                asr_words=args.get("asr_words") if isinstance(args.get("asr_words"), list) else None,
+                audio_path=args.get("audio_path"),
+                provider=str(args.get("provider") or "whisper"),
+                language=str(args.get("language") or "ar"),
+                low_confidence_threshold=float(args.get("low_confidence_threshold", 0.72)),
+                audio_duration=float(args["audio_duration"]) if args.get("audio_duration") is not None else None,
+            )
+            return _text(res_al)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return _tool_error({"code": "ALIGNMENT_ERROR", "message": str(exc)})
+    if name == "resume_autopilot":
+        from .autopilot import resume_autopilot_checkpoint
+        try:
+            ok_r, res_r = resume_autopilot_checkpoint(
+                str(args.get("checkpoint") or ""),
+                action=str(args.get("action") or "continue"),
+                edits=args.get("edits") if isinstance(args.get("edits"), dict) else None,
+                output_path=args.get("output"),
+                stop_at=args.get("stop_at"),
+            )
+            if not ok_r:
+                return _tool_error(res_r)
+            return _text(res_r)
+        except (OSError, ValueError) as exc:
+            return _tool_error({"code": "AUTOPILOT_RESUME_ERROR", "message": str(exc)})
     if name == "list_agentcut_skills":
         from .skills_registry import list_agentcut_skills
         return _text({"skills": list_agentcut_skills()})
@@ -1303,6 +1455,94 @@ def call_tool(name, args):
         if sk is None:
             return _tool_error({"code": "SKILL_NOT_FOUND", "message": f"unknown skill {args.get('name')!r}"})
         return _text(sk)
+    if name == "clean_tts_audio":
+        from .smart_cut import clean_tts_audio
+        ok_c, info_c = clean_tts_audio(
+            str(args.get("input") or ""),
+            str(args.get("output") or ""),
+            trim_tail_sec=float(args.get("trim_tail_sec", 0.15)),
+            preserve_duration=bool(args.get("preserve_duration", False)),
+        )
+        if not ok_c:
+            return _tool_error(info_c)
+        return _text(info_c)
+    if name == "render_tech_card":
+        from .tech_cards import render_bar_chart_card_png, render_code_card_png, render_kpi_card_png
+        kind = str(args.get("kind") or "kpi").strip().lower()
+        out_p = args.get("output")
+        w = int(args.get("width", 1080))
+        h = int(args.get("height", 1920))
+        try:
+            if kind == "code":
+                path = render_code_card_png(
+                    args.get("lines") or [],
+                    output_path=out_p,
+                    title=str(args.get("title") or "project.json"),
+                    subtitle=args.get("subtitle"),
+                    width=w,
+                    height=h,
+                )
+            elif kind in ("chart", "bars", "bar_chart"):
+                path = render_bar_chart_card_png(
+                    args.get("items") or [],
+                    title=str(args.get("title") or "مقارنة الأداء"),
+                    output_path=out_p,
+                    width=w,
+                    height=h,
+                )
+            else:
+                path = render_kpi_card_png(
+                    value=str(args.get("value") or "100%"),
+                    label=str(args.get("label") or "AgentCut"),
+                    subtitle=args.get("subtitle"),
+                    output_path=out_p,
+                    width=w,
+                    height=h,
+                )
+            return _text({"kind": kind, "path": path, "width": w, "height": h})
+        except Exception as exc:
+            return _tool_error({"code": "TECH_CARD_FAILED", "message": str(exc)})
+    if name == "generate_music_bed":
+        from .soundscape import generate_ambient_music_bed
+        ok_m, info_m = generate_ambient_music_bed(
+            str(args.get("output") or ""),
+            float(args.get("duration") or 5.0),
+            preset=str(args.get("preset") or "documentary_drone"),
+            volume_db=args.get("volume_db"),
+        )
+        if not ok_m:
+            return _tool_error(info_m)
+        return _text(info_m)
+    if name == "audit_subtitle_legibility":
+        from .subtitles_style import audit_subtitle_legibility
+        target = dict(args.get("brief") or {})
+        if "width" in args and "height" in args:
+            target.setdefault("output", {"width": int(args["width"]), "height": int(args["height"])})
+        res = audit_subtitle_legibility(target, theme=args.get("theme"))
+        return _text(res)
+    if name == "auto_chapter_cards":
+        from .parallax import auto_attach_chapter_cards
+        b = dict(args.get("brief") or {})
+        b.setdefault("auto_chapter_cards", True)
+        res = auto_attach_chapter_cards(b, interval_scenes=int(args.get("interval_scenes", 3)))
+        return _text(res)
+    if name == "benchmark_render_speed":
+        from .profiles import benchmark_render_speed
+        w = int(args.get("width") or 720)
+        h = int(args.get("height") or 1280)
+        return _text(benchmark_render_speed(width=w, height=h))
+    if name == "inspect_video_frames":
+        from .qc import inspect_rendered_video_frames
+        res = inspect_rendered_video_frames(
+            str(args.get("video_path") or ""),
+            project_or_brief=args.get("project"),
+            sample_count=int(args.get("sample_count") or 4),
+            save_frames_dir=args.get("save_frames_dir"),
+        )
+        return _text(res)
+    if name == "audit_font_compliance":
+        from .validate import audit_font_compliance
+        return _text(audit_font_compliance())
     return _tool_error({"code": "INVALID_SCHEMA", "message": f"unknown tool {name}"})
 
 

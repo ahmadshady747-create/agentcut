@@ -192,3 +192,71 @@ def smart_cut_media(
         "segment_count": analysis["segment_count"],
     })
     return ok, out
+
+
+def clean_tts_audio(
+    input_audio: str,
+    output_audio: str,
+    trim_tail_sec: float = 0.15,
+    fade_out_sec: float = 0.07,
+    highpass_hz: int = 75,
+    lowpass_hz: int = 12500,
+    silence_db: float = -40.0,
+    preserve_duration: bool = False,
+    timeout: int = 60,
+) -> tuple[bool, dict[str, Any]]:
+    """Remove TTS leading/trailing silence, breath/whistle hallucinations, and harsh rumble (v3.3.1).
+
+    Specifically targets voice-cloning tail artifacts (e.g. Chatterbox snorts,
+    whistles, and breath spikes at utterance endings) via reverse-silenceremove,
+    band-limiting (75Hz-12.5kHz), optional safety tail trim, and smooth fade-out.
+    """
+    if not input_audio or not os.path.isfile(input_audio):
+        return False, {"code": "FILE_NOT_FOUND", "message": f"Audio file not found: {input_audio!r}"}
+
+    info = probe_media(input_audio)
+    orig_dur = float(info.get("duration") or 0.0) if info else 0.0
+    os.makedirs(os.path.dirname(os.path.abspath(output_audio)), exist_ok=True)
+
+    # Add gentle fade-in/out to prevent clicks
+    af_chain = [
+        f"highpass=f={int(highpass_hz)}",
+        f"lowpass=f={int(lowpass_hz)}",
+    ]
+    if not preserve_duration:
+        af_chain.extend([
+            f"silenceremove=start_periods=1:start_duration=0.05:start_threshold={silence_db}dB",
+            "areverse",
+            f"silenceremove=start_periods=1:start_duration=0.05:start_threshold={silence_db}dB",
+            "areverse",
+        ])
+    af_chain.append("afade=t=in:st=0:d=0.02")
+    if orig_dur > (trim_tail_sec + fade_out_sec + 0.5) and trim_tail_sec > 0:
+        safe_end = max(0.3, orig_dur - trim_tail_sec)
+        af_chain.append(f"atrim=end={safe_end:.3f}")
+        af_chain.append(f"afade=t=out:st={max(0.0, safe_end - fade_out_sec):.3f}:d={fade_out_sec:.3f}")
+        if preserve_duration:
+            # Pad clean silence back to exact orig_dur so beat tiling & word_timings never desync
+            af_chain.append(f"apad=whole_dur={orig_dur:.6f}")
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-v", "error",
+        "-i", input_audio,
+        "-af", ",".join(af_chain),
+        output_audio,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0 or not os.path.isfile(output_audio):
+        return False, {"code": "TTS_CLEAN_FAILED", "message": (proc.stderr or "").strip() or "ffmpeg failed"}
+
+    new_info = probe_media(output_audio)
+    new_dur = float(new_info.get("duration") or 0.0) if new_info else 0.0
+    return True, {
+        "input": input_audio,
+        "output": output_audio,
+        "original_duration": round(orig_dur, 3),
+        "cleaned_duration": round(new_dur, 3),
+        "trimmed_seconds": round(max(0.0, orig_dur - new_dur), 3),
+        "preserve_duration": bool(preserve_duration),
+        "muted_tail_seconds": round(trim_tail_sec if (preserve_duration and orig_dur > (trim_tail_sec + fade_out_sec + 0.5)) else max(0.0, orig_dur - new_dur), 3),
+    }

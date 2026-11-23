@@ -470,3 +470,306 @@ def audit_editorial_craft(brief: dict[str, Any]) -> dict[str, Any]:
             "has_soundscape": bool(brief.get("soundscape")),
         },
     }
+
+
+
+def _extract_raw_rgb_frame(
+    video_path: str,
+    timestamp: float,
+    out_w: int = 180,
+    out_h: int = 320,
+    save_png_path: str | None = None,
+    timeout: int = 30,
+) -> bytes | None:
+    """Extract a single decoded frame at `timestamp` as raw RGB24 bytes (and optional full-res PNG)."""
+    t_str = f"{max(0.0, float(timestamp)):.3f}"
+    if save_png_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_png_path)), exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-v", "error",
+                "-ss", t_str, "-i", video_path,
+                "-frames:v", "1", save_png_path,
+            ],
+            capture_output=True,
+            timeout=timeout,
+        )
+    cmd = [
+        "ffmpeg", "-hide_banner", "-v", "error",
+        "-ss", t_str, "-i", video_path,
+        "-vf", f"scale={int(out_w)}:{int(out_h)}",
+        "-frames:v", "1",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    expected_len = int(out_w) * int(out_h) * 3
+    if proc.returncode != 0 or len(proc.stdout) < expected_len:
+        return None
+    return proc.stdout[:expected_len]
+
+
+def _analyze_rgb_frame_bytes(
+    rgb: bytes,
+    w: int,
+    h: int,
+    expect_subtitle: bool = False,
+    expect_highlight_card: bool = False,
+) -> dict[str, Any]:
+    """Compute pixel-level visual health metrics on an RGB24 frame buffer in pure Python."""
+    import math
+
+    total_px = max(1, w * h)
+    sum_r = sum_g = sum_b = 0
+    sum_luma = 0.0
+    sum_luma_sq = 0.0
+
+    sub_y0 = int(round(0.70 * h))
+    sub_y1 = int(round(0.91 * h))
+    bot_y0 = int(round(0.94 * h))
+    mid_y0 = int(round(0.33 * h))
+    mid_y1 = int(round(0.66 * h))
+
+    sub_ink_px = 0
+    sub_dark_pill_px = 0
+    bot_edge_ink_px = 0
+    mid_card_ink_px = 0
+
+    for y in range(h):
+        row_off = y * w * 3
+        in_sub = sub_y0 <= y < sub_y1
+        in_bot = y >= bot_y0
+        in_mid = mid_y0 <= y < mid_y1
+        x_margin = int(round(0.10 * w))
+        for x in range(w):
+            idx = row_off + x * 3
+            r = rgb[idx]
+            g = rgb[idx + 1]
+            b = rgb[idx + 2]
+            sum_r += r
+            sum_g += g
+            sum_b += b
+            luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            sum_luma += luma
+            sum_luma_sq += luma * luma
+
+            is_center_x = x_margin <= x < (w - x_margin)
+            is_bright_ink = (r >= 185 and g >= 175 and b >= 140 and luma >= 180.0)
+            if in_sub and is_center_x:
+                if is_bright_ink:
+                    sub_ink_px += 1
+                elif luma <= 52.0:
+                    sub_dark_pill_px += 1
+            elif in_bot and is_center_x and is_bright_ink:
+                bot_edge_ink_px += 1
+            elif in_mid and is_center_x and ( is_bright_ink or (r >= 200 and g >= 170 and b <= 100) ):
+                mid_card_ink_px += 1
+
+    mean_r = round(sum_r / total_px, 2)
+    mean_g = round(sum_g / total_px, 2)
+    mean_b = round(sum_b / total_px, 2)
+    luma_mean = round(sum_luma / total_px, 2)
+    luma_var = max(0.0, (sum_luma_sq / total_px) - (luma_mean * luma_mean))
+    luma_std = round(math.sqrt(luma_var), 2)
+
+    # Muddy green-teal cast metric: how much green+blue overpower red in murky midtones
+    green_cast = round(mean_g - max(mean_r, mean_b), 2)
+
+    return {
+        "luma_mean": luma_mean,
+        "luma_std": luma_std,
+        "rgb_means": [mean_r, mean_g, mean_b],
+        "green_cast_delta": green_cast,
+        "subtitle_ink_pixels": sub_ink_px,
+        "subtitle_dark_pill_pixels": sub_dark_pill_px,
+        "bottom_edge_ink_pixels": bot_edge_ink_px,
+        "middle_card_ink_pixels": mid_card_ink_px,
+        "expect_subtitle": expect_subtitle,
+        "expect_highlight_card": expect_highlight_card,
+    }
+
+
+def inspect_rendered_video_frames(
+    video_path: str,
+    project_or_brief: dict[str, Any] | None = None,
+    sample_count: int = 4,
+    save_frames_dir: str | None = None,
+    timeout: int = 90,
+) -> dict[str, Any]:
+    """Extract and inspect actual decoded frames from a rendered MP4 for visual defects (v3.3.8).
+
+    Checks:
+      1. Dynamic range & visual contrast (`luma_std >= 5.0`, no blank/washed-out frames).
+      2. Zero muddy green color cast (`green_cast_delta <= 32.0`).
+      3. Frame-to-frame camera/parallax motion (`mean_motion_mapd >= 0.4`).
+      4. Active subtitle glyph ink & dark pill presence in the lower third (`70%..91%`)
+         with clean bottom breathing margin (`94%..100%`).
+      5. Non-empty highlight card glyph ink during active card windows.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return {
+            "passed": False,
+            "score": 0,
+            "grade": "F",
+            "video_path": video_path,
+            "issues": [{"severity": "error", "code": "FILE_NOT_FOUND", "message": f"Video not found: {video_path!r}"}],
+            "frames": [],
+        }
+
+    try:
+        probe = _run_ffprobe_json(video_path, timeout=min(30, timeout))
+    except Exception as exc:
+        return {
+            "passed": False,
+            "score": 0,
+            "grade": "F",
+            "video_path": video_path,
+            "issues": [{"severity": "error", "code": "CORRUPT_VIDEO", "message": str(exc)}],
+            "frames": [],
+        }
+
+    fmt = probe.get("format", {})
+    streams = probe.get("streams", [])
+    vstream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if vstream is None:
+        return {
+            "passed": False,
+            "score": 0,
+            "grade": "F",
+            "video_path": video_path,
+            "issues": [{"severity": "error", "code": "NO_VIDEO_STREAM", "message": "No video stream found"}],
+            "frames": [],
+        }
+
+    dur = float(fmt.get("duration") or vstream.get("duration") or 0.0)
+    vw = int(vstream.get("width") or 720)
+    vh = int(vstream.get("height") or 1280)
+    is_vertical = vh >= vw
+    aw, ah = (180, 320) if is_vertical else (320, 180)
+
+    captions = list((project_or_brief or {}).get("captions") or [])
+    texts = list((project_or_brief or {}).get("texts") or [])
+
+    # Pick informative timestamps: active caption midpoints + even spread across duration
+    n_samples = max(2, min(8, int(sample_count)))
+    timestamps: list[float] = []
+    for cap in captions:
+        cs = float(cap.get("start", 0.0))
+        ce = float(cap.get("end", 0.0))
+        if ce - cs >= 0.3:
+            mid = round((cs + ce) / 2.0, 3)
+            if 0.05 <= mid <= max(0.1, dur - 0.08) and all(abs(mid - t) >= 0.25 for t in timestamps):
+                timestamps.append(mid)
+                if len(timestamps) >= n_samples:
+                    break
+    if len(timestamps) < n_samples and dur > 0.2:
+        for i in range(n_samples):
+            frac = 0.15 + 0.72 * (i / max(1, n_samples - 1))
+            t_cand = round(dur * frac, 3)
+            if all(abs(t_cand - t) >= 0.20 for t in timestamps):
+                timestamps.append(t_cand)
+            if len(timestamps) >= n_samples:
+                break
+    timestamps = sorted(timestamps[:n_samples]) or [round(max(0.0, dur * 0.5), 3)]
+
+    raw_buffers: list[bytes] = []
+    frame_reports: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    score = 100
+
+    for idx, ts in enumerate(timestamps):
+        expect_sub = any(float(c.get("start", 0)) + 0.12 <= ts <= float(c.get("end", 0)) - 0.12 for c in captions)
+        expect_card = any(
+            float(t.get("start", 0)) + 0.10 <= ts <= float(t.get("end", 0)) - 0.10
+            and 0.25 * vh <= float(t.get("y", 0) if isinstance(t.get("y"), (int, float)) else 0) <= 0.68 * vh
+            for t in texts
+        )
+        png_out = os.path.join(save_frames_dir, f"inspect_frame_{idx:02d}_{ts:.2f}s.png") if save_frames_dir else None
+        buf = _extract_raw_rgb_frame(video_path, ts, out_w=aw, out_h=ah, save_png_path=png_out)
+        if buf is None:
+            score -= 25
+            issues.append({
+                "severity": "error",
+                "code": "FRAME_EXTRACTION_FAILED",
+                "message": f"Could not decode video frame at t={ts:.2f}s.",
+                "timestamp": ts,
+            })
+            continue
+        raw_buffers.append(buf)
+        metrics = _analyze_rgb_frame_bytes(
+            buf, aw, ah,
+            expect_subtitle=expect_sub,
+            expect_highlight_card=expect_card,
+        )
+        metrics["timestamp"] = ts
+        if png_out and os.path.isfile(png_out):
+            metrics["saved_png"] = png_out
+        frame_reports.append(metrics)
+
+        if metrics["luma_std"] < 4.5:
+            score -= 15
+            issues.append({
+                "severity": "warning",
+                "code": "LOW_CONTRAST_OR_BLANK_FRAME",
+                "message": f"Frame at t={ts:.2f}s has very low luminance contrast (std={metrics[luma_std]}).",
+                "timestamp": ts,
+            })
+        if metrics["green_cast_delta"] > 35.0:
+            score -= 15
+            issues.append({
+                "severity": "warning",
+                "code": "MUDDY_GREEN_CAST",
+                "message": f"Frame at t={ts:.2f}s exhibits green color cast (delta={metrics[green_cast_delta]}).",
+                "timestamp": ts,
+            })
+        if expect_sub and metrics["subtitle_ink_pixels"] < 12:
+            score -= 15
+            issues.append({
+                "severity": "warning",
+                "code": "SUBTITLE_INK_MISSING",
+                "message": f"Expected visible subtitle glyphs at t={ts:.2f}s, but found only {metrics[subtitle_ink_pixels]} ink pixels.",
+                "timestamp": ts,
+            })
+        if expect_card and metrics["middle_card_ink_pixels"] < 10:
+            score -= 15
+            issues.append({
+                "severity": "warning",
+                "code": "BLANK_HIGHLIGHT_CARD",
+                "message": f"Active highlight card at t={ts:.2f}s appears blank (ink={metrics[middle_card_ink_pixels]}).",
+                "timestamp": ts,
+            })
+
+    # Compute frame-to-frame motion MAPD (Mean Absolute Pixel Difference)
+    mapds: list[float] = []
+    for i in range(1, len(raw_buffers)):
+        b0, b1 = raw_buffers[i - 1], raw_buffers[i]
+        diff_sum = sum(abs(a - b) for a, b in zip(b0, b1))
+        mapd = round(diff_sum / max(1, len(b0)), 2)
+        mapds.append(mapd)
+        frame_reports[i]["motion_mapd_from_prev"] = mapd
+
+    mean_mapd = round(sum(mapds) / len(mapds), 2) if mapds else 0.0
+    mean_std = round(sum(f["luma_std"] for f in frame_reports) / max(1, len(frame_reports)), 2)
+    sub_verified = all(
+        f["subtitle_ink_pixels"] >= 12 for f in frame_reports if f.get("expect_subtitle")
+    )
+    bottom_clean = all(f["bottom_edge_ink_pixels"] <= max(25, f["subtitle_ink_pixels"] // 4) for f in frame_reports)
+
+    score = max(0, min(100, score))
+    grade = "A" if score >= 90 else ("B" if score >= 80 else ("C" if score >= 70 else ("D" if score >= 60 else "F")))
+    return {
+        "passed": score >= 80 and all(i["severity"] != "error" for i in issues),
+        "score": score,
+        "grade": grade,
+        "video_path": video_path,
+        "width": vw,
+        "height": vh,
+        "duration": round(dur, 3),
+        "frame_count": len(frame_reports),
+        "mean_motion_mapd": mean_mapd,
+        "mean_luma_std": mean_std,
+        "subtitle_ink_verified": sub_verified,
+        "bottom_margin_clean": bottom_clean,
+        "frames": frame_reports,
+        "issues": issues,
+    }

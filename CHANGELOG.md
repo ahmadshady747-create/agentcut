@@ -1,3 +1,155 @@
+## 3.3.13 — Cycle 12: Optional YouTube Data API v3 Resumable Publisher (`publish_youtube_video`)
+
+Completes the 4-feature expansion roadmap by adding an opt-in YouTube publisher built strictly with Python's standard library (`urllib` + `http.server`):
+
+- **Resumable Chunked Upload & Local Loopback OAuth (`src/agentcut/youtube_publisher.py`):** Implements local OAuth 2.0 loopback code capture (`http.server.HTTPServer`), automatic token refresh, and chunked Resumable Upload (`uploadType=resumable` with HTTP `308 Resume Incomplete` handling) for large 180MB+ 1080p MP4 renders.
+- **Brief Metadata Extraction (`extract_youtube_metadata_from_brief`):** Automatically populates video title, multi-scene description, tags, language, and privacy status (`private` default, `unlisted`, or `public`) from the AgentCut brief or explicit overrides.
+- **Strict Non-Publishing Default (`confirm_publish=True` Required):** Never uploads automatically; calls without `confirm_publish=True` return a safe `CONFIRMATION_REQUIRED` preview payload.
+- **MCP Tool #73 (`publish_youtube_video`) & CLI (`agentcut youtube-publish`):** Exposes the YouTube publisher over MCP and CLI (bringing total MCP tools to 73 with zero external Python dependencies).
+
+---
+
+## 3.3.12 — Cycle 11: Character-Level LCS Word-Timing Alignment & Optional Deepgram Bridge
+
+Adds a zero-dependency character-level Longest Common Subsequence (LCS) word-timing alignment engine and an optional Deepgram timing bridge while keeping Whisper as the free default:
+
+- **Character-Level LCS Alignment (`src/agentcut/deepgram_align.py`):** Normalizes Arabic diacritics (`tashkeel`), tatweel, and Alef/Teh-Marbuta/Alef-Maksura variants during alignment while preserving 100% of the author's original Arabic and English script spelling in `word_timings`.
+- **Unmatched Interpolation & Low-Confidence Flagging:** Smoothly interpolates timestamps for skipped or unmatched words, subdivides merged ASR tokens proportionally, enforces monotonic non-overlapping ranges for `render.py`, and flags uncertain tokens in `low_confidence_words`.
+- **Optional Deepgram Timing Bridge (`urllib` stdlib only):** Added `transcribe_audio_deepgram()` and `parse_deepgram_response()` using Python stdlib `urllib.request` only; Whisper remains the free default (`provider="whisper"`).
+- **Bundle Bridge (`bundle.py`), MCP Tool #72 (`align_word_timings`) & CLI (`agentcut align-timings`):** Automatically aligns `word_timings` in `bundle_to_editorial_brief()` and `produce_from_bundle()` and exposes standalone MCP and CLI entrypoints.
+
+---
+
+## 3.3.11 — Cycle 10: Stage Approval Gates & Checkpoint Resume/Edit/Cancel in `autopilot_produce`
+
+Adds human-in-the-loop review and approval gates (`stop_at`) to `autopilot_produce` so users and agents can pause, inspect, edit, or cancel before committing compute to a full render — while keeping full one-shot automatic mode (`stop_at="none"`) as the default:
+
+- **Three Approval Gates (`autopilot.py`):**
+  1. `stop_at="script"`: Pauses immediately after `repair_brief()` and `polish_script_scenes()`, returning a clean per-scene `script_review` digest and saving a persistent JSON checkpoint before any directing or rendering occurs.
+  2. `stop_at="preview"`: Renders a fast `proxy` preview MP4, generates a visual `contact_sheet.png` and review frames, runs pixel-level `inspect_rendered_video_frames()`, and pauses for visual sign-off before the full master render.
+  3. `stop_at="pre_render"`: Pauses right before the final full-resolution render with the complete directed brief, Style Bible prompts, and `audit_editorial_craft` score.
+- **Checkpoint Resumption, In-Place Script Editing & Cancellation (`resume_autopilot_checkpoint`):** Allows modifying scene texts (automatically regenerating `.srt` captions for edited scenes), overriding `cinema_look` or `profile`, advancing to the next gate or final render (`action="continue"`), or aborting cleanly (`action="cancel"`). Zero external webhooks or Telegram dependencies.
+- **MCP Tool #71 (`resume_autopilot`) & CLI (`agentcut autopilot --stop-at ...` / `agentcut autopilot-resume`):** Exposes gated autopilot workflows over MCP and CLI.
+
+---
+
+## 3.3.10 — Meta Muse Secure VM Hardware Profile & Cgroup Memory Cap Detection
+
+Adds first-class hardware detection and render tuning for **Meta Muse Secure VM** containers (`2 vCPUs` AMD EPYC Turin, `8GB` VM RAM often cgroup-capped to `2–4GB` inside the `systemd-nspawn` runtime cell, `100GB` SSD, CPU-only):
+
+- **Dedicated `muse_vm` Profile (`profiles.py`):** 720p crisp HD (`scale_factor=0.67`), `24 fps`, `superfast` preset, `crf=23`, `grain_mode="off"`, `max_workers=1`, and `ffmpeg_threads=2` so a single FFmpeg process uses both vCPUs cleanly without triggering container OOM resets or 2-core context-switching overhead.
+- **Cgroup Memory Cap & Muse Runtime Detection (`profiles.py`):** Added `_detect_cgroup_ram_gb()` (cgroup v1 & v2) and `detect_muse_environment()` (checking `/run/hatch`, `/opt/hatch`, `hatch-egress-proxy`, and `AGENTCUT_MUSE_ENV`). `detect_hardware_profile()` now uses `min(host_ram_gb, cgroup_ram_gb)` and recommends `muse_vm` automatically inside Muse containers.
+- **Single-Worker Sequential Bypass (`render.py`):** When `max_workers <= 1` (e.g. `muse_vm`), `produce_explainer` skips parallel chunk+assembly double-encoding overhead automatically.
+
+---
+
+## 3.3.9 — Cycle 9: Open-Licensed Arabic & Dual-Script Font Migration (Cairo OFL) & Removal of Proprietary Microsoft Fonts
+
+Eliminates the proprietary font distribution risk by adopting open-licensed `Cairo.ttf` (SIL Open Font License 1.1) as the default dual-script Arabic+Latin font and removing `Arial.ttf` and `SegoeUI.ttf` from the repository:
+
+- **Removed Proprietary Font Binaries (`fonts/`):** Deleted `fonts/Arial.ttf` (`1,013 KB`) and `fonts/SegoeUI.ttf` (`934 KB`), reducing archive footprint by ~1.95 MB and ensuring 100% open-source licensing compliance (`SIL OFL 1.1` + `Bitstream Vera`).
+- **Cairo OFL Default Dual-Script Resolution (`validate.py` & `render.py`):** Updated `DUAL_SCRIPT_FONT_FILES = ["Cairo.ttf", "NotoSansArabic-Bold.ttf"]`, cleaned `BUNDLED_FONTS` to the 4 open-licensed faces (`cairo`, `noto-sans-bold`, `noto-naskh`, `dejavu`), and registered `Cairo` in `_ASS_FONT_BY_REGISTRY` and `_ASS_FONT_BY_BASENAME`.
+- **Template & Brief Repair Migration (`templates.py` & `brief_repair.py`):** Migrated all 8 content templates in `templates.py` to `"font": "cairo"` and added automatic coercion in `repair_brief()` mapping legacy `segoe-ui`/`arial` requests to `cairo`.
+- **MCP Tool #70 (`audit_font_compliance`) & CLI (`agentcut fonts-audit`):** Verifies bundled font licensing, absence of proprietary font files, and dual-script/Arabic/Latin font resolution.
+
+---
+
+## 3.3.8 — Cycle 8: Pixel-Level Visual Frame Inspection of Real Rendered Videos in Tests & Auto-Heal QC
+
+Completes all 7 quality priorities by decoding and inspecting real rendered MP4 frames at the pixel level during tests and `produce_cinematic_auto_heal` runs:
+
+- **Pixel-Level Frame Inspector (`qc.py:inspect_rendered_video_frames`):** Decodes sampled frames across active subtitle cues and `highlight_card` windows as raw RGB24 buffers and verifies:
+  1. Dynamic luminance contrast (`luma_std >= 4.5`) with zero blank or flat-grey frames.
+  2. Absence of muddy green/teal color casts (`green_cast_delta <= 35.0`).
+  3. Active Arabic subtitle glyph ink (`subtitle_ink_pixels >= 12`) inside the lower-third capsule zone (`70%..91%`) and dark obsidian pill backdrop pixels (`luma <= 52`).
+  4. Clean bottom breathing margin (`94%..100%`) with zero clipped glyph overflow.
+  5. Visible glyph ink inside active middle-third `highlight_card` windows (preventing empty glass card linger).
+  6. Active camera/parallax motion (`motion_mapd_from_prev`) across consecutive frames.
+- **Auto-Heal Closed-Loop Integration (`pipeline/auto_heal.py`):** `produce_cinematic_auto_heal()` now executes `inspect_rendered_video_frames()` alongside `audit_video_quality()` and includes `frame_inspection` in the output report.
+- **MCP Tool #69 (`inspect_video_frames`) & CLI (`agentcut inspect-frames`):** Exposes pixel-level visual frame auditing over MCP and CLI.
+
+---
+
+## 3.3.7 — Cycle 7: Render Speed & Memory/HDD I/O Optimization for Constrained Hardware (8GB RAM / HDD / CPU-Only)
+
+Eliminates major CPU, memory, and mechanical HDD bottlenecks during single-pass and parallel renders on 4-core / 8GB RAM / HDD / CPU-only machines:
+
+- **Zero-Subprocess Fast Header Probing & Single-Load Probe Cache (`validate.py`):** Added `_fast_probe_header()` reading 24-byte PNG `IHDR` headers and standard PCM `.wav` headers directly in pure Python (`~0.03ms` vs `~45ms` `ffprobe` subprocess spawn), hydrated `data/.probe-cache.json` once into memory per process instead of reading/parsing the 2,000-entry JSON on every cache miss, and skipped disk rewrites for ephemeral `/tmp` and `/dev/shm` files.
+- **Cached & 1D-Precomputed Cinematic Gradient Generator (`compositor.py`):** Precomputed 1D squared-distance lookup tables (`dx_gx_sq`, `dx_cx_sq`) with squared-radius early exit and in-memory PNG caching (`_GRADIENT_PNG_CACHE`), dropping repeat gradient background writes from `1.1s–3.0s` of 100% CPU to `< 0.2ms` (byte-identical output).
+- **RAM-Disk (`tmpfs` `/dev/shm`) Scratch Routing (`profiles.py` & `render.py`):** Added `get_fast_temp_root()` which routes ephemeral parallel scene chunks into `/dev/shm` when >= 384 MB RAM is free, bypassing slow mechanical HDD head-seeks.
+- **Single-Pass Assembly Loudnorm & Fast H.264 Join (`render.py`):** Disabled redundant per-chunk EBU R128 `loudnorm` buffering on intermediate sub-chunks (`~150 MB` RAM saved per worker) while preserving the final assembly `-14 LUFS` master pass, and switched direct assembly join from `crf=10 / fast` to `crf=20 / veryfast` (~50% faster join and 65% less HDD write volume).
+- **MCP Tool #68 (`benchmark_render_speed`) & CLI (`agentcut benchmark`):** Exposes live hardware speed micro-benchmarking over MCP and CLI.
+
+---
+
+## 3.3.6 — Cycle 6: Automatic In-Render Chapter Cards, 2.5D Parallax & True J-Cut Audio Lead
+
+Bridges the gap between standalone tools and the core `produce_explainer` render pipeline by wiring documentary Chapter Title Cards, 2.5D Parallax depth compositing, and J-Cut audio overlap directly into the render path:
+
+- **In-Render Chapter Cards (`parallax.py`, `director.py`, `render.py`):** Added `render_chapter_card_png()` and `auto_attach_chapter_cards()` and wired them into `produce_explainer`. Scenes with `chapter_card`, `chapter_title`, `act`, or `auto_chapter_cards=True` automatically render either a full-bleed atmospheric chapter slate PNG (when no B-roll is set) or an upper-act glass banner overlay (`ed-chapter-<scene_id>`), reporting `chapter_cards_rendered`.
+- **In-Render 2.5D Parallax Compositing (`parallax.py` & `render.py`):** Added `synthesize_depth_foreground_png()` and `render_cached_parallax_beat()` and wired them into `produce_explainer` so scenes or beats with `parallax=True`, `fg_broll`, or `auto_parallax=True` automatically composite background and foreground focal planes at differential zoom speeds with soft depth-of-field blur, reporting `parallax_clips_rendered`.
+- **True J-Cut Audio Lead in Render & Soundscape Mixer (`render.py` & `pipeline/audio_mixer.py`):** Active across both single-pass and parallel renders (`j_cut=True`). Incoming scene narrations lead visual cuts by `0.18s` (`audio_start < start`) and are mixed with micro fade-ins and sidechain music ducking via `-c:v copy`, reporting `j_cuts_applied`.
+- **MCP Tool #67 (`auto_chapter_cards`) & CLI (`agentcut auto-chapters`):** Exposes automatic chapter boundary detection and card attachment over MCP and CLI.
+
+---
+
+## 3.3.5 — Cycle 5: Arabic Subtitle Pill Aesthetics, WCAG AAA Contrast & Bottom Breathing Room
+
+Upgrades Arabic documentary subtitle capsule placement, contrast, horizontal/vertical padding, and bottom breathing room across vertical (`9:16`, `4:5`) and horizontal (`16:9`, `1:1`) renders:
+
+- **Arabic Subtitle Pill Engine (`subtitles_style.py`):** Added 3 curated documentary subtitle themes (`editorial_cinema`, `gold_documentary`, `high_contrast_broadcast`), `compute_subtitle_layout()`, `style_arabic_caption_entry()`, `render_styled_pill_png()`, and `audit_subtitle_legibility()`.
+- **Elevated Bottom Breathing Room (`render.py` & `validate.py`):** Anchors editorial Arabic subtitle capsules with an automatic `11.5%` bottom clearance on vertical frames (`221px` at `1080x1920`, `147px` at `720x1280`) and `9.5%` on landscape frames, keeping subtitles well above bottom mobile UI overlays while maintaining a wide gap below middle-third `highlight_card`s.
+- **WCAG AAA Contrast & Translucent Glass Rim (`14.2:1+`):** Replaces washed-out `black@0.50` boxes (`~3.8:1` contrast) with deep obsidian glass capsules (`#0B0F19` / `#0F172A` at `0.82..0.88` opacity), asymmetric Arabic script padding (`box_padding_x=24`, `box_padding_y=14`, `box_radius=22` at 720p base, scaling with resolution), `caption_line_spacing=1.42`, and an anti-aliased SDF translucent outer glass rim.
+- **MCP Tool #66 (`audit_subtitle_legibility`) & CLI (`agentcut subtitle-audit`):** Exposes deterministic subtitle placement, WCAG contrast, and breathing-room verification over MCP and CLI.
+
+---
+
+## 3.3.4 — Cycle 4: Generative Ambient Music Beds & Sidechain Dynamic Ducking
+
+Eliminates dry, naked voiceovers and harsh pauses by synthesizing warm, zero-asset ambient music beds and ducking them dynamically under narration via FFmpeg `sidechaincompress`:
+
+- **Generative Ambient Music Engine (`soundscape.py`):** Added `MUSIC_BED_PRESETS` (`documentary_drone`, `contemplative_pad`, `tech_pulse`), `list_music_presets()`, and `generate_ambient_music_bed()` synthesizing warm multi-harmonic chords with slow organic LFO breathing (`tremolo`) and soft pink-noise warmth at `-22 dB`.
+- **True Sidechain Dynamic Ducking (`pipeline/audio_mixer.py` & `render.py`):** Splits the voice stream (`asplit`) to drive `sidechaincompress=threshold=0.025:ratio=4.5:attack=35:release=420` on the background music bed so music ducks smoothly whenever the speaker talks and swells gently during speech pauses, mixed via `-c:v copy` without re-encoding video.
+- **Automatic Director Wiring (`director.py`):** `humanize_brief()` and `direct_from_script()` now select a mood-matched generative `music_bed` and enable `sidechain_ducking=True` by default.
+- **MCP Tool #65 (`generate_music_bed`) & CLI (`agentcut music-bed`):** Exposes generative music synthesis directly to MCP agents and CLI scripts.
+
+---
+
+## 3.3.3 — Cycle 3: Real Technical Code, KPI & Chart Visual Cards (Replacing AI Gibberish B-Roll)
+
+Eliminates random/irrelevant AI B-roll and hallucinated gibberish text (`ISANNN`, `TAIWA`, `QANOHOW`) on technical, code, and quantitative scenes by rendering crisp, deterministic 1080x1920 / 1920x1080 PNG infographics directly in AgentCut:
+
+- **New `tech_cards.py` Engine:**
+  - `render_code_card_png()`: Studio IDE / terminal window with macOS window traffic lights, line numbers, syntax-colored JSON/Python lines, and BiDi Arabic headers.
+  - `render_kpi_card_png()`: High-contrast documentary hero metric card (`64 أداة`, `576 اختباراً`, `100%`) with golden accent bar and progress track.
+  - `render_bar_chart_card_png()`: Clean horizontal comparative bar chart PNG for benchmark and version comparisons.
+  - `build_tech_card_for_scene()` & `auto_attach_tech_cards()`: Automatically detects code/JSON/CLI keywords and quantitative metrics in scenes without local B-roll (or with explicit `tech_card`) and renders deterministic visual cards in `produce_explainer`.
+- **MCP Tool #64 (`render_tech_card`) & CLI (`agentcut tech-card`):** Exposes direct technical card generation over MCP and CLI.
+
+---
+
+## 3.3.2 — Cycle 2: Automatic In-Pipeline TTS Tail-Hallucination & Rumble Cleaning
+
+Wires `clean_tts_audio()` directly into `produce_explainer`, `autopilot_produce`, `produce_cinematic_auto_heal`, and `bundle_to_editorial_brief` so voice-cloning tail artifacts (Chatterbox breath spikes, whistles, snorts, and sub-75Hz rumble) are scrubbed automatically without desynchronizing beat timings:
+
+- **Duration-preserving TTS tail cleaner (`smart_cut.py`):** Added `preserve_duration=True` to `clean_tts_audio()` (mutes and fades out the last `0.15s` hallucination zone, band-limits to `75Hz–12.5kHz`, and pads clean digital silence back to the exact original duration via `apad=whole_dur=...` so editorial beat tiling and Whisper `word_timings` never drift).
+- **Automatic wiring in `produce_explainer` (`render.py`):** Enabled by default for all `editorial` and `humanized` briefs (`clean_tts=True`), cleaning each scene's narration audio before rendering and reporting `tts_cleaned_scenes` in the render output.
+- **Autopilot, Auto-Heal & Bundle integration (`autopilot.py`, `pipeline/auto_heal.py`, `bundle.py`, `director.py`):** Enabled `clean_tts=True` across all high-level entry points plus added `agentcut clean-tts` to the CLI.
+
+---
+
+## 3.3.1 — Cycle 1: Real-Video Visual & Audio Quality Fixes (Blank Card, Color Cast, Hard Cuts & TTS Tail Cleaner)
+
+Fixes concrete defects observed in real rendered vertical editorial videos (`12337.mp4`):
+
+- **Fixed blank glass `highlight_card` linger (`render.py`):** Tightened card text inset from `0.25s/0.20s` to `0.05s/0.05s` so the glass card never lingers empty without text on entrance or exit.
+- **Eliminated muddy teal-green color cast (`cinematography.py`):** Re-calibrated `chiaroscuro_doc` and `noir_slate` to clean neutral blacks and crisp contrast, and added zero-cast `crisp_cinema` look.
+- **Hard Cut default (`director.py`, `render.py`):** Switched default editorial scene and beat transitions to punchy hard cuts (`"none"`) while reserving crossfades for reflective/quote beats, eliminating repetitive PowerPoint double-exposure ghosting.
+- **Strict face/text/split-screen bans (`art_director.py`):** Hardened Style Bible negative constraints against distorted human faces, gibberish text/letters, and split-screen frames.
+- **TTS hallucination tail cleaner (`smart_cut.py`, MCP tool #63 `clean_tts_audio`):** Strips trailing voice-cloning breathing/whistling artifacts and sub-75Hz rumble with smooth micro fade-out.
+
+---
+
 ## 3.2.0 — Native Modular Skills Pack & Agent Integration Layer
 
 Bundles 4 focused, token-efficient agent skills (`skills/*/SKILL.md`) with a stdlib registry, MCP self-discovery tools, and one-command export into any external agent's skills directory.

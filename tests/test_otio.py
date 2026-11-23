@@ -58,13 +58,13 @@ def _v1_transitions(timeline):
 class TestOtioExporter(unittest.TestCase):
 
     def test_version_is_1_63_0(self):
-        self.assertEqual(__version__, "3.2.0")
+        self.assertEqual(__version__, "3.3.11")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "3.2.0")
+            self.assertEqual(f.read().strip(), "3.3.11")
 
     def test_tool_count_is_34_and_export_otio_listed(self):
         names = [t["name"] for t in TOOLS]
-        self.assertEqual(len(names), 62)
+        self.assertEqual(len(names), 71)
         self.assertIn("export_otio", names)
 
     def test_basic_example_clip_order_and_ranges(self):

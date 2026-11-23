@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#151a25"/>
+      <stop offset="100%" stop-color="#0b0e14"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="35%" r="58%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="720" fill="url(#glow)"/>
+  <g stroke="#262e40" stroke-width="1" opacity="0.45">
+    <line x1="0" y1="180" x2="1280" y2="180"/>
+    <line x1="0" y1="360" x2="1280" y2="360"/>
+    <line x1="0" y1="540" x2="1280" y2="540"/>
+    <line x1="320" y1="0" x2="320" y2="720"/>
+    <line x1="640" y1="0" x2="640" y2="720"/>
+    <line x1="960" y1="0" x2="960" y2="720"/>
+  </g>
+  <rect x="550" y="96" width="180" height="44" rx="22" fill="#f59e0b" fill-opacity="0.18" stroke="#f59e0b" stroke-opacity="0.55" stroke-width="1.5"/>
+  <text x="640" y="126" text-anchor="middle" fill="#f8fafc" font-family="Cairo, system-ui, sans-serif" font-size="22" font-weight="700">شروحات</text>
+  <text x="640" y="295" text-anchor="middle" fill="#f8fafc" font-family="Cairo, system-ui, sans-serif" font-size="64" font-weight="800">ما هو أجينت كات؟</text>
+  <text x="640" y="365" text-anchor="middle" fill="#94a3b8" font-family="Cairo, system-ui, sans-serif" font-size="28" font-weight="500">محرك إنتاج الفيديو بالوكلاء بلا مونتاج يدوي</text>
+  <rect x="576" y="410" width="128" height="5" rx="2.5" fill="#f59e0b"/>
+  <text x="1200" y="660" text-anchor="end" fill="#64748b" font-family="ui-monospace, monospace" font-size="22" font-weight="600">AgentCut</text>
+</svg>

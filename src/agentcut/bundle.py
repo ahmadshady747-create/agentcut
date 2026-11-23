@@ -1,8 +1,12 @@
-"""AgentMedia Bundle Bridge & Auto-Beat Editorial Director (v2.0.0).
+"""AgentMedia Bundle Bridge & Auto-Beat Editorial Director (v3.3.12).
 
 Standardizes the handoff contract between AgentMedia (Whisper word timings,
 voiceover narration, generated/curated visual assets) and AgentCut's editorial
 documentary engine. Zero external dependencies.
+
+Includes character-level LCS script alignment (preserving original Arabic
+script spelling and flagging low-confidence words) with Whisper as the free
+default and Deepgram as an optional timing provider.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .deepgram_align import align_scene_audio, parse_deepgram_response
 from .profiles import apply_profile_to_brief
 
 
@@ -22,9 +27,9 @@ def auto_split_beats(
 ) -> list[dict[str, Any]]:
     """Split a scene duration into natural 2.5-4.0s editorial visual beats.
 
-    Uses inter-word pause gaps from Whisper `word_timings` when available so
-    visual cuts land cleanly on natural speech pauses rather than mid-word.
-    Falls back to even tiling when no word timings are provided.
+    Uses inter-word pause gaps from Whisper/Deepgram `word_timings` when
+    available so visual cuts land cleanly on natural speech pauses rather than
+    mid-word. Falls back to even tiling when no word timings are provided.
     """
     dur = max(0.5, float(total_duration))
     imgs = [str(x) for x in (images or []) if isinstance(x, str) and x.strip()]
@@ -91,6 +96,78 @@ def auto_split_beats(
             item["broll"] = imgs[i % len(imgs)]
         beats.append(item)
     return beats
+
+
+def align_bundle_word_timings(
+    bundle: dict[str, Any],
+    provider: str = "whisper",
+    api_key: str | None = None,
+    language: str = "ar",
+    low_confidence_threshold: float = 0.72,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Align all scenes in an AgentMedia bundle using character-level LCS.
+
+    Preserves the author's original Arabic/English script spelling in
+    ``word_timings`` and collects any low-confidence or interpolated words in
+    the returned alignment summary. Whisper remains the free default.
+    """
+    out_bundle = dict(bundle)
+    scenes_out: list[dict[str, Any]] = []
+    scene_reports: list[dict[str, Any]] = []
+    total_words = 0
+    total_low_conf = 0
+
+    for idx, sc in enumerate(bundle.get("scenes", [])):
+        sc_copy = dict(sc)
+        sid = str(sc_copy.get("id") or f"scene_{idx + 1}")
+        text = str(sc_copy.get("text") or sc_copy.get("script") or "").strip()
+        nar = sc_copy.get("narration") or sc_copy.get("audio")
+        raw_timings = sc_copy.get("word_timings")
+
+        if raw_timings is None and isinstance(sc_copy.get("deepgram_response"), dict):
+            parsed_dg = parse_deepgram_response(sc_copy["deepgram_response"])
+            raw_timings = parsed_dg.get("words")
+            if sc_copy.get("duration") is None and parsed_dg.get("duration") is not None:
+                sc_copy["duration"] = parsed_dg["duration"]
+
+        should_align = bool(text) and (
+            isinstance(raw_timings, list) and len(raw_timings) > 0
+            or (provider == "deepgram" and isinstance(nar, str) and bool(nar))
+        )
+        if should_align:
+            dur = sc_copy.get("duration")
+            aligned = align_scene_audio(
+                script_text=text,
+                asr_words=raw_timings if isinstance(raw_timings, list) else None,
+                audio_path=nar if isinstance(nar, str) else None,
+                provider=provider,
+                api_key=api_key,
+                language=str(sc_copy.get("language") or language),
+                low_confidence_threshold=low_confidence_threshold,
+                audio_duration=float(dur) if isinstance(dur, (int, float)) else None,
+            )
+            sc_copy["word_timings"] = aligned["word_timings"]
+            sc_copy["alignment_stats"] = aligned["stats"]
+            if aligned["low_confidence_words"]:
+                sc_copy["low_confidence_words"] = aligned["low_confidence_words"]
+            total_words += aligned["stats"]["total_words"]
+            total_low_conf += aligned["stats"]["low_confidence_count"]
+            scene_reports.append({
+                "scene_id": sid,
+                "provider": aligned["provider"],
+                "stats": aligned["stats"],
+                "low_confidence_words": aligned["low_confidence_words"],
+            })
+        scenes_out.append(sc_copy)
+
+    out_bundle["scenes"] = scenes_out
+    summary = {
+        "provider": provider or "whisper",
+        "total_words": total_words,
+        "low_confidence_count": total_low_conf,
+        "scenes": scene_reports,
+    }
+    return out_bundle, summary
 
 
 def validate_media_bundle(bundle: dict[str, Any], check_files: bool = True) -> tuple[bool, list[dict[str, str]]]:
@@ -160,18 +237,35 @@ def bundle_to_editorial_brief(
     max_beat: float = 4.0,
     humanize: bool = False,
     cinema_look: str | None = None,
+    align_script: bool = True,
+    timing_provider: str = "whisper",
+    deepgram_api_key: str | None = None,
+    low_confidence_threshold: float = 0.72,
 ) -> dict[str, Any]:
     """Convert an AgentMedia bundle manifest into a ready-to-render editorial brief.
 
-    - Automatically splits long scenes into 2.5-4.0s beats using Whisper word_timings.
+    - Aligns word_timings to original script spelling via character-level LCS
+      (preserving Arabic spelling and flagging low-confidence words).
+    - Automatically splits long scenes into 2.5-4.0s beats using word_timings.
     - Wires scene-level highlight_card, word_timings, and full-sentence Arabic pills.
     - Applies the selected hardware render profile (`proxy`, `low_spec`, `master`, etc.).
     """
-    title = str(bundle.get("title") or "Editorial Essay")
-    brief_aspect = aspect or bundle.get("aspect") or "9:16"
+    align_summary: dict[str, Any] | None = None
+    working_bundle = bundle
+    if align_script:
+        working_bundle, align_summary = align_bundle_word_timings(
+            bundle,
+            provider=timing_provider,
+            api_key=deepgram_api_key,
+            language=str(bundle.get("language") or "ar"),
+            low_confidence_threshold=low_confidence_threshold,
+        )
+
+    title = str(working_bundle.get("title") or "Editorial Essay")
+    brief_aspect = aspect or working_bundle.get("aspect") or "9:16"
     scenes_out: list[dict[str, Any]] = []
 
-    for idx, sc in enumerate(bundle.get("scenes", [])):
+    for idx, sc in enumerate(working_bundle.get("scenes", [])):
         nar = sc.get("narration") or sc.get("audio")
         text = sc.get("text") or sc.get("script") or ""
         wtimings = sc.get("word_timings")
@@ -220,14 +314,15 @@ def bundle_to_editorial_brief(
         "captions_style": "plain",
         "parallel": bool(parallel),
         "cache_scenes": True,
+        "clean_tts": bool(working_bundle.get("clean_tts", True)),
         "scenes": scenes_out,
     }
-    if bundle.get("music"):
-        brief["music"] = bundle["music"]
-    if bundle.get("music_volume") is not None:
-        brief["music_volume"] = bundle["music_volume"]
-    if bundle.get("font"):
-        brief["font"] = bundle["font"]
+    if working_bundle.get("music"):
+        brief["music"] = working_bundle["music"]
+    if working_bundle.get("music_volume") is not None:
+        brief["music_volume"] = working_bundle["music_volume"]
+    if working_bundle.get("font"):
+        brief["font"] = working_bundle["font"]
 
     if humanize or cinema_look:
         from .director import humanize_brief
@@ -239,6 +334,8 @@ def bundle_to_editorial_brief(
         )
     if profile:
         brief = apply_profile_to_brief(brief, profile)
+    if align_summary and align_summary.get("total_words", 0) > 0:
+        brief["_alignment_summary"] = align_summary
     return brief
 
 
@@ -249,6 +346,9 @@ def produce_from_bundle(
     profile: str | None = None,
     parallel: bool = True,
     qc_audit: bool = False,
+    align_script: bool = True,
+    timing_provider: str = "whisper",
+    deepgram_api_key: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Validate an AgentMedia bundle, build an editorial brief, render it, and optionally run QC."""
     ok_val, errs = validate_media_bundle(bundle, check_files=True)
@@ -257,11 +357,22 @@ def produce_from_bundle(
 
     from .render import produce_explainer
 
-    brief = bundle_to_editorial_brief(bundle, aspect=aspect, profile=profile, parallel=parallel)
+    brief = bundle_to_editorial_brief(
+        bundle,
+        aspect=aspect,
+        profile=profile,
+        parallel=parallel,
+        align_script=align_script,
+        timing_provider=timing_provider,
+        deepgram_api_key=deepgram_api_key,
+    )
+    align_summary = brief.pop("_alignment_summary", None)
     ok, info = produce_explainer(brief, output_path)
     result = dict(info) if isinstance(info, dict) else {"result": info}
     result["bundle_scenes"] = len(brief["scenes"])
     result["render_profile"] = brief.get("render_profile", "default")
+    if align_summary is not None:
+        result["alignment_summary"] = align_summary
 
     if ok and qc_audit:
         from .qc import audit_video_quality

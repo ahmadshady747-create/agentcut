@@ -46,8 +46,8 @@ class TestSkillsPackV32(unittest.TestCase):
                 self.assertTrue((Path(td) / name / "SKILL.md").is_file())
 
     def test_62_mcp_tools_and_skills_cli(self):
-        self.assertEqual(__version__, "3.2.0")
-        self.assertEqual(len(TOOLS), 62)
+        self.assertEqual(__version__, "3.3.13")
+        self.assertEqual(len(TOOLS), 73)
 
         r1 = call_tool("list_agentcut_skills", {})
         self.assertFalse(r1.get("isError"))

@@ -249,3 +249,98 @@ def plan_jl_cut_audio(
         })
         cursor += dur
     return plan
+
+
+MUSIC_BED_PRESETS: dict[str, dict[str, Any]] = {
+    "documentary_drone": {
+        "name": "documentary_drone",
+        "description": "Warm atmospheric A-minor fifth documentary pad (110Hz/165Hz/220Hz/330Hz) with slow organic LFO breathing.",
+        "freqs": (110.0, 164.81, 220.0, 329.63),
+        "weights": "0.45 0.35 0.25 0.15",
+        "lowpass_hz": 520,
+        "tremolo_freq": 0.14,
+        "tremolo_depth": 0.28,
+        "default_volume_db": -22.0,
+    },
+    "contemplative_pad": {
+        "name": "contemplative_pad",
+        "description": "Soft reflective D-minor harmonic bed (146.8Hz/220Hz/261.6Hz/440Hz) for philosophical & literary essays.",
+        "freqs": (146.83, 220.0, 261.63, 440.0),
+        "weights": "0.40 0.35 0.25 0.12",
+        "lowpass_hz": 680,
+        "tremolo_freq": 0.11,
+        "tremolo_depth": 0.24,
+        "default_volume_db": -23.0,
+    },
+    "tech_pulse": {
+        "name": "tech_pulse",
+        "description": "Focused dark C-minor electronic pulse pad (65.4Hz/130.8Hz/196Hz/311.1Hz) for AI, software & investigative videos.",
+        "freqs": (65.41, 130.81, 196.00, 311.13),
+        "weights": "0.48 0.36 0.24 0.15",
+        "lowpass_hz": 600,
+        "tremolo_freq": 0.35,
+        "tremolo_depth": 0.32,
+        "default_volume_db": -22.0,
+    },
+}
+
+
+def list_music_presets() -> list[dict[str, Any]]:
+    """Return metadata for all built-in generative ambient music bed presets."""
+    return [dict(v) for v in MUSIC_BED_PRESETS.values()]
+
+
+def generate_ambient_music_bed(
+    output_path: str,
+    duration: float,
+    preset: str = "documentary_drone",
+    volume_db: float | None = None,
+    sample_rate: int = 48000,
+    timeout: int = 45,
+) -> tuple[bool, dict[str, Any]]:
+    """Synthesize a warm, zero-asset generative ambient music bed using pure FFmpeg `lavfi` (v3.3.4)."""
+    key = str(preset or "documentary_drone").strip().lower()
+    if key not in MUSIC_BED_PRESETS:
+        valid = ", ".join(sorted(MUSIC_BED_PRESETS))
+        return False, {"code": "UNKNOWN_MUSIC_PRESET", "message": f"Unknown music preset {preset!r}; choose from: {valid}"}
+
+    spec = MUSIC_BED_PRESETS[key]
+    dur = max(0.5, float(duration))
+    vol_db = float(volume_db if volume_db is not None else spec["default_volume_db"])
+    fade_in = min(0.8, dur * 0.18)
+    fade_out = min(1.2, dur * 0.22)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    f1, f2, f3, f4 = spec["freqs"]
+    fc = (
+        f"sine=f={f1}:r={sample_rate}:d={dur:.3f}[s1];"
+        f"sine=f={f2}:r={sample_rate}:d={dur:.3f}[s2];"
+        f"sine=f={f3}:r={sample_rate}:d={dur:.3f}[s3];"
+        f"sine=f={f4}:r={sample_rate}:d={dur:.3f}[s4];"
+        f"anoisesrc=c=pink:r={sample_rate}:d={dur:.3f}:a=0.08[n1];"
+        f"[s1][s2][s3][s4][n1]amix=inputs=5:weights={spec['weights']} 0.10,"
+        f"lowpass=f={spec['lowpass_hz']},highpass=f=45,"
+        f"tremolo=f={spec['tremolo_freq']}:d={spec['tremolo_depth']},"
+        f"afade=t=in:st=0:d={fade_in:.3f}:curve=qsin,"
+        f"afade=t=out:st={max(0.0, dur - fade_out):.3f}:d={fade_out:.3f}:curve=qsin,"
+        f"volume={vol_db}dB[aout]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-v", "error",
+        "-filter_complex", fc,
+        "-map", "[aout]",
+        "-ar", str(sample_rate),
+        "-ac", "2",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0 or not os.path.isfile(output_path):
+        return False, {"code": "MUSIC_BED_FAILED", "message": (proc.stderr or "").strip() or "ffmpeg failed"}
+
+    return True, {
+        "preset": key,
+        "output": output_path,
+        "duration": round(dur, 3),
+        "volume_db": vol_db,
+        "size_bytes": os.path.getsize(output_path),
+    }

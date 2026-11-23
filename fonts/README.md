@@ -23,6 +23,8 @@ system fonts installed:
   common words rendered with tofu boxes. Noto Sans Arabic
   Bold (751 presentation forms) renders joined Arabic
   completely under the same path.
+- `Cairo.ttf` — Dual-script Arabic + Latin display and body face (v3.3.9 default for mixed Arabic+Latin/punctuation text and all turnkey templates, replacing proprietary Arial/Segoe UI).
+  Licence: SIL Open Font License 1.1, see `OFL.txt`.
 - `DejaVuSans.ttf` — Latin text and the review timecode.
   Licence: Bitstream Vera licence, see `DejaVu-LICENSE.txt`.
 

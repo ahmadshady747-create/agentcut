@@ -17,7 +17,7 @@ from typing import Any
 
 from ..director import humanize_brief
 from ..profiles import apply_profile_to_brief
-from ..qc import audit_editorial_craft, audit_video_quality
+from ..qc import audit_editorial_craft, audit_video_quality, inspect_rendered_video_frames
 from .ir import compile_brief_to_ir
 
 
@@ -29,6 +29,7 @@ def produce_cinematic_auto_heal(
     auto_focal: bool = True,
     match_exposure: bool = True,
     mix_soundscape: bool = True,
+    clean_tts: bool = True,
     min_craft_score: int = 85,
     max_retries: int = 1,
 ) -> tuple[bool, dict[str, Any]]:
@@ -74,12 +75,16 @@ def produce_cinematic_auto_heal(
             healed_actions.append(f"matched_exposure_yavg_{ir.exposure_target_yavg}")
 
     working["mix_soundscape"] = bool(mix_soundscape)
+    working["clean_tts"] = bool(clean_tts)
+    if clean_tts:
+        healed_actions.append("enabled_auto_clean_tts")
     craft_after = audit_editorial_craft(working)
 
     # 3. Render + QC + Auto-Heal retry loop
     attempts = 0
     last_info: dict[str, Any] = {}
     last_qc: dict[str, Any] = {}
+    last_frame_insp: dict[str, Any] = {}
     ok = False
 
     for attempt in range(max(1, int(max_retries) + 1)):
@@ -89,7 +94,12 @@ def produce_cinematic_auto_heal(
         if not ok:
             break
         last_qc = audit_video_quality(output_path)
-        if last_qc.get("passed"):
+        last_frame_insp = inspect_rendered_video_frames(
+            output_path,
+            project_or_brief=last_info.get("project") if isinstance(last_info, dict) else working,
+            sample_count=4,
+        )
+        if last_qc.get("passed") and last_frame_insp.get("passed", True):
             break
         # Apply deterministic repairs for fixable QC issues
         codes = {i.get("code") for i in last_qc.get("issues", [])}
@@ -111,6 +121,7 @@ def produce_cinematic_auto_heal(
         "craft_before": craft_before,
         "craft_after": craft_after,
         "qc": last_qc,
+        "frame_inspection": last_frame_insp,
         "ir_summary": {
             "scenes": len(ir.scenes),
             "total_duration": ir.total_duration,

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "what-is-agentcut",
+    "title": "ما هو أجينت كات؟",
+    "description": "جولة سريعة تشرح كيف يحوّل AgentCut الفكرة النصية إلى فيديو وثائقي مكتمل بالسرد الصوتي والترجمة والموسيقى دون مونتاج يدوي.",
+    "duration": "3:08",
+    "category": "شروحات",
+    "thumbnail": "thumbnails/what-is-agentcut.svg",
+    "type": "mp4",
+    "source": "videos/what-is-agentcut.mp4"
+  },
+  {
+    "id": "ai-race-2026",
+    "title": "سباق الذكاء الاصطناعي 2026",
+    "description": "وثائقي تحليلي يرصد التحولات الكبرى في نماذج الذكاء الاصطناعي والوكلاء المستقلين خلال عام 2026، أُنتج بالكامل عبر AgentCut.",
+    "duration": "10:00",
+    "category": "شروحات",
+    "thumbnail": "thumbnails/ai-race-2026.svg",
+    "type": "mp4",
+    "source": "videos/ai-race-2026.mp4"
+  },
+  {
+    "id": "what-is-inflation",
+    "title": "ما هو التضخم؟",
+    "description": "شرح قصير ومكثف بصيغة ريلز يبسّط مفهوم التضخم الاقتصادي وتأثيره اليومي على القوة الشرائية في أقل من دقيقة.",
+    "duration": "0:55",
+    "category": "ريلز",
+    "thumbnail": "thumbnails/what-is-inflation.svg",
+    "type": "mp4",
+    "source": "videos/what-is-inflation.mp4"
+  }
+]

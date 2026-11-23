@@ -305,8 +305,8 @@ class TestParallelEditorialRenderV2(unittest.TestCase):
 
 class TestMcpAndCliV2(unittest.TestCase):
     def test_mcp_43_tools_and_dispatch(self):
-        self.assertEqual(__version__, "3.2.0")
-        self.assertEqual(len(TOOLS), 62)
+        self.assertEqual(__version__, "3.3.13")
+        self.assertEqual(len(TOOLS), 73)
 
         r1 = call_tool("list_render_profiles", {})
         self.assertFalse(r1.get("isError"))

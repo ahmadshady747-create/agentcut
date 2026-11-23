@@ -23,16 +23,28 @@ from typing import Any
 CINEMA_LOOKS: dict[str, dict[str, Any]] = {
     "chiaroscuro_doc": {
         "name": "chiaroscuro_doc",
-        "description": "Documentary chiaroscuro: rich warm shadows, subtle amber highlights, gentle contrast & natural vignette.",
+        "description": "Crisp documentary chiaroscuro: deep neutral blacks, subtle warm golden highlights, high clarity (no muddy teal cast).",
         "mood": "philosophical, historical, investigative",
         "vf": (
-            "eq=contrast=1.08:brightness=-0.02:saturation=0.92,"
-            "colorbalance=rs=-0.03:gs=-0.01:bs=0.04:rm=0.03:gm=0.01:bm=-0.02:rh=0.05:gh=0.02:bh=-0.03,"
-            "unsharp=3:3:0.35:3:3:0.0,"
-            "vignette=PI/5"
+            "eq=contrast=1.12:brightness=-0.01:saturation=1.00,"
+            "colorbalance=rs=0.01:gs=0.0:bs=0.0:rm=0.02:gm=0.01:bm=-0.01:rh=0.04:gh=0.02:bh=-0.02,"
+            "unsharp=3:3:0.45:3:3:0.0,"
+            "vignette=PI/5.5"
         ),
-        "scrim_opacity": 0.52,
-        "scrim_depth": 0.32,
+        "scrim_opacity": 0.50,
+        "scrim_depth": 0.30,
+    },
+    "crisp_cinema": {
+        "name": "crisp_cinema",
+        "description": "Zero-cast high-contrast natural cinema grade with clean blacks and micro-sharpening.",
+        "mood": "modern, tech, clean documentary",
+        "vf": (
+            "eq=contrast=1.10:brightness=0.0:saturation=1.04,"
+            "unsharp=3:3:0.40:3:3:0.0,"
+            "vignette=PI/6"
+        ),
+        "scrim_opacity": 0.48,
+        "scrim_depth": 0.30,
     },
     "kodak_warm": {
         "name": "kodak_warm",
@@ -52,7 +64,7 @@ CINEMA_LOOKS: dict[str, dict[str, Any]] = {
         "mood": "technical, analytical, thriller",
         "vf": (
             "eq=contrast=1.12:brightness=-0.03:saturation=0.78,"
-            "colorbalance=rs=-0.05:gs=0.01:bs=0.07:rm=-0.02:gm=0.0:bm=0.03:rh=0.02:gh=0.02:bh=0.01,"
+            "colorbalance=rs=-0.02:gs=0.0:bs=0.03:rm=-0.01:gm=0.0:bm=0.01:rh=0.02:gh=0.02:bh=0.01,"
             "unsharp=3:3:0.45:3:3:0.0,"
             "vignette=PI/4.8"
         ),

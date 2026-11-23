@@ -2,7 +2,7 @@
 
 ### The Autonomous Video Editing Engine Built for AI Agents.
 
-[![Version](https://img.shields.io/badge/version-3.2.0-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-3.3.13-blue.svg)](VERSION)
 [![CI Test Suite](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml/badge.svg)](https://github.com/ahmadshady747-create/agentcut/actions/workflows/test.yml)
 [![Zero Python Dependencies](https://img.shields.io/badge/python%20dependencies-zero%20(stdlib%20only)-brightgreen.svg)](https://www.python.org/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20Tools-34%20tools-purple.svg)](src/agentcut/server.py)
@@ -54,7 +54,7 @@ agentcut reframe out.mp4 9:16 vertical.mp4 --mode blur_pad
 # 6. Launch the interactive HTML5 Web Studio & Templates Gallery
 agentcut studio examples/basic.json studio.html
 
-# 7. Start the stdio Model Context Protocol (MCP) server (62 tools)
+# 7. Start the stdio Model Context Protocol (MCP) server (71 tools)
 agentcut-mcp
 ```
 
@@ -108,9 +108,9 @@ environment — open the file in Resolve to confirm.
 
 ---
 
-## 🎬 Editorial (`v3.2.0`): the Clean Editorial Theatre
+## 🎬 Editorial (`v3.3.13`): the Clean Editorial Theatre
 
-With **v3.2.0** `produce_explainer` gains style `editorial` — the
+With **v3.3.13** `produce_explainer` gains style `editorial` — the
 answer to the "automated slides" look. Scenes split into visual
 beats (2.5–4.0s each, from AgentMedia 0.13.0 bundles) with one
 crisp full-bleed image per beat: no heavy blur, no darkening, a
@@ -129,9 +129,9 @@ clean again. Verified end to end with real assets by
 
 ---
 
-## 🎬 Cinematic, Fixed and Alive (`v3.2.0`): Bundle Karaoke, the Pill on Every Cue, Continuous Motion
+## 🎬 Cinematic, Fixed and Alive (`v3.3.13`): Bundle Karaoke, the Pill on Every Cue, Continuous Motion
 
-With **v3.2.0** the cinematic compositor grows up: `produce_explainer`
+With **v3.3.13** the cinematic compositor grows up: `produce_explainer`
 takes a scene-level `word_timings` key — the Whisper timings from an
 AgentMedia scene bundle feed the karaoke path directly (the explicit
 key wins over in-tool TTS timings; malformed timings are rejected with

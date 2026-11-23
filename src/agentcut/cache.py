@@ -268,7 +268,7 @@ def clear_cache(project_dir: str | Path | None = None) -> int:
     cache_dir = get_cache_dir(project_dir)
     removed = 0
     if cache_dir.exists():
-        for pattern in ("scene_*.mp4", "seg_*.mkv", ".scene_*.tmp"):
+        for pattern in ("scene_*.mp4", "seg_*.mkv", "tts_*.wav", "tech_*.png", ".scene_*.tmp"):
             for item in cache_dir.glob(pattern):
                 try:
                     item.unlink()

@@ -36,7 +36,11 @@ jobs:
             tests/test_v250.py \
             tests/test_v300.py \
             tests/test_v310.py \
-            tests/test_v320.py -v
+            tests/test_v320.py \
+            tests/test_v331.py \
+            tests/test_v332.py \
+            tests/test_v333.py \
+            tests/test_v3311.py tests/test_v3312.py tests/test_v3313.py tests/test_v3310.py tests/test_v339.py tests/test_v338.py tests/test_v337.py tests/test_v336.py tests/test_v335.py tests/test_v334.py -v
       - name: Render smoke test
         run: ./run.sh render examples/basic.json /tmp/agentcut-smoke.mp4
 

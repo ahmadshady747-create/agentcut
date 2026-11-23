@@ -240,5 +240,14 @@ def repair_brief(raw_input: Any) -> tuple[dict[str, Any], list[str]]:
 
         fixed_scenes.append(sc)
 
+    if str(brief.get("font", "")).strip().lower() in ("segoe-ui", "segoeui", "arial", "tahoma"):
+        brief["font"] = "cairo"
+        if "replaced_proprietary_font_with_cairo" not in repairs:
+            repairs.append("replaced_proprietary_font_with_cairo")
+    for _sc in fixed_scenes:
+        if isinstance(_sc, dict) and str(_sc.get("font", "")).strip().lower() in ("segoe-ui", "segoeui", "arial", "tahoma"):
+            _sc["font"] = "cairo"
+            if "replaced_proprietary_font_with_cairo" not in repairs:
+                repairs.append("replaced_proprietary_font_with_cairo")
     brief["scenes"] = fixed_scenes
     return brief, repairs

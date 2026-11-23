@@ -146,8 +146,8 @@ class TestAutopilotV31(unittest.TestCase):
 
 class TestMcpAndCliV31(unittest.TestCase):
     def test_60_mcp_tools_and_v31_cli(self):
-        self.assertEqual(__version__, "3.2.0")
-        self.assertEqual(len(TOOLS), 62)
+        self.assertEqual(__version__, "3.3.13")
+        self.assertEqual(len(TOOLS), 73)
 
         r1 = call_tool("list_style_bibles", {})
         self.assertFalse(r1.get("isError"))

@@ -8644,9 +8644,9 @@ class TestLoop142(unittest.TestCase):
 
     def test_fix6_version_is_1_63_0(self):
         import agentcut
-        self.assertEqual(agentcut.__version__, "3.2.0")
+        self.assertEqual(agentcut.__version__, "3.3.11")
         with open(os.path.join(BASE, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "3.2.0")
+            self.assertEqual(f.read().strip(), "3.3.11")
 
 
 class TestLoop143(unittest.TestCase):

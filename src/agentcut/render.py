@@ -818,7 +818,8 @@ def _emit_glass_card(filters, vcur, overlay_index, bx, by, bw, bh,
     return f"vglass{gi}"
 
 
-def _pill_png_path(bw, bh, radius, color, opacity):
+def _pill_png_path(bw, bh, radius, color, opacity,
+                   border_color=None, border_opacity=0.0, border_width=1):
     """Cached path to a pre-rendered pill PNG (v1.46.0, R4).
 
     The pill is a static rounded-rect (colour + rounded alpha
@@ -836,8 +837,14 @@ def _pill_png_path(bw, bh, radius, color, opacity):
     """
     br = min(int(radius), int(bw) // 2, int(bh) // 2)
     _c = "".join(ch for ch in str(color) if ch.isalnum())[:16]
-    name = (f"pill_{int(bw)}x{int(bh)}_r{br}_{_c}_"
-            f"o{float(opacity):.2f}.png")
+    _bop = float(border_opacity or 0.0)
+    if border_color and _bop > 0.0:
+        _bc = "".join(ch for ch in str(border_color) if ch.isalnum())[:16]
+        name = (f"pill_{int(bw)}x{int(bh)}_r{br}_{_c}_"
+                f"o{float(opacity):.2f}_b{_bc}_{_bop:.2f}_w{int(border_width)}.png")
+    else:
+        name = (f"pill_{int(bw)}x{int(bh)}_r{br}_{_c}_"
+                f"o{float(opacity):.2f}.png")
     d = os.path.join(tempfile.gettempdir(), "agentcut-pill-masks")
     try:
         os.makedirs(d, exist_ok=True)
@@ -846,6 +853,18 @@ def _pill_png_path(bw, bh, radius, color, opacity):
     path = os.path.join(d, name)
     if os.path.isfile(path):
         return path
+    if border_color and _bop > 0.0:
+        try:
+            from .subtitles_style import render_styled_pill_png
+            return render_styled_pill_png(
+                path, int(bw), int(bh), br,
+                color=str(color), opacity=float(opacity),
+                border_color=str(border_color),
+                border_opacity=_bop,
+                border_width=max(1, int(border_width)),
+            )
+        except Exception:
+            pass
     vf = (f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
           f"a='{_rounded_alpha_factor(br)}*255*{float(opacity)}'")
     try:
@@ -863,7 +882,8 @@ def _pill_png_path(bw, bh, radius, color, opacity):
 
 def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
                     radius, color, opacity, fps, afmt, start, end,
-                    argv=None):
+                    argv=None, border_color=None, border_opacity=0.0,
+                    border_width=1):
     """Append a rounded-rect text background (pill) overlay.
 
     A colour source masked by the rounded-rect geq factor,
@@ -905,7 +925,12 @@ def _emit_text_pill(filters, vcur, overlay_index, bx, by, bw, bh,
     exactly; very short cues (< 0.02s) skip the fade.
     """
     br = min(int(radius), bw // 2, bh // 2)
-    _pp = _pill_png_path(bw, bh, br, color, opacity) if argv is not None else None
+    _pp = _pill_png_path(
+        bw, bh, br, color, opacity,
+        border_color=border_color,
+        border_opacity=border_opacity,
+        border_width=border_width,
+    ) if argv is not None else None
     _fd = min(0.12, max(0.0, (float(end) - float(start)) / 2.0))
     _fade = ""
     if _fd > 0.01:
@@ -1428,7 +1453,8 @@ def _measure_text_width(text, font, size, cache=None):
 
 
 def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
-                         zone_clamp=False, scale_factor=1.0):
+                         zone_clamp=False, scale_factor=1.0,
+                         margin_bottom=None, pad_y=0.0):
     """Top y of a no-position caption block (v1.42.0, Fix 3).
 
     The old default anchors the LAST line's top at height-120
@@ -1442,6 +1468,8 @@ def _default_caption_top(height, size, n_lines=1, line_spacing=1.35,
     (scale_factor), so a 0.5 draft anchors at height-60 —
     the same relative position, not the same pixels."""
     est_h = (n_lines - 1) * size * line_spacing + size * 1.4
+    if margin_bottom is not None:
+        return float(height - float(margin_bottom) * scale_factor - float(pad_y)) - est_h
     top = float(height - 120 * scale_factor) - (n_lines - 1) * size * line_spacing
     if zone_clamp:
         top = min(top, 0.92 * height - est_h)
@@ -1465,8 +1493,10 @@ def _active_caption_y(item, size, height, zone_clamp=False, scale_factor=1.0):
         return float(height - m40 - size * 1.4)
     if pos == "center":
         return float((height - size * 1.4) / 2)
+    _mb = item.get("margin_bottom")
+    _py = float(item.get("box_padding_y", item.get("box_padding", 12))) * scale_factor if _mb is not None else 0.0
     return _default_caption_top(height, size, 1, 1.35, zone_clamp,
-                                scale_factor)
+                                scale_factor, margin_bottom=_mb, pad_y=_py)
 
 
 def _expand_text_preset(item):
@@ -1562,8 +1592,10 @@ _ASS_FONT_BY_REGISTRY = {
     "noto-naskh": ("Noto Naskh Arabic", 0),
     "noto-sans-bold": ("Noto Sans Arabic", -1),
     "dejavu": ("DejaVu Sans", 0),
+    "cairo": ("Cairo", -1),
 }
 _ASS_FONT_BY_BASENAME = (
+    ("Cairo", ("Cairo", -1)),
     ("NotoSansArabic-Bold", ("Noto Sans Arabic", -1)),
     ("NotoSansArabic", ("Noto Sans Arabic", 0)),
     ("NotoNaskhArabic", ("Noto Naskh Arabic", 0)),
@@ -1774,8 +1806,10 @@ def _text_on_background(item, is_caption, width, height, size, bg_rects,
             top = _pos_expr_value(_ye, width, height, tw, th)
         else:
             left = (width - tw) / 2
+            _mb = item.get("margin_bottom")
+            _py = float(item.get("box_padding_y", item.get("box_padding", 12))) * scale_factor if _mb is not None else 0.0
             top = _default_caption_top(height, size, 1, 1.35, zone_clamp,
-                                       scale_factor)
+                                       scale_factor, margin_bottom=_mb, pad_y=_py)
     elif pos in _pm:
         _xe, _ye = _pm[pos]
         left = _pos_expr_value(_xe, width, height, tw, th)
@@ -4044,9 +4078,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                             _rbh = (_rn - 1) * _rlh + _rsize * 1.4
                             _rys.append((height - _rbh) / 2 + _li * _rlh)
                         else:
+                            _mb = _item.get("margin_bottom", project.get("caption_margin_bottom"))
+                            _py = _px(float(_item.get("box_padding_y", _item.get("box_padding", 12)))) if _mb is not None else 0.0
                             _rys.append(_default_caption_top(
                                 height, _rsize, _rn, cap_spacing,
-                                zone_clamp, scale_factor) + _li * _rlh)
+                                zone_clamp, scale_factor, margin_bottom=_mb, pad_y=_py) + _li * _rlh)
                     # Which full line each word belongs to.
                     _words_in_line = [len(_ln.split())
                                       for _ln in _full_lines]
@@ -4182,9 +4218,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 _block_h = (len(_lines) - 1) * _lh + _size * 1.4
                 _sub["_wrap_y"] = (height - _block_h) / 2 + _li * _lh
             else:
+                _mb = _item.get("margin_bottom", project.get("caption_margin_bottom"))
+                _py = _px(float(_item.get("box_padding_y", _item.get("box_padding", 12)))) if _mb is not None else 0.0
                 _sub["_wrap_y"] = _default_caption_top(
                     height, _size, len(_lines), cap_spacing,
-                    zone_clamp, scale_factor) + _li * _lh
+                    zone_clamp, scale_factor, margin_bottom=_mb, pad_y=_py) + _li * _lh
             if _block_top is None:
                 _block_top = float(_sub["_wrap_y"])
             _sub["_block_id"] = _block_seq
@@ -4248,8 +4286,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 x_expr, y_expr = _PM[item["position"]]
             else:
                 x_expr = "(w-text_w)/2"
+                _mb = item.get("margin_bottom", project.get("caption_margin_bottom"))
+                _py = _px(float(item.get("box_padding_y", item.get("box_padding", 12)))) if _mb is not None else 0.0
                 y_expr = str(_default_caption_top(height, size, 1, 1.35,
-                                                  zone_clamp, scale_factor))
+                                                  zone_clamp, scale_factor,
+                                                  margin_bottom=_mb, pad_y=_py))
         else:
             x = item.get("x", "center")
             if x == "center":
@@ -4518,13 +4559,14 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                        for _bw in _bwidths]
             _bleft = min(_blefts)
             _bright = max(_l + _w for _l, _w in zip(_blefts, _bwidths))
-            _bpad = _pxi(12)
-            _bbx = max(0, int(_bleft - _bpad))
-            _bby = max(0, int(float(item["_block_top"]) - _bpad))
-            _bbw = int(_bright - _bleft + 2 * _bpad + 0.5)
+            _bpad_x = _pxi(int(item.get("box_padding_x", item.get("box_padding", 12))))
+            _bpad_y = _pxi(int(item.get("box_padding_y", item.get("box_padding", 12))))
+            _bbx = max(0, int(_bleft - _bpad_x))
+            _bby = max(0, int(float(item["_block_top"]) - _bpad_y))
+            _bbw = int(_bright - _bleft + 2 * _bpad_x + 0.5)
             _bbh = int((int(item["_block_n"]) - 1)
                        * float(item["_block_lh"]) + float(size) * 1.4
-                       + 2 * _bpad + 0.5)
+                       + 2 * _bpad_y + 0.5)
             _bbw = max(1, min(_bbw, width - _bbx))
             _bbh = max(1, min(_bbh, height - _bby))
             _bbr = item.get("box_radius")
@@ -4533,7 +4575,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 filters, vcur, overlay_index, _bbx, _bby,
                 _bbw, _bbh, _bbr, item.get("box_color", "black"),
                 float(item.get("box_opacity", 0.5)),
-                fps, _afmt, start, end, argv)
+                fps, _afmt, start, end, argv,
+                border_color=item.get("box_border_color"),
+                border_opacity=float(item.get("box_border_opacity", 0.0) or 0.0),
+                border_width=max(1, _pxi(int(item.get("box_border_width", 1) or 1))))
         # Rounded text background (v1.36.0 pill, v1.45.0 R5
         # default): a generated rounded-rect colour source
         # overlaid UNDER the text, in place of drawtext's
@@ -4557,9 +4602,10 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
             est_w = _measure_text_width(str(item["text"]), item_font,
                                         size, _width_cache)
             est_h = float(size) * 1.4
-            pad = _pxi(int(item.get("box_padding", 12)))
-            bw = int(est_w + 2 * pad + 0.5)
-            bh = int(est_h + 2 * pad + 0.5)
+            pad_x = _pxi(int(item.get("box_padding_x", item.get("box_padding", 12))))
+            pad_y = _pxi(int(item.get("box_padding_y", item.get("box_padding", 12))))
+            bw = int(est_w + 2 * pad_x + 0.5)
+            bh = int(est_h + 2 * pad_y + 0.5)
             _brad = item.get("box_radius")
             _brad = _pxi(16) if _brad is None else _pxi(int(_brad))
             pos = item.get("position")
@@ -4573,8 +4619,11 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                 elif pos == "center":
                     top = (height - est_h) / 2
                 else:
+                    _mb = item.get("margin_bottom", project.get("caption_margin_bottom"))
+                    _py = float(pad_y) if _mb is not None else 0.0
                     top = _default_caption_top(height, size, 1, 1.35,
-                                               zone_clamp, scale_factor)
+                                               zone_clamp, scale_factor,
+                                               margin_bottom=_mb, pad_y=_py)
                 if pos in ("top_left", "bottom_left"):
                     left = _m40
                 elif pos in ("top_right", "bottom_right"):
@@ -4613,13 +4662,16 @@ def build_ffmpeg_args(project, info, output_path, scale_factor=1.0,
                                 str(xv))
                             left = (_px(float(_m.group(1))) - est_w / 2
                                     if _m else (width - est_w) / 2)
-            bx = max(0, int(left - pad))
-            by = max(0, int(top - pad))
+            bx = max(0, int(left - pad_x))
+            by = max(0, int(top - pad_y))
             vcur = _emit_text_pill(
                 filters, vcur, overlay_index, bx, by, bw, bh,
                 _brad, item.get("box_color", "black"),
                 float(item.get("box_opacity", 0.5)),
-                fps, _afmt, start, end, argv)
+                fps, _afmt, start, end, argv,
+                border_color=item.get("box_border_color"),
+                border_opacity=float(item.get("box_border_opacity", 0.0) or 0.0),
+                border_width=max(1, _pxi(int(item.get("box_border_width", 1) or 1))))
         # Highlight sweep / underline swipe (v1.44.0, F4): a bar
         # behind (highlight) or under (underline) the line that
         # sweeps in over the first 0.6s, then holds. The bar hugs
@@ -7242,7 +7294,8 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
     import concurrent.futures
     import shutil
 
-    tmp_dir = tempfile.mkdtemp(prefix="agentcut-parallel-")
+    from .profiles import get_fast_temp_root
+    tmp_dir = tempfile.mkdtemp(prefix="agentcut-parallel-", dir=get_fast_temp_root())
     try:
         chunk_files = []
         futures = []
@@ -7394,8 +7447,12 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                     "scrims": project.get("scrims", {}),
                     "default_image_motion": project.get("default_image_motion", False),
                 }
-                chunk_proj["output"]["master_loudnorm"] = True
-                chunk_proj["output"]["loudnorm_i"] = -14.0
+                for _ckey in ("caption_max_width", "caption_line_spacing", "caption_margin_bottom", "subtitle_theme"):
+                    if _ckey in project:
+                        chunk_proj[_ckey] = project[_ckey]
+                # v3.3.7 optimization: skip redundant per-chunk EBU R128 loudnorm buffer
+                # (~150MB RAM + audio CPU per worker); the final assembly pass normalizes the joined timeline once.
+                chunk_proj["output"]["master_loudnorm"] = False
 
                 chunk_out = os.path.join(tmp_dir, f"chunk_{si:03d}.mp4")
 
@@ -7510,8 +7567,8 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
         joined_path = os.path.join(tmp_dir, "joined.mp4")
         ok, ainfo = render_project(
             assembly, joined_path, scale_factor=scale_factor,
-            video_codec=video_codec, video_crf=10,
-            video_preset=video_preset or "fast",
+            video_codec=video_codec, video_crf=20,
+            video_preset=video_preset or "veryfast",
             t_override=total + 1.0 / fps,
             timeout=timeout)
         if not ok:
@@ -7619,7 +7676,7 @@ def _render_explainer_parallel(project, scenes, output_path, scale_factor=1.0,
                 "-i", joined_path,
                 "-i", music_src,
                 "-filter_complex",
-                "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14.0:TP=-1.0:LRA=11,apad[a]",
+                "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asplit=2[v_main][v_sc];[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=0.22[bg];[bg][v_sc]sidechaincompress=threshold=0.025:ratio=4.5:attack=35:release=420[bg_duck];[v_main][bg_duck]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14.0:TP=-1.0:LRA=11,apad[a]",
                 "-map", "0:v",
                 "-map", "[a]",
                 "-c:v", "copy",
@@ -8144,7 +8201,22 @@ def produce_explainer(brief, output_path, review_dir=None):
     # timings never spoke) for the result.
     _ed_beat_index = 0
     _ed_warnings = []
+    _tts_cleaned_count = 0
+    _tech_cards_count = 0
+    _chapter_cards_count = 0
+    _parallax_clips_count = 0
+    _j_cuts_count = 0
     total = 0.0
+    if brief.get("auto_chapter_cards") or any(
+        isinstance(s, dict) and (s.get("chapter_card") or s.get("chapter_title") or s.get("act"))
+        for s in scenes_in
+    ):
+        try:
+            from .parallax import auto_attach_chapter_cards
+            _ch_brief = auto_attach_chapter_cards(brief)
+            scenes_in = list(_ch_brief.get("scenes") or scenes_in)
+        except Exception:
+            pass
     for si, scene in enumerate(scenes_in):
         if not isinstance(scene, dict):
             return False, {"code": "INVALID_SCHEMA",
@@ -8186,6 +8258,41 @@ def produce_explainer(brief, output_path, review_dir=None):
             return False, {"code": "FILE_NOT_FOUND",
                            "message": f"scene {sid} narration not found: {narration}",
                            "fix": f"fix scene {sid} narration to an existing local audio file"}
+        # v3.3.2 (Cycle 2): Automatic TTS tail-hallucination & rumble cleaning inside
+        # produce_explainer. Uses preserve_duration=True so explicit editorial beats
+        # and Whisper word_timings stay 100% in sync while muting trailing snorts/whistles.
+        _want_clean_tts = scene.get(
+            "clean_tts",
+            brief.get("clean_tts", bool(editorial or brief.get("humanized"))),
+        )
+        if _want_clean_tts:
+            try:
+                import hashlib
+                from .cache import get_cache_dir
+                from .smart_cut import clean_tts_audio
+                _nar_abs = resolve_path(narration)
+                _st = os.stat(_nar_abs)
+                _tail_s = float(scene.get("tts_trim_tail_sec", brief.get("tts_trim_tail_sec", 0.16)))
+                _ckey = hashlib.sha256(
+                    f"clean_tts_v1:{_nar_abs}:{_st.st_size}:{_st.st_mtime_ns}:{_tail_s:.3f}".encode("utf-8")
+                ).hexdigest()[:16]
+                _cdir = get_cache_dir(os.path.dirname(os.path.abspath(output_path)))
+                _clean_out = str(_cdir / f"tts_{_ckey}.wav")
+                if os.path.isfile(_clean_out) and os.path.getsize(_clean_out) > 256:
+                    narration = _clean_out
+                    _tts_cleaned_count += 1
+                else:
+                    _ok_cl, _cl_info = clean_tts_audio(
+                        _nar_abs,
+                        _clean_out,
+                        trim_tail_sec=_tail_s,
+                        preserve_duration=True,
+                    )
+                    if _ok_cl and os.path.isfile(_clean_out):
+                        narration = _clean_out
+                        _tts_cleaned_count += 1
+            except Exception:
+                pass
         probe = probe_media(narration)
         if probe is None or probe.get("duration") is None or float(probe["duration"]) <= 0:
             return False, {"code": "INVALID_SCHEMA",
@@ -8368,6 +8475,20 @@ def produce_explainer(brief, output_path, review_dir=None):
                                                   or scene.get("captions_style")
                                                   or brief.get("caption_style")
                                                   or captions_style)
+            if not is_karaoke and (editorial or brief.get("humanized") or brief.get("subtitle_theme")):
+                from .subtitles_style import style_arabic_caption_entry, theme_for_cinema_look
+                _sub_theme = (
+                    scene.get("subtitle_theme")
+                    or brief.get("subtitle_theme")
+                    or theme_for_cinema_look(brief.get("cinema_look"))
+                )
+                cap_entry = style_arabic_caption_entry(
+                    cap_entry,
+                    width=width,
+                    height=height,
+                    theme=_sub_theme,
+                    margin_bottom_override=scene.get("caption_margin_bottom", brief.get("caption_margin_bottom")),
+                )
             captions.append(cap_entry)
         scene_trans = "none"
         if si > 0:
@@ -8379,7 +8500,105 @@ def produce_explainer(brief, output_path, review_dir=None):
         # non-local broll spec in cinematic mode is a brief
         # error, not a fetch; blackboard keeps the 1.60.0
         # resolve_broll_media behaviour (local / URL / keyword).
+        # v3.3.3 (Cycle 3): Real technical code/KPI/chart card auto-generation
+        # for technical or quantitative scenes that have no explicit local B-roll
+        # (or carry an explicit `tech_card` object). Replaces random AI gibberish
+        # images with crisp deterministic vector/FFmpeg graphics.
         scene_broll = scene.get("broll") or scene.get("bg_media") or scene.get("background")
+        _want_tech_card = isinstance(scene.get("tech_card"), dict) or (
+            not scene_broll and bool(scene.get("auto_tech_cards", brief.get("auto_tech_cards", bool(editorial or brief.get("humanized")))))
+        )
+        if _want_tech_card:
+            try:
+                from .tech_cards import build_tech_card_for_scene
+                _tc_png = build_tech_card_for_scene(
+                    scene,
+                    width=width,
+                    height=height,
+                    project_dir=os.path.dirname(os.path.abspath(output_path)),
+                )
+                if _tc_png and os.path.isfile(_tc_png):
+                    scene_broll = _tc_png
+                    _tech_cards_count += 1
+            except Exception:
+                pass
+        # v3.3.6 (Cycle 6): Automatic Chapter Card B-Roll or Upper Act Banner Overlay
+        _ch_raw = scene.get("chapter_card")
+        if _ch_raw:
+            _ch_obj = _ch_raw if isinstance(_ch_raw, dict) else {"title": str(_ch_raw).strip(), "label": f"الفصل {si + 1:02d}"}
+            _ch_title = str(_ch_obj.get("title") or "").strip()
+            if _ch_title:
+                if not scene_broll or _ch_obj.get("as_broll", False):
+                    try:
+                        from .parallax import render_chapter_card_png
+                        _ok_ch, _ch_res = render_chapter_card_png(
+                            title=_ch_title,
+                            subtitle=_ch_obj.get("subtitle"),
+                            chapter_label=_ch_obj.get("label"),
+                            width=width,
+                            height=height,
+                            cinema_look=str(brief.get("cinema_look") or "chiaroscuro_doc"),
+                            project_dir=os.path.dirname(os.path.abspath(output_path)),
+                        )
+                        if _ok_ch and os.path.isfile(_ch_res["output"]):
+                            scene_broll = _ch_res["output"]
+                            _chapter_cards_count += 1
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        from .compositor import glass_card_overlay
+                        _ch_dur = min(float(_ch_obj.get("duration", 1.5)), dur * 0.55)
+                        _ch_w = int(round(width * 0.74))
+                        _ch_h = max(64, int(round(height * 0.085)))
+                        _ch_x = int(round((width - _ch_w) / 2))
+                        _ch_y = int(round(height * 0.10))
+                        overlays.append(glass_card_overlay(
+                            overlay_id=f"ed-chapter-{sid}",
+                            x=_ch_x, y=_ch_y, w=_ch_w, h=_ch_h,
+                            start=round(start, 3), duration=round(_ch_dur, 3),
+                            width=width, accent_bar=True, accent_color="#D4A359",
+                            drop_shadow=True,
+                            project_dir=os.path.dirname(os.path.abspath(output_path)),
+                        ))
+                        _ch_tsize = max(22, int(round(min(width, height) * 0.044)))
+                        _ch_lsize = max(14, int(round(_ch_tsize * 0.55)))
+                        _ch_lbl = str(_ch_obj.get("label") or "").strip()
+                        if _ch_lbl:
+                            texts.append({
+                                "text": _ch_lbl,
+                                "start": round(start + 0.04, 3),
+                                "end": round(start + max(0.3, _ch_dur - 0.04), 3),
+                                "size": _ch_lsize,
+                                "x": "center",
+                                "y": _ch_y + 10,
+                                "color": "#F59E0B",
+                                "box": False,
+                            })
+                            texts.append({
+                                "text": _ch_title,
+                                "start": round(start + 0.04, 3),
+                                "end": round(start + max(0.3, _ch_dur - 0.04), 3),
+                                "size": _ch_tsize,
+                                "x": "center",
+                                "y": _ch_y + 12 + int(round(_ch_lsize * 1.35)),
+                                "color": "white",
+                                "box": False,
+                            })
+                        else:
+                            texts.append({
+                                "text": _ch_title,
+                                "start": round(start + 0.04, 3),
+                                "end": round(start + max(0.3, _ch_dur - 0.04), 3),
+                                "size": _ch_tsize,
+                                "x": "center",
+                                "y": _ch_y + max(10, (_ch_h - int(round(_ch_tsize * 1.3))) // 2),
+                                "color": "white",
+                                "box": False,
+                            })
+                        _chapter_cards_count += 1
+                    except Exception:
+                        pass
         scene_src = background
         scene_kind = "image"
         is_broll = False
@@ -8442,17 +8661,57 @@ def produce_explainer(brief, output_path, review_dir=None):
                 else:
                     _beat_src = background
                     _beat_kind = "image"
+                # v3.3.6 (Cycle 6): Automatic 2.5D Parallax compositing on image beats
+                _beat_px = _beat.get("parallax") if _beat.get("parallax") is not None else (scene.get("parallax") if _bi == 0 else None)
+                _beat_fg = _beat.get("fg_broll") or _beat.get("parallax_fg") or (_bi == 0 and (scene.get("fg_broll") or scene.get("parallax_fg")))
+                _auto_px = bool(brief.get("auto_parallax")) and _bi == 0 and (scene.get("_narrative_intent") in ("hook", "climax", "revelation") or si == 0)
+                if (_beat_px or _beat_fg or _auto_px) and _beat_kind == "image" and _beat_src and os.path.isfile(_beat_src) and _beat_src != background:
+                    try:
+                        from .parallax import render_cached_parallax_beat
+                        _fg_p = (
+                            resolve_path(_beat_fg)
+                            if isinstance(_beat_fg, str) and _beat_fg
+                            else (
+                                resolve_path(_beat_px["fg"])
+                                if isinstance(_beat_px, dict) and isinstance(_beat_px.get("fg"), str)
+                                else None
+                            )
+                        )
+                        _bg_p = (
+                            resolve_path(_beat_px["bg"])
+                            if isinstance(_beat_px, dict) and isinstance(_beat_px.get("bg"), str)
+                            else _beat_src
+                        )
+                        _ok_px, _px_mp4 = render_cached_parallax_beat(
+                            bg_path=_bg_p,
+                            fg_path=_fg_p,
+                            duration=round(_clip_dur + 0.15, 3),
+                            width=width,
+                            height=height,
+                            fps=fps,
+                            cinema_look=brief.get("cinema_look"),
+                            project_dir=os.path.dirname(os.path.abspath(output_path)),
+                        )
+                        if _ok_px and os.path.isfile(_px_mp4):
+                            _beat_src = _px_mp4
+                            _beat_kind = "video"
+                            _parallax_clips_count += 1
+                    except Exception:
+                        pass
                 _beat_clip = {"id": f"{sid}-beat{_bi + 1:02d}",
                               "kind": _beat_kind, "src": _beat_src,
-                              "duration": round(_clip_dur, 3),
+                              **({"trim_in": 0, "trim_out": round(_clip_dur, 3)}
+                                 if _beat_kind == "video"
+                                 else {"duration": round(_clip_dur, 3)}),
                               # "crossfade" (not "fade"): "fade" is a
                               # fade-to-black that CONCATENATES —
                               # only XFADE_TRANSITIONS overlap the
                               # timeline (validate._recompute_clip_starts).
-                              "transition": ("crossfade" if _bi > 0
-                                             else scene_trans)}
-                if _bi > 0:
-                    _beat_clip["transition_duration"] = EDITORIAL_XFADE
+                              "transition": (_beat.get("transition") if _beat.get("transition") is not None
+                                             else ("none" if brief.get("beat_transition") == "none"
+                                                   else ("crossfade" if _bi > 0 else scene_trans)))}
+                if _bi > 0 and _beat_clip["transition"] != "none":
+                    _beat_clip["transition_duration"] = float(_beat.get("transition_duration", EDITORIAL_XFADE))
                 elif scene_trans != "none":
                     _beat_clip["transition_duration"] = float(
                         scene.get("transition_duration",
@@ -8549,8 +8808,27 @@ def produce_explainer(brief, output_path, review_dir=None):
         # (Editorial marks its first beat clip above instead.)
         if rich and si > 0 and not editorial:
             clips[-1]["sfx"] = "whoosh"
+        # v3.3.6 (Cycle 6): Automatic J-Cut audio overlap (incoming narration leads visual cut)
+        _jl_plan = ((brief.get("soundscape") or {}).get("jl_cuts") or [])
+        _want_jcut = (
+            bool(scene.get("j_cut", brief.get("j_cut", bool(editorial or brief.get("humanized") or _jl_plan))))
+            and scene.get("cut_style") != "straight"
+            and brief.get("j_cut") is not False
+        )
+        _audio_start = round(start, 3)
+        if si > 0 and _want_jcut:
+            _j_lead = float(scene.get("j_cut_lead", brief.get("j_cut_lead", 0.18)))
+            if si < len(_jl_plan) and isinstance(_jl_plan[si], dict) and _jl_plan[si].get("cut_style") == "j_cut":
+                _pl = float(_jl_plan[si].get("visual_start", start)) - float(_jl_plan[si].get("audio_start", start))
+                if _pl > 0:
+                    _j_lead = min(_pl, 0.25)
+            _prev_dur = float(scenes[-1]["duration"]) if scenes else dur
+            _j_lead = max(0.0, min(_j_lead, dur * 0.20, _prev_dur * 0.25))
+            _audio_start = max(0.0, round(start - _j_lead, 3))
+            if _audio_start < round(start, 3) - 0.005:
+                _j_cuts_count += 1
         audio.append({"src": narration, "kind": "voice", "volume": 1.0,
-                      "start": start})
+                      "start": _audio_start})
         stitle = scene.get("title")
         # v1.45.0, R8: a long paced scene shows its title as
         # a lower_third (beat 0, spring) instead of the static
@@ -8917,8 +9195,9 @@ def produce_explainer(brief, output_path, review_dir=None):
                 width=width, accent_bar=False, drop_shadow=True,
                 project_dir=os.path.dirname(
                     os.path.abspath(output_path))))
-            _tx0 = _hc_abs_start + 0.25
-            _tx1 = _hc_abs_start + _hc_dur - 0.20
+            # v3.3.1: tight 0.05s inset so the glass card never lingers empty on screen
+            _tx0 = _hc_abs_start + 0.05
+            _tx1 = _hc_abs_start + _hc_dur - 0.05
             if _tx1 - _tx0 < 0.5:
                 _tx0, _tx1 = _hc_abs_start, _hc_abs_start + _hc_dur
             texts.append({"text": _hc_title, "start": round(_tx0, 3),
@@ -8934,6 +9213,8 @@ def produce_explainer(brief, output_path, review_dir=None):
                     "color": "white", "box": False})
         scenes.append({"id": sid, "title": stitle, "start": round(start, 3),
                        "end": round(end, 3), "duration": round(dur, 3),
+                       "audio_start": _audio_start,
+                       "j_cut_lead_sec": round(start - _audio_start, 3),
                        "narration": narration, "captions": srt_path,
                        "clip_start": _scene_clip_start, "clip_end": len(clips)})
         total = end
@@ -8983,6 +9264,19 @@ def produce_explainer(brief, output_path, review_dir=None):
         "default_image_motion": (motion == "gentle" and not cinematic
                                  and not editorial),
     }
+    if editorial or brief.get("humanized") or brief.get("subtitle_theme"):
+        from .subtitles_style import compute_subtitle_layout, theme_for_cinema_look
+        _proj_sub_theme = brief.get("subtitle_theme") or theme_for_cinema_look(brief.get("cinema_look"))
+        _sub_lay = compute_subtitle_layout(
+            width=width,
+            height=height,
+            theme=_proj_sub_theme,
+            margin_bottom_override=brief.get("caption_margin_bottom"),
+        )
+        project["subtitle_theme"] = _proj_sub_theme
+        project["caption_max_width"] = float(brief.get("caption_max_width", _sub_lay["max_width_frac"]))
+        project["caption_line_spacing"] = float(brief.get("caption_line_spacing", _sub_lay["line_spacing"]))
+        project["caption_margin_bottom"] = int(_sub_lay["margin_bottom"])
     if brief.get("chapters"):
         project["chapters"] = [{"title": s["title"] or s["id"],
                                 "start": s["start"]} for s in scenes]
@@ -9042,8 +9336,10 @@ def produce_explainer(brief, output_path, review_dir=None):
     is_draft = bool(brief.get("draft") or brief.get("mode") == "draft")
     scale_factor = float(brief.get("scale_factor", 0.5 if is_draft else 1.0))
     video_preset = brief.get("video_preset") or ("ultrafast" if is_draft else None)
-    is_parallel = bool(brief.get("parallel") or brief.get("render_mode") == "parallel")
     max_workers = brief.get("max_workers")
+    is_parallel = bool(brief.get("parallel") or brief.get("render_mode") == "parallel")
+    if max_workers is not None and int(max_workers) <= 1:
+        is_parallel = False
 
     timeout = max(600, int(total * 20))
     # v2.0.0: parallel rendering now supports multi-beat editorial scenes!
@@ -9062,14 +9358,15 @@ def produce_explainer(brief, output_path, review_dir=None):
     if not ok:
         return False, rinfo
     soundscape_mix = None
-    if brief.get("soundscape") and brief.get("mix_soundscape", True):
+    if (brief.get("soundscape") or _j_cuts_count > 0) and brief.get("mix_soundscape", True):
         try:
             from .pipeline.audio_mixer import mix_soundscape_into_video
             _ok_mix, _mix_info = mix_soundscape_into_video(
                 output_path,
                 output_path,
-                brief["soundscape"],
+                brief.get("soundscape") or {},
                 total_duration=float(info["total_duration"]),
+                scenes=scenes,
             )
             if _ok_mix:
                 soundscape_mix = _mix_info
@@ -9100,6 +9397,11 @@ def produce_explainer(brief, output_path, review_dir=None):
         "parallel_chunks": rinfo.get("parallel_chunks", 0),
         "cache_hits": rinfo.get("cache_hits", 0),
         "soundscape_mix": soundscape_mix,
+        "tts_cleaned_scenes": _tts_cleaned_count,
+        "tech_cards_generated": _tech_cards_count,
+        "chapter_cards_rendered": _chapter_cards_count,
+        "parallax_clips_rendered": _parallax_clips_count,
+        "j_cuts_applied": _j_cuts_count,
         "scenes": scenes,
         "chapters": info.get("chapters", []),
         "warnings": explainer_warnings,
