@@ -356,11 +356,13 @@ class TestEditorialExplainer(_V164Base):
         card_h = png_h - 2 * CARD_SHADOW_PAD
         self.assertGreaterEqual(card_top, top)
         self.assertLessEqual(card_top + card_h, bottom)
-        # Card texts are inset by the 0.25s/0.20s fades.
+        # Card texts use the v3.3.1 tight 0.05s inset on both
+        # sides (card 6.0..8.8, so text 6.05..8.75): the card
+        # never lingers empty on screen.
         title = next(t for t in self.project["texts"]
                      if t["text"] == "70% من الوقت")
-        self.assertAlmostEqual(title["start"], 6.25, places=2)
-        self.assertAlmostEqual(title["end"], 8.6, places=2)
+        self.assertAlmostEqual(title["start"], 6.05, places=2)
+        self.assertAlmostEqual(title["end"], 8.75, places=2)
 
     def test_captions_are_plain_full_sentence(self):
         caps = self.project["captions"]

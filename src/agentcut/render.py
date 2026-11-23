@@ -9101,8 +9101,9 @@ def produce_explainer(brief, output_path, review_dir=None):
         # word's time in the scene's word_timings (explicit key
         # or TTS timings); else the scene middle. The card fades
         # in 0.25s / out 0.20s (glass_card_overlay) while texts
-        # hard-cut, so the text window is inset by the fades —
-        # text only shows while the card is opaque.
+        # hard-cut. v3.3.1: the text window uses a tight 0.05s
+        # inset on both sides (not the fade durations) so the
+        # card never lingers empty on screen.
         _hc = scene.get("highlight_card")
         if _hc is not None:
             if not editorial:
