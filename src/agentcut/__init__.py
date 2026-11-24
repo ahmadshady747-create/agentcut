@@ -1,22 +1,116 @@
-"""AgentCut: an agent-first cinematic documentary video engine. No human timeline UI."""
+"""AgentCut v3.4.5: complete browser-rendered Arabic & English video engine (FFmpeg strictly for encoding & audio)."""
 
-__version__ = "3.3.13"
+__version__ = "3.4.5"
 
-from .templates import CONTENT_TEMPLATES, list_content_templates, build_brief_from_template
-from .profiles import RENDER_PROFILES, list_render_profiles, get_render_profile, detect_hardware_profile
-from .qc import audit_video_quality, audit_editorial_craft
-from .bundle import auto_split_beats, validate_media_bundle, bundle_to_editorial_brief, produce_from_bundle
-from .smart_cut import detect_speech_segments, build_jump_cut_project, smart_cut_media, clean_tts_audio
-from .batch import run_batch_production
-from .cinematography import CINEMA_LOOKS, list_cinema_looks, get_cinema_look, choose_narrative_camera_move
-from .soundscape import SFX_CATALOG, synthesize_sfx, generate_room_tone, plan_jl_cut_audio, MUSIC_BED_PRESETS, list_music_presets, generate_ambient_music_bed
-from .director import analyze_narrative_beat, humanize_brief, direct_from_script
-from .vision import detect_focal_point, measure_shot_exposure, compute_exposure_match_filter
-from .parallax import render_chapter_card, render_parallax_clip, build_video_beat_motion_filter
-from .pipeline import compile_brief_to_ir, mix_soundscape_into_video, produce_cinematic_auto_heal
-from .brief_repair import repair_brief
-from .art_director import STYLE_BIBLES, list_style_bibles, generate_visual_prompts
+from .beat_sync import (
+    compute_rms_envelope,
+    detect_energy_peaks,
+    detect_natural_pauses,
+    analyze_audio_beats,
+    align_visual_anchors_to_beats,
+    build_scene_beat_profile,
+)
+from .brand_kits import (
+    BRAND_KITS,
+    list_brand_kits,
+    get_brand_kit,
+    register_brand_kit,
+    apply_brand_kit,
+)
+from .browser_render import (
+    PLAYWRIGHT_AVAILABLE,
+    chromium_available,
+    frame_times,
+    probe_audio_duration,
+    mix_audio,
+    measure_loudness,
+    audit_audio_mix,
+    build_loudnorm_filter,
+    encode_frames,
+    encode_png_stream_pipe,
+    get_fast_scratch_dir,
+    capture_frames,
+    capture_single_frame,
+    render_browser_page,
+)
+from .captions import (
+    CAPTION_STYLES,
+    is_latin_token,
+    balance_caption_chunks,
+    render_caption_html,
+)
+from .charts import (
+    build_line_chart_svg,
+    build_donut_chart_svg,
+    build_grouped_bars_svg,
+)
+from .director_browser import script_to_spec
+from .icons import (
+    ICONS,
+    ILLUSTRATIONS,
+    icon_svg,
+    illustration_svg,
+    list_icons,
+    list_illustrations,
+    search_icons,
+)
+from .flat_reels import (
+    PALETTES,
+    FORMATS,
+    SCENE_TYPES,
+    LAYOUTS,
+    TRANSITIONS,
+    MOTION_PRESETS,
+    PHYSICS_MODES,
+    CAMERA_MOVES,
+    resolve_dimensions,
+    validate_reel_spec,
+    compute_scene_timings,
+    measure_narration_pace,
+    build_flat_reels_html,
+    build_video_html,
+    build_audio_mix,
+    render_flat_reels,
+    render_video,
+    render_flat_reels_frame,
+    render_video_frame,
+)
+from .multi_export import (
+    render_thumbnail_html,
+    render_thumbnail_png,
+    build_multi_format_html_bundle,
+    export_multi_format,
+)
+from .preflight import preflight_audit, doctor_environment
+from .scene_patch import (
+    compute_scene_fingerprint,
+    compute_spec_scene_manifest,
+    diff_scene_fingerprints,
+    patch_scene,
+    generate_hook_ab_variants,
+)
+from .soundscape import (
+    SFX_CATALOG,
+    ROOM_TONE_PRESETS,
+    MUSIC_BED_PRESETS,
+    list_sfx_kinds,
+    list_music_presets,
+    synthesize_sfx,
+    generate_room_tone,
+    generate_ambient_music_bed,
+    plan_scene_sfx,
+    plan_jl_cut_schedule,
+)
+from .studio_web import (
+    build_studio_ui_html,
+    handle_studio_api,
+    run_studio_server,
+)
+from .visual_qc import (
+    compute_contrast_ratio,
+    audit_html_motion_continuity,
+    audit_rendered_frames,
+    render_contact_sheet,
+)
 from .script_polisher import clean_spoken_text, generate_srt_for_scene, polish_script_scenes
-from .autopilot import autopilot_produce
 from .skills_registry import list_agentcut_skills, get_agentcut_skill, export_agentcut_skills
-from .tech_cards import render_code_card_png, render_kpi_card_png, render_bar_chart_card_png, build_tech_card_for_scene, auto_attach_tech_cards

@@ -1,0 +1,88 @@
+{
+  "id": "agentcut-browser-explainer-16x9",
+  "title": "كيف يعمل محرك المتصفح الحتمي في أجينت كات 3.4؟",
+  "brand_kit": "midnight_tech",
+  "format": "landscape",
+  "scenes": [
+    {
+      "id": "ch1",
+      "type": "chapter_toc",
+      "narration": "s1.wav",
+      "text": "ثلاث ركائز حوّلت إنتاج الفيديو من عشرات الدقائق إلى أقل من دقيقتين.",
+      "title": "خطة الحلقة",
+      "active_chapter": 0,
+      "chapters": [
+        {"title": "حتمية الزمن عبر window.setTime", "time": "00:00"},
+        {"title": "المزامنة الفيزيائية مع قمم الصوت", "time": "00:45"},
+        {"title": "التحرير الجراحي والتصدير المتعدد", "time": "01:30"}
+      ]
+    },
+    {
+      "id": "sc2",
+      "type": "before_after",
+      "narration": "s2.wav",
+      "text": "استبدلنا سلاسل فلاتر FFmpeg المعقدة بريندر متصفح حتمي ونظيف.",
+      "title": "لماذا الانتقال إلى المتصفح؟",
+      "before": {
+        "badge": "سابقاً",
+        "title": "رسم FFmpeg القديم",
+        "items": ["36 دقيقة ريندر على المعالج", "تكسّر الحروف العربية المختلطة", "مشاهد جامدة بعد الدخول"]
+      },
+      "after": {
+        "badge": "الآن 3.4.5",
+        "title": "محرك المتصفح الحتمي",
+        "items": ["دقيقة و45 ثانية فقط", "طباعة عربية وSVG حادة", "حركة محيطة مستمرة طوال المشهد"]
+      }
+    },
+    {
+      "id": "sc3",
+      "type": "code",
+      "narration": "s3.wav",
+      "text": "كل إطار يُحسب رياضياً من الزمن t فقط دون أي مؤقتات خارجية.",
+      "title": "قاعدة الحتمية البصرية",
+      "language": "javascript",
+      "code": "window.setTime = function(t) {\n  const beat = beatEnergy(t - sc.start, sc.peaks);\n  renderSceneTransform(t, beat);\n};",
+      "highlight_lines": [2, 3]
+    },
+    {
+      "id": "sc4",
+      "type": "chart_line",
+      "narration": "s4.wav",
+      "text": "سرعة الإنتاج قفزت أكثر من عشرين ضعفاً مع ثبات الجودة.",
+      "title": "قفزة سرعة الرندر",
+      "chart": {
+        "points": [
+          {"label": "v3.2", "value": 15},
+          {"label": "v3.3", "value": 35},
+          {"label": "v3.4", "value": 96}
+        ],
+        "unit": "%",
+        "color": "accent"
+      }
+    },
+    {
+      "id": "sc5",
+      "type": "terminal_demo",
+      "narration": "s5.wav",
+      "text": "بأمر واحد تصدّر الفيديو الأفقي والعمودي والصورة المصغّرة معاً.",
+      "title": "التشغيل الفوري",
+      "shell": "bash",
+      "commands": [
+        {"cmd": "agentcut preflight examples/reel_winter_60s.json", "out": "OK — 8 scenes, variety 100%, WCAG AAA"},
+        {"cmd": "agentcut multi-export examples/reel_winter_60s.json dist/", "out": "Exported 16:9 + 9:16 + 1:1 + thumbnail.png"}
+      ]
+    },
+    {
+      "id": "sc6",
+      "type": "checklist",
+      "narration": "s6.wav",
+      "text": "كل معايير القبول البصرية والصوتية متحققة بالكامل.",
+      "title": "معايير القبول النهائية",
+      "items": [
+        "حركة محيطة مستمرة مدفوعة بـ setTime(t) فقط",
+        "صوت طبيعي بإيقاعه الحقيقي عند -14 LUFS بلا تسريع",
+        "تحرير جراحي للمشاهد واستوديو ويب للهاتف"
+      ]
+    }
+  ]
+}

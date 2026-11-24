@@ -1,8 +1,4 @@
-"""AgentCut CLI (v2.0.0): serve | validate | render | preview | probe | poster |
-contact-sheet | produce | produce-explainer | produce-variants | split | package |
-tts | voices | reframe | studio | plugins | templates | from-template | otio |
-qc | profiles | bundle | smart-cut | batch | cache-stats | cache-clear.
-"""
+"""AgentCut v3.4.1 CLI — Browser-rendered video production with Acoustic Beat-Sync (FFmpeg for encoding only)."""
 from __future__ import annotations
 
 import json
@@ -10,747 +6,337 @@ import os
 import sys
 
 from . import __version__
-from .otio import export_otio
-from .package import package_project
-from .render import (
-    poster_frame,
-    preview_project,
-    produce_explainer,
-    produce_variants,
-    produce_video,
-    render_contact_sheet,
-    render_project,
-    run_job_worker,
-    split_clip,
-    timeline_summary,
-)
-from .server import serve
-from .validate import probe_media, validate_project
+
+_USAGE = """AgentCut v{ver} — Browser-rendered video engine (FFmpeg for encoding & audio only)
+
+Usage:
+  agentcut render <spec.json> <out.mp4> [--palette NAME] [--format vertical|landscape|square]
+                                        [--motion calm|normal|energetic] [--scale N] [--keep-frames]
+  agentcut frame <spec.json> <t_sec> <out.png> [--palette NAME] [--format NAME] [--scale N]
+  agentcut flat-reels <spec.json> <out.mp4> [options]        (alias for render)
+  agentcut flat-reels-frame <spec.json> <t_sec> <out.png>    (alias for frame)
+  agentcut validate <spec.json>
+  agentcut pace <spec.json> [--target-duration SEC]
+  agentcut beat-sync <audio_or_spec>
+  agentcut audit-audio <audio.wav> [--target-lufs -14.0]
+  agentcut icons [search_query]
+  agentcut illustrations
+  agentcut brand-kits
+  agentcut thumbnail <spec.json> <out.png|out.html> [--format landscape|vertical] [--brand-kit ID]
+  agentcut multi-export <spec.json> <out_dir> [--brand-kit ID]
+  agentcut patch-scene <spec.json> <scene_id> <updates_json> [out_spec.json]
+  agentcut hook-ab <spec.json> [out_dir]
+  agentcut contact-sheet <frames_dir_or_mp4> <out.png> [--cols 3] [--rows 2]
+  agentcut visual-qc <spec.json_or_frames_dir>
+  agentcut script-to-spec <script.txt_or_text> [out_spec.json] [--brand-kit ID] [--format vertical|landscape|square]
+  agentcut preflight <spec.json> [--no-audio]
+  agentcut studio [--host 127.0.0.1] [--port 8765]
+  agentcut doctor
+  agentcut sfx-list
+  agentcut music-list
+  agentcut mcp
+  agentcut version
+""".format(ver=__version__)
 
 
-_USAGE = (
-    "usage: agentcut [--version | --help] <command> [args...]\n"
-    "commands:\n"
-    "  serve | validate <json> | render <json> <mp4> | preview <json> <dir>\n"
-    "  probe <file> | poster <json> <png> [seconds] | contact-sheet <video> <out.png> [project.json]\n"
-    "  produce <brief.json> <mp4> | produce-explainer <brief.json> <mp4> | produce-variants <brief.json> <dir>\n"
-    "  summary <json> | split <json> <clip_id> <seconds> | package <json> <outdir> [--trim-clips]\n"
-    "  tts <text> <mp3> [srt] [voice] | voices [lang] | reframe <in.mp4> <out.mp4> [--aspect 9:16] [--mode blur_pad] [--draft]\n"
-    "  studio <json> [video.mp4] [-o out.html] [--open] | plugins [list|discover] | palette <hex> [--harmony analogous]\n"
-    "  text-metrics <text|file> | minify-json <json|file> | templates [category] | from-template <id> <input.json> <out.mp4> [--aspect 9:16] [--parallel] [--profile low_spec]\n"
-    "  otio <project.json> <out.otio>\n"
-    "  qc <video.mp4> [--expected-duration SEC] [--no-black] [--no-silence]\n"
-    "  profiles [--detect]\n"
-    "  bundle <bundle.json> <out.mp4> [--aspect 9:16] [--profile low_spec] [--no-parallel] [--qc]\n"
-    "  smart-cut <in.mp4> <out.mp4> [--noise-db -35] [--min-silence 0.55]\n"
-    "  batch <manifest.json> [--concurrency N] [--no-resume] [--profile low_spec] [--qc] [--report report.json]\n"
-    "  cache-stats [project_dir] | cache-clear [project_dir]\n"
-    "  looks | humanize <brief.json> [out.json] [--look chiaroscuro_doc] | direct <script.txt> [out.json] [--title T] [--look L]\n"
-    "  craft-audit <brief.json> | sfx <kind> <out.wav> [--duration SEC] | room-tone <out.wav> <dur> [--preset warm_studio]\n"
-    "  focal-point <media> | exposure-match <img1> <img2...> | chapter-card <title> <out.mp4> | parallax <bg> <fg> <out.mp4> | compile-ir <brief.json> | auto-heal <brief.json> <out.mp4>\n"
-    "  repair-brief <file|text> | art-prompts <brief.json> [--look L] | autopilot <file|text> [out.mp4] [--look L] [--profile P] [--stop-at script|preview|pre_render] [--checkpoint chk.json] | autopilot-resume <chk> [--action continue|cancel] [--stop-at G] [--out out.mp4] | skills [list|show <name>|export <dir>] | clean-tts <in.wav> <out.wav> [--trim-tail 0.15] [--preserve-duration] | tech-card <code|kpi|chart> <out.png> [args...] | music-bed <out.wav> <dur> [--preset documentary_drone] | subtitle-audit [brief.json] [--theme editorial_cinema] | auto-chapters <brief.json> [out.json] | benchmark [--width 720] [--height 1280] | inspect-frames <video.mp4> [project.json] [--samples 4] [--save-dir dir] | fonts-audit | align-timings <script_or_file> <words.json|audio.wav> [--provider whisper|deepgram] [--lang ar] [--threshold 0.72] | youtube-publish <video.mp4> [--brief brief.json] [--title T] [--privacy private|unlisted|public] [--confirm]"
-)
-
-
-def _load(path: str):
+def _load(path: str) -> dict:
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def main(argv=None):
-    """CLI entry point: file/argument errors report to stderr with non-zero exit."""
-    if argv is None:
-        argv = sys.argv[1:]
-    try:
-        return _main(argv)
-    except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+def _apply_common_flags(spec: dict, argv: list[str], start_idx: int) -> tuple[float, bool, str]:
+    scale = 1.0
+    keep_frames = False
+    base_dir = os.path.dirname(os.path.abspath(argv[1]))
+    idx = start_idx
+    while idx < len(argv):
+        flag = argv[idx]
+        if flag == "--keep-frames":
+            keep_frames = True
+            idx += 1
+        elif flag == "--palette" and idx + 1 < len(argv):
+            spec["palette"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--format" and idx + 1 < len(argv):
+            spec["format"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--motion" and idx + 1 < len(argv):
+            spec["motion"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--transition" and idx + 1 < len(argv):
+            spec["transition"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--caption-style" and idx + 1 < len(argv):
+            spec["caption_style"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--brand-kit" and idx + 1 < len(argv):
+            spec["brand_kit"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--physics" and idx + 1 < len(argv):
+            spec["physics"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--camera" and idx + 1 < len(argv):
+            spec["camera_move"] = argv[idx + 1]
+            idx += 2
+        elif flag == "--scale" and idx + 1 < len(argv):
+            scale = float(argv[idx + 1])
+            idx += 2
+        elif flag == "--base-dir" and idx + 1 < len(argv):
+            base_dir = argv[idx + 1]
+            idx += 2
+        else:
+            idx += 1
+    return scale, keep_frames, base_dir
 
 
-def _main(argv):
-    if not argv or argv[0] == "serve":
-        serve()
-        return 0
-    if argv[0] in ("-h", "--help", "help"):
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("-h", "--help", "help"):
         print(_USAGE)
         return 0
-    if argv[0] in ("-V", "--version", "version"):
-        print(f"agentcut {__version__}")
+
+    cmd = args[0]
+    if cmd in ("version", "--version", "-v"):
+        print(__version__)
         return 0
-    if argv[0] == "validate" and len(argv) == 2:
-        errors, info = validate_project(_load(argv[1]))
-        print(json.dumps({"valid": not errors, "errors": errors,
-                          "total_duration": info.get("total_duration")}, indent=2, ensure_ascii=False))
-        return 1 if errors else 0
-    if argv[0] == "render" and len(argv) == 3:
-        ok, info = render_project(_load(argv[1]), argv[2])
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "preview" and len(argv) == 3:
-        ok, info = preview_project(_load(argv[1]), argv[2])
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "poster" and len(argv) in (3, 4):
-        t = float(argv[3]) if len(argv) == 4 else None
-        ok, info = poster_frame(_load(argv[1]), argv[2], time=t)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "contact-sheet" and len(argv) in (3, 4):
-        proj = _load(argv[3]) if len(argv) == 4 else None
-        ok, info = render_contact_sheet(argv[1], argv[2], project=proj)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "otio" and len(argv) == 3:
-        ok, info = export_otio(_load(argv[1]), argv[2])
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "produce-variants" and len(argv) == 3:
-        ok, info = produce_variants(_load(argv[1]), argv[2])
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "produce-explainer" and len(argv) == 3:
-        ok, info = produce_explainer(_load(argv[1]), argv[2])
-        info = dict(info)
-        info.pop("project", None)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "produce" and len(argv) == 3:
-        ok, info = produce_video(_load(argv[1]), argv[2])
-        info = dict(info)
-        info.pop("project", None)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "summary" and len(argv) == 2:
-        ok, info = timeline_summary(_load(argv[1]))
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "split" and len(argv) == 4:
-        ok, info = split_clip(_load(argv[1]), argv[2], float(argv[3]))
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "worker" and len(argv) == 4:
-        return 0 if run_job_worker(argv[1], argv[2], argv[3]) else 1
-    if argv[0] == "tts" and len(argv) in (3, 4, 5):
-        from .tts import synthesize_speech
-        text = argv[1]
-        out_mp3 = argv[2]
-        out_srt = argv[3] if len(argv) >= 4 and not argv[3].startswith("-") else None
-        voice = argv[4] if len(argv) >= 5 else None
-        res = synthesize_speech(text, out_mp3, out_srt, voice=voice)
+
+    if cmd == "doctor":
+        from .preflight import doctor_environment
+        res = doctor_environment(probe_browser="--probe-browser" in args)
         print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    if cmd == "studio":
+        from .studio_web import run_studio_server
+        host = "127.0.0.1"
+        port = 8765
+        if "--host" in args:
+            host = args[args.index("--host") + 1]
+        if "--port" in args:
+            port = int(args[args.index("--port") + 1])
+        run_studio_server(host=host, port=port)
         return 0
-    if argv[0] == "voices" and len(argv) in (1, 2):
-        from .tts import list_voices
-        lang = argv[1] if len(argv) == 2 else None
-        vlist = list_voices(lang)
-        print(json.dumps(vlist, indent=2, ensure_ascii=False))
+
+    if cmd == "preflight" and len(args) >= 2:
+        from .preflight import preflight_audit
+        spec = _load(args[1])
+        base_dir = os.path.dirname(os.path.abspath(args[1]))
+        req_audio = "--no-audio" not in args
+        res = preflight_audit(spec, base_dir=base_dir, require_audio_files=req_audio)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    if cmd == "script-to-spec" and len(args) >= 2:
+        from .director_browser import script_to_spec
+        raw_arg = args[1]
+        text = open(raw_arg, encoding="utf-8").read() if os.path.isfile(raw_arg) else raw_arg
+        brand_kit = "tab_ezzay"
+        fmt = "vertical"
+        title = ""
+        if "--brand-kit" in args:
+            brand_kit = args[args.index("--brand-kit") + 1]
+        if "--format" in args:
+            fmt = args[args.index("--format") + 1]
+        if "--title" in args:
+            title = args[args.index("--title") + 1]
+        spec = script_to_spec(text, title=title, brand_kit=brand_kit, format_name=fmt)
+        if len(args) >= 3 and not args[2].startswith("--"):
+            with open(args[2], "w", encoding="utf-8") as fh:
+                json.dump(spec, fh, indent=2, ensure_ascii=False)
+        print(json.dumps(spec, indent=2, ensure_ascii=False))
         return 0
-    if argv[0] == "reframe" and len(argv) >= 3:
-        from .reframe import reframe_video
-        in_path = argv[1]
-        out_path = argv[2]
-        aspect = "9:16"
-        mode = "blur_pad"
-        draft = "--draft" in argv
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--aspect" and idx + 1 < len(argv):
-                aspect = argv[idx + 1]
-            elif argv[idx] == "--mode" and idx + 1 < len(argv):
-                mode = argv[idx + 1]
-        ok, info = reframe_video(in_path, out_path, target_aspect=aspect, mode=mode, draft=draft)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
+
+    if cmd == "patch-scene" and len(args) >= 4:
+        from .scene_patch import patch_scene
+        spec = _load(args[1])
+        scene_id = args[2]
+        updates = json.loads(args[3])
+        ok, info = patch_scene(spec, scene_id, updates)
+        if ok and len(args) >= 5:
+            with open(args[4], "w", encoding="utf-8") as fh:
+                json.dump(info["patched_spec"], fh, indent=2, ensure_ascii=False)
+        print(json.dumps({"ok": ok, **{k: v for k, v in info.items() if k != "patched_spec"}}, indent=2, ensure_ascii=False))
         return 0 if ok else 1
-    if argv[0] == "studio" and len(argv) >= 2:
-        from .studio import generate_studio_html
-        target_json = argv[1]
-        video_arg = None
-        out_html = None
-        auto_open = "--open" in argv
-        idx = 2
-        while idx < len(argv):
-            if argv[idx] in ("-o", "--output") and idx + 1 < len(argv):
-                out_html = argv[idx + 1]
-                idx += 2
-            elif argv[idx] != "--open" and video_arg is None:
-                video_arg = argv[idx]
-                idx += 1
-            else:
-                idx += 1
-        path = generate_studio_html(target_json, video_path=video_arg, output_html_path=out_html)
-        print(json.dumps({"studio_html": path}, indent=2, ensure_ascii=False))
-        if auto_open:
-            import webbrowser
-            webbrowser.open(f"file://{path}")
+
+    if cmd == "hook-ab" and len(args) >= 2:
+        from .scene_patch import generate_hook_ab_variants
+        spec = _load(args[1])
+        variants = generate_hook_ab_variants(spec)
+        if len(args) >= 3:
+            os.makedirs(args[2], exist_ok=True)
+            for v in variants:
+                vp = os.path.join(args[2], f"{v['variant_id']}.json")
+                with open(vp, "w", encoding="utf-8") as fh:
+                    json.dump(v["hook_only_spec"], fh, indent=2, ensure_ascii=False)
+        summary = [{"variant_id": v["variant_id"], "label": v["label"], "hook_fingerprint": v["hook_fingerprint"]} for v in variants]
+        print(json.dumps({"ok": True, "count": len(summary), "variants": summary}, indent=2, ensure_ascii=False))
         return 0
-    if argv[0] == "plugins" and len(argv) in (1, 2):
-        from .plugins import discover_plugins, list_diagram_plugins, list_motion_plugins
-        sub = argv[1] if len(argv) == 2 else "list"
-        if sub == "discover":
-            loaded = discover_plugins()
-            print(json.dumps({"discovered_files": loaded, "motion_plugins": list_motion_plugins(), "diagram_plugins": list_diagram_plugins()}, indent=2))
+
+    if cmd == "contact-sheet" and len(args) >= 3:
+        from .visual_qc import render_contact_sheet
+        cols = 3
+        rows = 2
+        if "--cols" in args:
+            cols = int(args[args.index("--cols") + 1])
+        if "--rows" in args:
+            rows = int(args[args.index("--rows") + 1])
+        ok, info = render_contact_sheet(args[1], args[2], cols=cols, rows=rows)
+        print(json.dumps({"ok": ok, **info}, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if cmd == "visual-qc" and len(args) >= 2:
+        from .flat_reels import build_video_html, even_word_timings
+        from .visual_qc import audit_html_motion_continuity, audit_rendered_frames
+        target = args[1]
+        if os.path.isdir(target):
+            res = audit_rendered_frames(target)
         else:
-            print(json.dumps({"motion_plugins": list_motion_plugins(), "diagram_plugins": list_diagram_plugins()}, indent=2))
+            spec = _load(target)
+            timings = [
+                {"id": sc["id"], "start": i * 2.0, "duration": 2.0,
+                 "words": even_word_timings(sc.get("text", "").split(), i * 2.0, (i + 1) * 2.0)}
+                for i, sc in enumerate(spec.get("scenes") or [])
+            ]
+            html = build_video_html(spec, timings, embed_font=False)
+            res = audit_html_motion_continuity(html, spec)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    if cmd == "brand-kits":
+        from .brand_kits import list_brand_kits
+        kits = list_brand_kits()
+        print(json.dumps({"count": len(kits), "brand_kits": kits}, indent=2, ensure_ascii=False))
         return 0
-    if argv[0] == "palette" and len(argv) >= 2:
-        from .colors import generate_palette
-        base_color = argv[1]
-        harmony = "analogous"
-        if len(argv) >= 4 and argv[2] == "--harmony":
-            harmony = argv[3]
-        pal = generate_palette(base_color, harmony=harmony)
-        print(json.dumps(pal, indent=2))
-        return 0
-    if argv[0] == "text-metrics" and len(argv) >= 2:
-        from .text_metrics import analyze_text, estimate_reading_duration
-        arg = argv[1]
-        raw_text = open(arg, encoding="utf-8").read() if os.path.isfile(arg) else arg
-        metrics = analyze_text(raw_text)
-        metrics["estimated_reading_duration"] = estimate_reading_duration(raw_text)
-        print(json.dumps(metrics, indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "minify-json" and len(argv) == 2:
-        from .json_tools import minify_json
-        arg = argv[1]
-        raw = open(arg, encoding="utf-8").read() if os.path.isfile(arg) else arg
-        print(minify_json(raw))
-        return 0
-    if argv[0] == "probe" and len(argv) == 2:
-        info = probe_media(argv[1])
-        print(json.dumps(info, indent=2, default=str) if info else "cannot probe")
-        return 0 if info else 1
-    if argv[0] == "templates" and len(argv) in (1, 2):
-        from .templates import list_content_templates
-        cat = argv[1] if len(argv) == 2 else None
-        tpls = list_content_templates(cat)
-        print(json.dumps(tpls, indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "from-template" and len(argv) >= 4:
-        from .templates import build_brief_from_template
-        tid = argv[1]
-        in_json = _load(argv[2])
-        out_mp4 = argv[3]
-        aspect = "9:16"
-        parallel = False
-        profile = None
-        for idx in range(4, len(argv)):
-            if argv[idx] == "--aspect" and idx + 1 < len(argv):
-                aspect = argv[idx + 1]
-            elif argv[idx] == "--parallel":
-                parallel = True
-            elif argv[idx] == "--profile" and idx + 1 < len(argv):
-                profile = argv[idx + 1]
-        title = in_json.get("title", "Untitled Video")
-        scenes = in_json.get("scenes", [])
-        brief = build_brief_from_template(tid, title, scenes, aspect=aspect)
-        if parallel:
-            brief["parallel"] = True
-        if profile:
-            brief["render_profile"] = profile
-        ok, info = produce_explainer(brief, out_mp4)
-        info = dict(info) if isinstance(info, dict) else {"result": info}
-        info.pop("project", None)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "package" and len(argv) in (3, 4):
-        trim = len(argv) == 4 and argv[3] == "--trim-clips"
-        if len(argv) == 4 and not trim:
-            print(_USAGE, file=sys.stderr)
-            return 2
-        summary = package_project(_load(argv[1]), argv[2], trim_clips=trim)
-        print(json.dumps(summary, indent=2, default=str, ensure_ascii=False))
-        return 0
-    # --- v2.0.0 CLI commands ---
-    if argv[0] == "qc" and len(argv) >= 2:
-        from .qc import audit_video_quality
-        vpath = argv[1]
-        exp_dur = None
-        check_black = "--no-black" not in argv
-        check_silence = "--no-silence" not in argv
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--expected-duration" and idx + 1 < len(argv):
-                exp_dur = float(argv[idx + 1])
-        report = audit_video_quality(
-            vpath,
-            expected_duration=exp_dur,
-            check_black=check_black,
-            check_silence=check_silence,
-        )
-        print(json.dumps(report, indent=2, ensure_ascii=False))
-        return 0 if report.get("passed") else 1
-    if argv[0] == "profiles":
-        from .profiles import detect_hardware_profile, list_render_profiles
-        if "--detect" in argv:
-            print(json.dumps(detect_hardware_profile(), indent=2, ensure_ascii=False))
-        else:
-            print(json.dumps(list_render_profiles(), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "bundle" and len(argv) >= 3:
-        from .bundle import produce_from_bundle
-        bdata = _load(argv[1])
-        out_mp4 = argv[2]
-        aspect = None
-        profile = None
-        parallel = "--no-parallel" not in argv
-        qc_flag = "--qc" in argv
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--aspect" and idx + 1 < len(argv):
-                aspect = argv[idx + 1]
-            elif argv[idx] == "--profile" and idx + 1 < len(argv):
-                profile = argv[idx + 1]
-        ok, info = produce_from_bundle(
-            bdata, out_mp4, aspect=aspect, profile=profile,
-            parallel=parallel, qc_audit=qc_flag,
-        )
-        info = dict(info) if isinstance(info, dict) else {"result": info}
-        info.pop("project", None)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "smart-cut" and len(argv) >= 3:
-        from .smart_cut import smart_cut_media
-        in_media = argv[1]
-        out_mp4 = argv[2]
-        noise_db = -35.0
-        min_silence = 0.55
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--noise-db" and idx + 1 < len(argv):
-                noise_db = float(argv[idx + 1])
-            elif argv[idx] == "--min-silence" and idx + 1 < len(argv):
-                min_silence = float(argv[idx + 1])
-        ok, info = smart_cut_media(
-            in_media, out_mp4, noise_db=noise_db, min_silence=min_silence
-        )
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "batch" and len(argv) >= 2:
-        from .batch import run_batch_production
-        manifest = _load(argv[1])
-        conc = None
-        resume = "--no-resume" not in argv
-        profile = None
-        qc_flag = "--qc" in argv
-        report_path = None
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--concurrency" and idx + 1 < len(argv):
-                conc = int(argv[idx + 1])
-            elif argv[idx] == "--profile" and idx + 1 < len(argv):
-                profile = argv[idx + 1]
-            elif argv[idx] == "--report" and idx + 1 < len(argv):
-                report_path = argv[idx + 1]
-        summary = run_batch_production(
-            manifest, max_concurrency=conc, resume=resume,
-            default_profile=profile, qc_audit=qc_flag, report_path=report_path,
-        )
-        print(json.dumps(summary, indent=2, default=str, ensure_ascii=False))
-        return 0 if summary.get("all_ok") else 1
-    if argv[0] == "cache-stats" and len(argv) in (1, 2):
-        from .cache import get_cache_stats
-        pdir = argv[1] if len(argv) == 2 else None
-        print(json.dumps(get_cache_stats(pdir), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "cache-clear" and len(argv) in (1, 2):
-        from .cache import clear_cache
-        pdir = argv[1] if len(argv) == 2 else None
-        removed = clear_cache(pdir)
-        print(json.dumps({"removed": removed}, indent=2))
-        return 0
-    # --- v2.5.0 Human-Feel Director & Cinema CLI commands ---
-    if argv[0] == "looks":
-        from .cinematography import list_cinema_looks
-        print(json.dumps(list_cinema_looks(), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "humanize" and len(argv) >= 2:
-        from .director import humanize_brief
-        brief = _load(argv[1])
-        look = "chiaroscuro_doc"
-        out_json = None
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--look" and idx + 1 < len(argv):
-                look = argv[idx + 1]
-            elif not argv[idx].startswith("-") and (idx == 2 or argv[idx - 1] != "--look"):
-                out_json = argv[idx]
-        directed = humanize_brief(brief, cinema_look=look)
-        if out_json:
-            with open(out_json, "w", encoding="utf-8") as fh:
-                json.dump(directed, fh, indent=2, ensure_ascii=False)
-            print(json.dumps({"written": out_json, "cinema_look": look, "scenes": len(directed.get("scenes", []))}, indent=2, ensure_ascii=False))
-        else:
-            print(json.dumps(directed, indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "direct" and len(argv) >= 2:
-        from .director import direct_from_script
-        raw_arg = argv[1]
-        script = open(raw_arg, encoding="utf-8").read() if os.path.isfile(raw_arg) else raw_arg
-        title = "Editorial Essay"
-        look = "chiaroscuro_doc"
-        aspect = "9:16"
-        out_json = None
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--title" and idx + 1 < len(argv):
-                title = argv[idx + 1]
-            elif argv[idx] == "--look" and idx + 1 < len(argv):
-                look = argv[idx + 1]
-            elif argv[idx] == "--aspect" and idx + 1 < len(argv):
-                aspect = argv[idx + 1]
-            elif not argv[idx].startswith("-") and argv[idx - 1] not in ("--title", "--look", "--aspect"):
-                out_json = argv[idx]
-        directed = direct_from_script(script, title=title, cinema_look=look, aspect=aspect)
-        if out_json:
-            with open(out_json, "w", encoding="utf-8") as fh:
-                json.dump(directed, fh, indent=2, ensure_ascii=False)
-            print(json.dumps({"written": out_json, "scenes": len(directed["scenes"]), "cinema_look": look}, indent=2, ensure_ascii=False))
-        else:
-            print(json.dumps(directed, indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "craft-audit" and len(argv) == 2:
-        from .qc import audit_editorial_craft
-        rep = audit_editorial_craft(_load(argv[1]))
-        print(json.dumps(rep, indent=2, ensure_ascii=False))
-        return 0 if rep.get("passed") else 1
-    if argv[0] == "sfx" and len(argv) >= 3:
-        from .soundscape import synthesize_sfx
-        dur = None
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--duration" and idx + 1 < len(argv):
-                dur = float(argv[idx + 1])
-        ok, info = synthesize_sfx(argv[1], argv[2], duration=dur)
-        print(json.dumps(info, indent=2, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "room-tone" and len(argv) >= 3:
-        from .soundscape import generate_room_tone
-        preset = "warm_studio"
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--preset" and idx + 1 < len(argv):
-                preset = argv[idx + 1]
-        ok, info = generate_room_tone(argv[1], float(argv[2]), preset=preset)
-        print(json.dumps(info, indent=2, ensure_ascii=False))
-        return 0
-    # --- v3.0.0 Cinema Documentary Engine CLI commands ---
-    if argv[0] == "focal-point" and len(argv) >= 2:
-        from .vision import detect_focal_point
-        print(json.dumps(detect_focal_point(argv[1]), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "exposure-match" and len(argv) >= 2:
-        from .vision import compute_exposure_match_filter
-        print(json.dumps(compute_exposure_match_filter(argv[1:]), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "chapter-card" and len(argv) >= 3:
-        from .parallax import render_chapter_card
-        sub = None
-        dur = 2.0
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--subtitle" and idx + 1 < len(argv):
-                sub = argv[idx + 1]
-            elif argv[idx] == "--duration" and idx + 1 < len(argv):
-                dur = float(argv[idx + 1])
-        ok, info = render_chapter_card(argv[1], argv[2], subtitle=sub, duration=dur)
-        print(json.dumps(info, indent=2, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "parallax" and len(argv) >= 4:
-        from .parallax import render_parallax_clip
-        ok, info = render_parallax_clip(argv[1], argv[2], argv[3])
-        print(json.dumps(info, indent=2, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "compile-ir" and len(argv) >= 2:
-        from .pipeline.ir import compile_brief_to_ir
-        ir = compile_brief_to_ir(_load(argv[1]), auto_focal="--focal" in argv, match_exposure="--exposure" in argv)
-        print(json.dumps(ir.to_dict(), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "auto-heal" and len(argv) >= 3:
-        from .pipeline.auto_heal import produce_cinematic_auto_heal
-        prof = "low_spec"
-        look = "chiaroscuro_doc"
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--profile" and idx + 1 < len(argv):
-                prof = argv[idx + 1]
-            elif argv[idx] == "--look" and idx + 1 < len(argv):
-                look = argv[idx + 1]
-        ok, info = produce_cinematic_auto_heal(_load(argv[1]), argv[2], cinema_look=look, profile=prof)
-        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    # --- v3.1.0 Model-Agnostic Autopilot CLI commands ---
-    if argv[0] == "repair-brief" and len(argv) >= 2:
-        from .brief_repair import repair_brief
-        raw_arg = argv[1]
-        raw_val = open(raw_arg, encoding="utf-8").read() if os.path.isfile(raw_arg) else raw_arg
-        rep, changes = repair_brief(raw_val)
-        print(json.dumps({"brief": rep, "repairs_made": changes}, indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "art-prompts" and len(argv) >= 2:
-        from .art_director import generate_visual_prompts
-        look = None
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--look" and idx + 1 < len(argv):
-                look = argv[idx + 1]
-        print(json.dumps(generate_visual_prompts(_load(argv[1]), style_bible=look), indent=2, ensure_ascii=False))
-        return 0
-    if argv[0] == "autopilot" and len(argv) >= 2:
-        from .autopilot import autopilot_produce
-        raw_arg = argv[1]
-        raw_val = open(raw_arg, encoding="utf-8").read() if os.path.isfile(raw_arg) else raw_arg
-        out_mp4 = None
-        look = "chiaroscuro_doc"
-        aspect = None
-        prof = "low_spec"
-        stop_at = None
-        chk_path = None
-        flag_vals = ("--look", "--aspect", "--profile", "--stop-at", "--checkpoint")
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--look" and idx + 1 < len(argv):
-                look = argv[idx + 1]
-            elif argv[idx] == "--aspect" and idx + 1 < len(argv):
-                aspect = argv[idx + 1]
-            elif argv[idx] == "--profile" and idx + 1 < len(argv):
-                prof = argv[idx + 1]
-            elif argv[idx] == "--stop-at" and idx + 1 < len(argv):
-                stop_at = argv[idx + 1]
-            elif argv[idx] == "--checkpoint" and idx + 1 < len(argv):
-                chk_path = argv[idx + 1]
-            elif not argv[idx].startswith("-") and argv[idx - 1] not in flag_vals:
-                out_mp4 = argv[idx]
-        ok, res = autopilot_produce(
-            raw_val,
-            output_path=out_mp4,
-            cinema_look=look,
-            aspect=aspect,
-            profile=prof,
-            stop_at=stop_at,
-            checkpoint_path=chk_path,
-        )
-        print(json.dumps(res, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    if argv[0] == "autopilot-resume" and len(argv) >= 2:
-        from .autopilot import resume_autopilot_checkpoint
-        chk_arg = argv[1]
-        act = "continue"
-        stop_at = None
-        out_mp4 = None
-        edits = None
-        for idx in range(2, len(argv)):
-            if argv[idx] == "--action" and idx + 1 < len(argv):
-                act = argv[idx + 1]
-            elif argv[idx] == "--stop-at" and idx + 1 < len(argv):
-                stop_at = argv[idx + 1]
-            elif argv[idx] == "--out" and idx + 1 < len(argv):
-                out_mp4 = argv[idx + 1]
-            elif argv[idx] == "--edits" and idx + 1 < len(argv):
-                edits = _load(argv[idx + 1]) if os.path.isfile(argv[idx + 1]) else json.loads(argv[idx + 1])
-        ok, res = resume_autopilot_checkpoint(chk_arg, action=act, edits=edits, output_path=out_mp4, stop_at=stop_at)
-        print(json.dumps(res, indent=2, default=str, ensure_ascii=False))
-        return 0 if ok else 1
-    # --- v3.2.0 Skills Pack CLI command ---
-    if argv[0] == "skills":
-        from .skills_registry import export_agentcut_skills, get_agentcut_skill, list_agentcut_skills
-        sub = argv[1] if len(argv) >= 2 else "list"
-        if sub == "list":
-            print(json.dumps(list_agentcut_skills(), indent=2, ensure_ascii=False))
+
+    if cmd == "thumbnail" and len(args) >= 3:
+        from .multi_export import render_thumbnail_html, render_thumbnail_png
+        spec = _load(args[1])
+        out_path = args[2]
+        scale, _kf, _bd = _apply_common_flags(spec, args, 3)
+        fmt = str(spec.get("format", "landscape"))
+        if out_path.endswith(".html"):
+            html = render_thumbnail_html(spec, format_name=fmt, embed_font=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            print(json.dumps({"ok": True, "output": out_path, "format": fmt}, indent=2))
             return 0
-        if sub == "show" and len(argv) >= 3:
-            sk = get_agentcut_skill(argv[2])
-            if sk is None:
-                print(f"error: skill not found: {argv[2]}", file=sys.stderr)
+        ok, info = render_thumbnail_png(spec, out_path, format_name=fmt, scale=scale)
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if cmd == "multi-export" and len(args) >= 3:
+        from .multi_export import export_multi_format
+        spec = _load(args[1])
+        out_dir = args[2]
+        scale, _kf, base_dir = _apply_common_flags(spec, args, 3)
+        ok, info = export_multi_format(spec, out_dir, base_dir=base_dir, scale=scale)
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if cmd == "illustrations":
+        from .icons import list_illustrations
+        names = list_illustrations()
+        print(json.dumps({"count": len(names), "illustrations": names}, indent=2))
+        return 0
+
+    if cmd == "icons":
+        from .icons import search_icons
+        q = args[1] if len(args) > 1 else ""
+        names = search_icons(q)
+        print(json.dumps({"count": len(names), "icons": names}, indent=2))
+        return 0
+
+    if cmd == "sfx-list":
+        from .soundscape import list_sfx_kinds
+        print(json.dumps(list_sfx_kinds(), indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "music-list":
+        from .soundscape import list_music_presets
+        print(json.dumps(list_music_presets(), indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "validate" and len(args) >= 2:
+        from .flat_reels import validate_reel_spec
+        ok, errors = validate_reel_spec(_load(args[1]))
+        print(json.dumps({"ok": ok, "errors": errors}, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if cmd == "pace" and len(args) >= 2:
+        from .flat_reels import compute_scene_timings, measure_narration_pace
+        spec = _load(args[1])
+        base_dir = os.path.dirname(os.path.abspath(args[1]))
+        target = spec.get("target_duration")
+        if "--target-duration" in args:
+            i = args.index("--target-duration")
+            if i + 1 < len(args):
+                target = float(args[i + 1])
+        timings, _tot, errs = compute_scene_timings(spec, base_dir)
+        if errs:
+            print(json.dumps({"ok": False, "errors": errs}, indent=2, ensure_ascii=False))
+            return 1
+        pace = measure_narration_pace(spec, timings, target_duration=target)
+        print(json.dumps({"ok": True, **pace}, indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "beat-sync" and len(args) >= 2:
+        from .beat_sync import analyze_audio_beats, build_scene_beat_profile
+        from .flat_reels import compute_scene_timings
+        target_path = args[1]
+        if target_path.endswith(".json"):
+            spec = _load(target_path)
+            base_dir = os.path.dirname(os.path.abspath(target_path))
+            timings, _tot, errs = compute_scene_timings(spec, base_dir)
+            if errs:
+                print(json.dumps({"ok": False, "errors": errs}, indent=2, ensure_ascii=False))
                 return 1
-            print(sk["content"])
+            prof = build_scene_beat_profile(spec, timings, base_dir=base_dir)
+            print(json.dumps({"ok": True, "scenes": prof}, indent=2, ensure_ascii=False))
             return 0
-        if sub == "export" and len(argv) >= 3:
-            print(json.dumps(export_agentcut_skills(argv[2]), indent=2, ensure_ascii=False))
-            return 0
-        print("usage: agentcut skills [list | show <name> | export <dest_dir>]", file=sys.stderr)
-        return 2
-    # --- v3.3.2 Cycle 2 CLI command: clean-tts ---
-    if argv[0] == "clean-tts" and len(argv) >= 3:
-        from .smart_cut import clean_tts_audio
-        in_a, out_a = argv[1], argv[2]
-        tail_s = 0.15
-        pres = "--preserve-duration" in argv
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--trim-tail" and idx + 1 < len(argv):
-                tail_s = float(argv[idx + 1])
-        ok, info = clean_tts_audio(in_a, out_a, trim_tail_sec=tail_s, preserve_duration=pres)
-        print(json.dumps(info, indent=2, ensure_ascii=False))
+        res = analyze_audio_beats(target_path)
+        print(json.dumps({"ok": res["duration"] > 0, **res}, indent=2, ensure_ascii=False))
+        return 0 if res["duration"] > 0 else 1
+
+    if cmd == "audit-audio" and len(args) >= 2:
+        from .browser_render import DEFAULT_LOUDNESS_TARGET, audit_audio_mix
+        target_lufs = DEFAULT_LOUDNESS_TARGET
+        if "--target-lufs" in args:
+            i = args.index("--target-lufs")
+            if i + 1 < len(args):
+                target_lufs = float(args[i + 1])
+        res = audit_audio_mix(args[1], target_lufs=target_lufs)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    if cmd in ("render", "flat-reels") and len(args) >= 3:
+        from .flat_reels import render_video
+        spec = _load(args[1])
+        out_mp4 = args[2]
+        scale, keep_frames, base_dir = _apply_common_flags(spec, args, 3)
+        ok, info = render_video(spec, out_mp4, base_dir=base_dir,
+                                scale=scale, keep_frames=keep_frames)
+        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
         return 0 if ok else 1
-    # --- v3.3.3 Cycle 3 CLI command: tech-card ---
-    if argv[0] == "tech-card" and len(argv) >= 3:
-        from .tech_cards import render_bar_chart_card_png, render_code_card_png, render_kpi_card_png
-        kind = argv[1].strip().lower()
-        out_p = argv[2]
-        if kind == "code":
-            lines = argv[3:] if len(argv) > 3 else None
-            path = render_code_card_png(lines or [], output_path=out_p)
-        elif kind in ("chart", "bars"):
-            path = render_bar_chart_card_png([], output_path=out_p)
-        else:
-            val = argv[3] if len(argv) > 3 else "64"
-            lbl = argv[4] if len(argv) > 4 else "أداة MCP"
-            path = render_kpi_card_png(value=val, label=lbl, output_path=out_p)
-        print(json.dumps({"kind": kind, "path": path}, indent=2, ensure_ascii=False))
-        return 0
-    # --- v3.3.4 Cycle 4 CLI command: music-bed ---
-    if argv[0] == "music-bed" and len(argv) >= 3:
-        from .soundscape import generate_ambient_music_bed
-        preset = "documentary_drone"
-        for idx in range(3, len(argv)):
-            if argv[idx] == "--preset" and idx + 1 < len(argv):
-                preset = argv[idx + 1]
-        ok, info = generate_ambient_music_bed(argv[1], float(argv[2]), preset=preset)
-        print(json.dumps(info, indent=2, ensure_ascii=False))
+
+    if cmd in ("frame", "flat-reels-frame") and len(args) >= 4:
+        from .flat_reels import render_video_frame
+        spec = _load(args[1])
+        t_sec = float(args[2])
+        out_png = args[3]
+        scale, _kf, base_dir = _apply_common_flags(spec, args, 4)
+        ok, info = render_video_frame(spec, t_sec, out_png,
+                                      base_dir=base_dir, scale=scale)
+        print(json.dumps(info, indent=2, default=str, ensure_ascii=False))
         return 0 if ok else 1
-    # --- v3.3.5 Cycle 5 CLI command: subtitle-audit ---
-    if argv[0] == "subtitle-audit":
-        from .subtitles_style import audit_subtitle_legibility
-        theme = None
-        target = {}
-        idx = 1
-        while idx < len(argv):
-            if argv[idx] == "--theme" and idx + 1 < len(argv):
-                theme = argv[idx + 1]
-                idx += 2
-            elif not argv[idx].startswith("--"):
-                target = _load(argv[idx])
-                idx += 1
-            else:
-                idx += 1
-        res = audit_subtitle_legibility(target, theme=theme)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0 if res.get("passed") else 1
-    # --- v3.3.6 Cycle 6 CLI command: auto-chapters ---
-    if argv[0] == "auto-chapters" and len(argv) >= 2:
-        from .parallax import auto_attach_chapter_cards
-        b = _load(argv[1])
-        b["auto_chapter_cards"] = True
-        enriched = auto_attach_chapter_cards(b)
-        if len(argv) >= 3:
-            with open(argv[2], "w", encoding="utf-8") as fh:
-                json.dump(enriched, fh, indent=2, ensure_ascii=False)
-        print(json.dumps(enriched, indent=2, ensure_ascii=False))
+
+    if cmd == "mcp":
+        from .server import run_stdio_server
+        run_stdio_server()
         return 0
-    # --- v3.3.7 Cycle 7 CLI command: benchmark ---
-    if argv[0] == "benchmark":
-        from .profiles import benchmark_render_speed
-        w, h = 720, 1280
-        for idx in range(1, len(argv)):
-            if argv[idx] == "--width" and idx + 1 < len(argv):
-                w = int(argv[idx + 1])
-            elif argv[idx] == "--height" and idx + 1 < len(argv):
-                h = int(argv[idx + 1])
-        res = benchmark_render_speed(width=w, height=h)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
-    # --- v3.3.8 Cycle 8 CLI command: inspect-frames ---
-    if argv[0] == "inspect-frames" and len(argv) >= 2:
-        from .qc import inspect_rendered_video_frames
-        vpath = argv[1]
-        proj = None
-        samples = 4
-        sdir = None
-        idx = 2
-        while idx < len(argv):
-            if argv[idx] == "--samples" and idx + 1 < len(argv):
-                samples = int(argv[idx + 1])
-                idx += 2
-            elif argv[idx] == "--save-dir" and idx + 1 < len(argv):
-                sdir = argv[idx + 1]
-                idx += 2
-            elif not argv[idx].startswith("--"):
-                proj = _load(argv[idx])
-                idx += 1
-            else:
-                idx += 1
-        res = inspect_rendered_video_frames(vpath, project_or_brief=proj, sample_count=samples, save_frames_dir=sdir)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0 if res.get("passed") else 1
-    # --- v3.3.9 Cycle 9 CLI command: fonts-audit ---
-    if argv[0] == "fonts-audit":
-        from .validate import audit_font_compliance
-        res = audit_font_compliance()
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0 if res.get("passed") else 1
-    # --- v3.3.12 Cycle 11 CLI command: align-timings ---
-    if argv[0] == "align-timings" and len(argv) >= 3:
-        from .deepgram_align import align_scene_audio
-        script_arg = argv[1]
-        source_arg = argv[2]
-        script_txt = Path(script_arg).read_text(encoding="utf-8") if os.path.isfile(script_arg) else script_arg
-        prov = "whisper"
-        lang = "ar"
-        thresh = 0.72
-        idx = 3
-        while idx < len(argv):
-            if argv[idx] == "--provider" and idx + 1 < len(argv):
-                prov = argv[idx + 1]
-                idx += 2
-            elif argv[idx] == "--lang" and idx + 1 < len(argv):
-                lang = argv[idx + 1]
-                idx += 2
-            elif argv[idx] == "--threshold" and idx + 1 < len(argv):
-                thresh = float(argv[idx + 1])
-                idx += 2
-            else:
-                idx += 1
-        asr_w = None
-        aud_p = None
-        if source_arg.lower().endswith(".json") and os.path.isfile(source_arg):
-            loaded = _load(source_arg)
-            asr_w = loaded if isinstance(loaded, list) else (loaded.get("words") or loaded.get("word_timings"))
-        else:
-            aud_p = source_arg
-        res = align_scene_audio(
-            script_text=script_txt,
-            asr_words=asr_w,
-            audio_path=aud_p,
-            provider=prov,
-            language=lang,
-            low_confidence_threshold=thresh,
-        )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
-    # --- v3.3.13 Cycle 12 CLI command: youtube-publish ---
-    if argv[0] == "youtube-publish" and len(argv) >= 2:
-        from .youtube_publisher import publish_video_to_youtube
-        vpath = argv[1]
-        brief_obj = None
-        title = None
-        desc = None
-        priv = None
-        tags = None
-        confirm = False
-        idx = 2
-        while idx < len(argv):
-            if argv[idx] == "--brief" and idx + 1 < len(argv):
-                brief_obj = _load(argv[idx + 1])
-                idx += 2
-            elif argv[idx] == "--title" and idx + 1 < len(argv):
-                title = argv[idx + 1]
-                idx += 2
-            elif argv[idx] == "--description" and idx + 1 < len(argv):
-                desc = argv[idx + 1]
-                idx += 2
-            elif argv[idx] == "--privacy" and idx + 1 < len(argv):
-                priv = argv[idx + 1]
-                idx += 2
-            elif argv[idx] == "--tags" and idx + 1 < len(argv):
-                tags = [t.strip() for t in argv[idx + 1].split(",") if t.strip()]
-                idx += 2
-            elif argv[idx] == "--confirm":
-                confirm = True
-                idx += 1
-            else:
-                idx += 1
-        ok_yt, res_yt = publish_video_to_youtube(
-            video_path=vpath,
-            brief=brief_obj,
-            title=title,
-            description=desc,
-            tags=tags,
-            privacy_status=priv,
-            confirm_publish=confirm,
-        )
-        print(json.dumps(res_yt, indent=2, ensure_ascii=False))
-        return 0 if ok_yt else 1
 
     print(_USAGE, file=sys.stderr)
     return 2
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

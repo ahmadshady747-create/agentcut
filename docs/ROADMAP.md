@@ -1,76 +1,29 @@
-# AgentCut Upgrade Roadmap
+# خطة التعميق المضغوطة عالية القيمة لأجينت كات 3.4 — 5 دورات (كل 30 دقيقة)
 
-This document outlines the strategic roadmap for expanding AgentCut from an agent-first video compositor into an **autonomous, end-to-end AI video creation studio**.
+**نقطة الانطلاق:** `agentcut-3.4.0.zip` (محرك إنتاج موحّد عبر المتصفح فقط + FFmpeg للترميز والصوت فقط، 66 أيقونة SVG، 15 قالب مشهد، 4 لوحات ألوان، 9 مؤثرات صوتية، 57 اختباراً ناجحاً).
 
----
+## الدورات الخمس المضغوطة (`v3.4.1` → `v3.4.5`)
 
-## 🗺️ The 4 Strategic Phases
+1. **الدورة 1 (`v3.4.1`) — المزامنة الصوتية الفيزيائية وترقية هندسة الصوت (`beat_sync.py` + `soundscape.py` + `browser_render.py`):**
+   - بناء `beat_sync.py` لتحليل ملفات السرد الفعلية (قمم الطاقة الصوتية، الوقفات الطبيعية، وتوقيتات الكلمات المفتاحية) لربط لحظة ظهور العناصر ونبضة الكاميرا والمؤثرات الصوتية بالملي ثانية عبر `setTime(t)`.
+   - توسيع `soundscape.py` إلى 15 مؤثراً صوتياً إجرائياً و6 خلفيات موسيقية، ودعم تداخل `J-Cut`/`L-Cut` في `mix_audio`، وإضافة `audit_audio_mix` لفحص `-14 LUFS` وTrue Peak.
 
-```mermaid
-flowchart LR
-    P1["Phase 1: All-in-One Engine<br/>Native TTS + Auto-SRT + SFX Sync"] --> P2["Phase 2: Advanced Motion<br/>Kinetic Subs + Timelines + Transitions"]
-    P2 --> P3["Phase 3: Performance & Parallelism<br/>GPU Encoders + Chunk Parallelism"]
-    P3 --> P4["Phase 4: Platforms & Extensibility<br/>Auto-Reframe + Motion Plugins"]
-```
+2. **الدورة 2 (`v3.4.2`) — الرسوم البيانية الحية + 100+ أيقونة + طباعة عربية حركية (`charts.py` + `icons.py` + `captions.py`):**
+   - بناء رسوم بيانية SVG حتمية (`line_chart`، `donut_chart`، `grouped_bars`) بحركة رسم المسار وعدّ رقمي حي عبر `setTime(t)` ودمجها كقوالب مشاهد لجميع الأبعاد.
+   - توسيع `icons.py` إلى 100+ أيقونة فلات متحركة مع رسوم مشهدية مركّبة متعددة الطبقات.
+   - بناء 4 أنماط كابشن عربي ذكي (`word_pop`، `highlighter_bar`، `karaoke_pill`، `editorial_box`) مع توازن الأسطر العربية وإبراز الكلمات المفتاحية (`keywords`) ودعم نظيف للأسطر المختلطة.
 
----
+3. **الدورة 3 (`v3.4.3`) — حزم الهوية (Brand Kits) + التصدير متعدد المنصات + الصور المصغّرة + قوالب الشرحيات (`brand_kits.py` + `multi_export.py` + `flat_reels.py`):**
+   - نظام **Brand Kits** (هوية قناة كاملة قابلة لإعادة الاستخدام مع 4 حزم جاهزة).
+   - `export_multi_format` لتوليد `16:9` + `9:16` + `1:1` + صورة مصغّرة **Thumbnail PNG** (`render_thumbnail_html`) من ملف `spec.json` واحد.
+   - إضافة 5 قوالب شرحيات متقدمة (`before_after`، `funnel`، `matrix_2x2`، `terminal_demo`، `chapter_toc`) ومنحنيات حركة فيزيائية (Spring/Elastic) وكاميرا متصفح ناعمة (`Push-in`/`Pan`) وانتقالات متقدمة (`wipe_rtl`، `iris_reveal`).
 
-### Phase 1: All-in-One Creation Engine (Completed ✅)
-**Goal:** Enable autonomous end-to-end video generation directly from text briefs without requiring external tools for voice synthesis or caption timing.
+4. **الدورة 4 (`v3.4.4`) — التحرير الجراحي للمشاهد + التسريع على العتاد المحدود + مدقق الجودة البصري (`scene_patch.py` + `visual_qc.py` + `browser_render.py`):**
+   - نظام **التحرير الجراحي** (`patch_scene` + `scene_cache` بالبصمة `sha256` + مولد A/B للهوك) لتعديل مشهد واحد دون إعادة ريندر الفيديو بالكامل.
+   - تسريع `browser_render.py` للعتاد المحدود (8GB RAM / CPU-only) بدعم التمرير المباشر للإطارات عبر pipe إلى FFmpeg لتقليل الكتابة على القرص الصلب (HDD).
+   - بناء `visual_qc.py` لتوليد لوحة معاينة مصوّرة (`render_contact_sheet`) والتحقق الآلي من استمرار الحركة وعدم وجود شاشات فارغة.
 
-1. **Native Text-to-Speech (TTS) Integration (`agentcut.tts`):**
-   * Built-in support for Edge-TTS (multilingual, high quality, zero cost) and pluggable cloud providers (ElevenLabs, Azure Speech).
-   * Briefs can now supply `narration_text` directly within scenes instead of requiring pre-recorded audio files.
-2. **Auto SRT & Subtitle Word Timing:**
-   * Automatic generation of time-aligned SRT captions directly during TTS synthesis.
-   * Full RTL and BiDi shaping support preserved across all platforms.
-3. **Procedural Sound Design & Auto-Foley (`agentcut.audio` / SFX):**
-   * Light built-in sound effects (whoosh, pop, click, swoosh) synced to motion graphic entrance and transition events.
-   * Procedural background ambient audio synthesis when no music file is supplied.
-4. **Enhanced MCP Tools & CLI:**
-   * Direct prompt-to-video workflow exposed via MCP tools and CLI commands.
-
----
-
-### Phase 2: Advanced Motion Graphics & Dynamic Typography (Completed ✅)
-**Goal:** Elevate visual production value to match modern short-form (Reels/TikTok/Shorts) and explainer video aesthetics.
-
-1. **Kinetic Typography (Karaoke Highlighting):**
-   * Dynamic word-by-word subtitle highlighting synchronized with speech audio via `boundary="WordBoundary"` and unified ASS styles.
-2. **Expanded Diagram Templates:**
-   * `timeline`: Chronological and roadmap diagrams with progressive draw-on animation.
-   * `process_flow`: Step-by-step workflow animations with connecting arrows and node badges.
-3. **Cinematic Transitions:**
-   * Explainer scene transitions support `whip_pan`, `glitch`, `cross_zoom`, `light_leak`, `zoom_out`.
-
----
-
-### Phase 3: Hardware Acceleration & Parallel Rendering (Completed ✅)
-**Goal:** 60-80% rendering speed improvement and scalable production throughput.
-
-1. **GPU Hardware Acceleration:**
-   * Automatic detection and fallback for `h264_nvenc` (NVIDIA), `h264_videotoolbox` (Apple Silicon), `h264_qsv` (Intel), `h264_amf` (AMD), `h264_mf` (Windows Media Foundation), `h264_vaapi` (Linux).
-2. **Chunked Parallel Scene Rendering:**
-   * Render independent scenes concurrently across CPU/GPU cores, concatenated via FFmpeg concat demuxer (`-c copy`).
-3. **Ultra-Fast Draft Mode:**
-   * 2-second preview generation at low resolution for agent verification loops.
-
----
-
-### Phase 4: Platform Adaptation & Extensibility (Completed ✅)
-**Goal:** Seamless multi-platform distribution and community-driven expansion.
-
-1. **Smart Multi-Aspect Auto-Reframe (`agentcut.reframe`):**
-   * Intelligent transformation between 16:9 (Landscape), 9:16 (Vertical Shorts/Reels/TikTok), 1:1 (Square), and 4:5 (Social Portrait).
-   * Industry-standard `blur_pad` mode (dynamic blurred background padding), `crop` mode, and `fit` letterboxing.
-   * Multi-variant generation in a single call (`reframe_to_variants`).
-2. **Plugin Architecture for Motion & Diagrams (`agentcut.plugins`):**
-   * Decoupled plugin registry for motion elements (`MotionPlugin`) and diagram templates.
-   * Dynamic loading from workspace `./plugins/` or user `~/.agentcut/plugins/`.
-   * Standard reference plugins included: `progress_bar` and `badge`.
-3. **Interactive Local Web Studio (`agentcut.studio`):**
-   * Single-page, zero-dependency HTML5 timeline inspector and synchronized video player.
-   * Multi-track visualization (Scenes, Narration, Motion, Audio bed), live playhead scrubber, aspect ratio frame simulator, and scene inspector.
-4. **New CLI Subcommands & MCP Tools:**
-   * CLI: `reframe`, `studio`, `plugins`.
-   * MCP Tools: `reframe_video`, `generate_web_studio`, `list_plugins`.
+5. **الدورة 5 (`v3.4.5`) — محول السكريبت الذكي + واجهة الاستوديو للهاتف + `agentcut doctor` والتغليف النهائي (`director_browser.py` + `studio_web.py` + `preflight.py`):**
+   - محول النص العربي الخام إلى `spec.json` متنوع تلقائياً (`script_to_spec`) مع مدقق ما قبل الرندر (`preflight_audit`) لقياس WPS واقتراح اختصار النص بدل التسريع.
+   - خادم ويب محلي خفيف **AgentCut Studio (`studio_web.py` — stdlib `http.server` + واجهة عربية متجاوبة للهاتف)** لإدخال الموضوع/الصوت واختيار Brand Kit ومعاينة الإطارات والرندر بضغطة زر.
+   - أمر `agentcut doctor` لفحص البيئة، ومثالان كاملان (`reel_winter_60s.json` و`explainer_landscape_16x9.json`)، وتحديث شامل لـ `README.md` و`server.py` (تصدير كل الأدوات عبر MCP).

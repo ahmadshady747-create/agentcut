@@ -1,0 +1,108 @@
+{
+  "id": "winter-cold-60s",
+  "title": "ليه بنحس بالبرد في الشتاء رغم ثبات حرارة الجسم؟",
+  "brand_kit": "tab_ezzay",
+  "format": "vertical",
+  "target_duration": 60.0,
+  "scenes": [
+    {
+      "id": "s1",
+      "type": "intro",
+      "layout": "zoom",
+      "narration": "s1.wav",
+      "text": "جسمك درجة حرارته 37 طول السنة حتى في عز البرد.",
+      "title": "ليه بنحس بالبرد في الشتاء؟",
+      "subtitle": "لغز الثبات الحراري البشري",
+      "icon": "thermometer",
+      "badge": "37°",
+      "body": "حرارة المركز ثابتة",
+      "keywords": ["37", "البرد"]
+    },
+    {
+      "id": "s2",
+      "type": "question",
+      "layout": "body",
+      "narration": "s2.wav",
+      "text": "طب ازاي؟"
+    },
+    {
+      "id": "s3",
+      "type": "concept",
+      "layout": "body",
+      "narration": "s3.wav",
+      "text": "الجلد مليان مستقبلات حرارة بتقيس برودة الهواء مش حرارة دمك.",
+      "title": "حساسات الإنذار المبكر",
+      "illustration": "thermoregulation",
+      "body": "الجلد يستشعر تغيّر البيئة فوراً",
+      "keywords": ["مستقبلات", "الجلد"]
+    },
+    {
+      "id": "s4",
+      "type": "layers",
+      "layout": "layers",
+      "narration": "s4.wav",
+      "text": "أول ما الهواء يبرد، الإشارة تروح للمخ فتنقبض الأوعية في الأطراف.",
+      "title": "خط الدفاع الثلاثي",
+      "layers": [
+        {"label": "الجلد", "text": "يرصد الهبوط ويرسل نبضة عصبية"},
+        {"label": "تحت المهاد", "text": "مركز التحكم في الدماغ يصدر القرار"},
+        {"label": "الأوعية", "text": "تضيق في اليدين لحفظ الدم الدافئ للقلب"}
+      ],
+      "keywords": ["للمخ", "الأوعية"]
+    },
+    {
+      "id": "s5",
+      "type": "chart_donut",
+      "layout": "chart",
+      "narration": "s5.wav",
+      "text": "أكتر من 75 بالمئة من الدم الدافئ يتركز حول الأعضاء الحيوية.",
+      "title": "توزيع الدم وقت البرد",
+      "chart": {
+        "center_value": "75%",
+        "center_label": "المركز الحيوي",
+        "segments": [
+          {"label": "القلب والدماغ", "value": 75, "color": "accent"},
+          {"label": "الأطراف والجلد", "value": 25, "color": "blue"}
+        ]
+      },
+      "keywords": ["75", "الأعضاء"]
+    },
+    {
+      "id": "s6",
+      "type": "statistic",
+      "layout": "scale",
+      "narration": "s6.wav",
+      "text": "لو البرد زاد، العضلات تبدأ ترتجف فتضاعف إنتاج الحرارة خمس مرات.",
+      "stat": {"value": "×5", "label": "مضاعفة إنتاج الحرارة بالارتجاف"},
+      "bars": [
+        {"label": "الراحة الطبيعية", "value": 20, "color": "blue"},
+        {"label": "أثناء الارتجاف", "value": 100, "color": "accent"}
+      ],
+      "keywords": ["خمس", "ترتجف"]
+    },
+    {
+      "id": "s7",
+      "type": "comparison",
+      "layout": "cards",
+      "narration": "s7.wav",
+      "text": "يعني برودة إيديك هي الدرع اللي بيحمي حرارة قلبك ومخك.",
+      "title": "معادلة البقاء",
+      "panels": [
+        {"title": "أطراف باردة", "body": "تقليل فقدان الحرارة للخارج", "icon": "hand"},
+        {"title": "مركز دافئ 37°", "body": "حماية القلب والدماغ", "icon": "heart"}
+      ],
+      "keywords": ["إيديك", "قلبك"]
+    },
+    {
+      "id": "s8",
+      "type": "conclusion",
+      "layout": "body",
+      "narration": "s8.wav",
+      "text": "إحساسك بالبرد مش ضعف، ده أذكى نظام إنذار مبكر في جسمك.",
+      "icon": "shield",
+      "body": "البرد إنذار ذكي لحمايتك",
+      "subtitle": "سلسلة طب ازاي؟",
+      "keywords": ["إنذار", "أذكى"]
+    }
+  ]
+}

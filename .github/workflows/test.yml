@@ -26,32 +26,32 @@ jobs:
         # (run 44750049307). With build isolation pip installs
         # setuptools>=61.0 from pyproject.toml into the build env.
         run: pip install --no-deps -e .
-      - name: Run fast unit & v2.0.0 suites
+      - name: Run 3.4.5 test suite
         run: |
           PYTHONPATH=src python3 -m unittest \
-            tests/test_otio.py \
-            tests/test_templates.py \
-            tests/test_procraft_integration.py \
-            tests/test_v200.py \
-            tests/test_v250.py \
-            tests/test_v300.py \
-            tests/test_v310.py \
-            tests/test_v320.py \
-            tests/test_v331.py \
-            tests/test_v332.py \
-            tests/test_v333.py \
-            tests/test_v3311.py tests/test_v3312.py tests/test_v3313.py tests/test_v3310.py tests/test_v339.py tests/test_v338.py tests/test_v337.py tests/test_v336.py tests/test_v335.py tests/test_v334.py -v
-      - name: Render smoke test
-        run: ./run.sh render examples/basic.json /tmp/agentcut-smoke.mp4
+            tests/test_browser_render.py \
+            tests/test_flat_reels.py \
+            tests/test_v340_browser_engine.py \
+            tests/test_v341_beat_sync.py \
+            tests/test_v342_charts_icons_captions.py \
+            tests/test_v343_brand_multi_templates.py \
+            tests/test_v344_patch_pipe_qc.py \
+            tests/test_v345_director_studio_doctor.py -v
+      - name: CLI smoke test
+        # No render here: CI has no Chromium and the example specs
+        # reference narration audio that is not in the repo. doctor
+        # and preflight cover import + spec validation without a
+        # browser; rendering is verified locally with Playwright.
+        run: |
+          PYTHONPATH=src python3 -m agentcut doctor
+          PYTHONPATH=src python3 -m agentcut preflight examples/reel_winter_60s.json --no-audio
 
   full-integration-tests:
     name: Full Render Integration Suite
     runs-on: ubuntu-24.04
-    # NOTE: shard 1 holds 476 tests (incl. test_agentcut.py) vs 98
-    # in shard 2 — it was killed by the 45-minute timeout in run
-    # 44750049307 (started 14:05:02Z, cancelled 14:50:18Z).
-    # 180 minutes gives the heavy shard room to finish.
-    timeout-minutes: 180
+    # 3.4.5 suite is 81 tests across 8 modules (browser tests skip
+    # without Playwright); 30 minutes is far more than enough.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

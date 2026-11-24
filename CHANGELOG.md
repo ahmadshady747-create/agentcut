@@ -1,3 +1,36 @@
+## [3.4.5] - 2026-11-24 — Cycle 5 (Final): Smart Script Director, Preflight Auditor, Mobile Web Studio & Doctor
+- Added `director_browser.py` (`script_to_spec`) converting raw Arabic/mixed text into a varied multi-template `spec.json` with automatic 104-icon domain matching, numeric badge/statistic extraction, and anti-repetition guards.
+- Added `preflight.py` (`preflight_audit` and `doctor_environment`) checking schema, template variety, real narration WPS pace & script-trim recommendations, HTML `setTime(t)` determinism, WCAG contrast, FFmpeg/Playwright readiness, and `/dev/shm` RAM-disk space.
+- Added `studio_web.py` (`agentcut studio`) — a zero-dependency stdlib `http.server` RTL Arabic mobile-responsive web studio with live interactive `window.setTime(t)` preview scrubbing, Brand Kit selector, thumbnail preview, and preflight audit.
+- Added production-ready benchmark examples (`examples/reel_winter_60s.json` and `examples/explainer_landscape_16x9.json`) and updated `README.md`, CLI, and MCP server (`server.py` — 19 tools).
+
+## [3.4.4] - 2026-11-24 — Cycle 4: Surgical Scene Patching, Pipe-Mode Encoding & Visual QC
+- Added `scene_patch.py` with SHA-256 per-scene fingerprinting (`compute_scene_fingerprint`), surgical single-scene updates (`patch_scene`), cache hit diffing (`diff_scene_fingerprints`), and instant 3-second Hook A/B variant generation (`generate_hook_ab_variants`).
+- Upgraded `browser_render.py` for constrained hardware (8GB RAM, HDD, CPU-only) with `/dev/shm` RAM-disk routing (`get_fast_scratch_dir`) and direct memory-to-FFmpeg `image2pipe` PNG streaming (`encode_png_stream_pipe` / `pipe_mode=True`).
+- Added `visual_qc.py` with `audit_html_motion_continuity`, `audit_rendered_frames` (pure-Python PNG header inspection & SHA-256 motion continuity verification), and `render_contact_sheet`.
+
+## [3.4.3] - 2026-11-24 — Cycle 3: Brand Kits, Multi-Format Export, Thumbnails & Advanced Explainer Templates
+- Added `brand_kits.py` with 4 reusable channel Brand Kits (`tab_ezzay`, `reel_studio_dark`, `arabic_documentary`, `midnight_tech`) locking palette, caption style, series tag, watermark, motion physics, camera move, transition, J/L-cut, room tone, and music bed.
+- Added `multi_export.py` (`render_thumbnail_html`, `render_thumbnail_png`, `build_multi_format_html_bundle`, `export_multi_format`) to generate `16:9`, `9:16`, `1:1`, and a flat-editorial `Thumbnail PNG` from a single `spec.json`.
+- Added 5 advanced explainer scene templates (`before_after`, `funnel`, `matrix_2x2`, `terminal_demo`, `chapter_toc` — bringing total templates to **23**), plus deterministic `easeOutSpring`/`easeOutElastic` physics, browser camera moves (`push_in`, `pull_out`, `pan_rtl`, `pan_ltr`, `drift`), and `wipe_rtl`/`iris_reveal` transitions inside `window.setTime(t)`.
+
+## [3.4.2] - 2026-11-24 — Cycle 2: Live Vector Charts, 104 Icons & Smart Arabic Kinetic Captions
+- Added `charts.py` with deterministic SVG vector charts (`build_line_chart_svg`, `build_donut_chart_svg`, `build_grouped_bars_svg`) driven exclusively by `window.setTime(t)` (`stroke-dashoffset` line/arc sweep, baseline bar growth, and center count-up) and wired as scene types `chart_line`, `chart_donut`, `chart_bars` across 9:16, 16:9, and 1:1.
+- Expanded `icons.py` to **104 flat-editorial SVG icons** across medicine, science, economics, tech, and storytelling, plus **6 multi-layer composite SVG scene illustrations** (`ILLUSTRATIONS` / `illustration_svg`).
+- Added `captions.py` with **4 Arabic kinetic caption styles** (`word_pop`, `highlighter_bar`, `karaoke_pill`, `editorial_box`), balanced Arabic line chunking (`balance_caption_chunks` preventing 1-word orphans), keyword emphasis (`data-kw="1"`), and clean mixed-script Latin bidi isolation (`data-latin="1"`).
+
+## [3.4.1] - 2026-11-24 — Cycle 1: Acoustic Beat-Sync & Audio Engineering
+- Added `beat_sync.py` (pure stdlib `wave`/`struct`/`math` + FFmpeg PCM fallback) extracting 25ms RMS energy envelopes, vocal emphasis peaks, natural breath pauses, and beat-snapped visual/SFX anchor timings.
+- Wired `beatEnergy(local, sc.peaks)` into `flat_reels.py` `window.setTime(t)` so icons and visual elements pulse deterministically on real vocal peaks.
+- Expanded `soundscape.py` to 15 procedural SFX (`page_flip`, `marker_swipe`, `pulse_heartbeat`, `digital_blip`, `success_chord`, `tape_stop`) and 6 ambient music beds (`curiosity_marimba`, `warm_acoustic`, `cinematic_tension`), plus `plan_jl_cut_schedule`.
+- Upgraded `browser_render.py` `mix_audio` with documentary `J-Cut`/`L-Cut` speech overlap and added `audit_audio_mix` verifying EBU R128 `-14 LUFS` integrated loudness and `-1.0 dBTP` True Peak compliance.
+
+## [3.4.0] - 2026-11-24
+- Unified browser-only production engine (Playwright + Chromium via deterministic `window.setTime(t)`).
+- Removed all legacy FFmpeg visual-drawing modules & tests; FFmpeg is strictly for encoding (`encode_frames`, `-14 LUFS`) and audio mixing (`mix_audio`).
+- Added 66 flat-editorial SVG icons (`icons.py`), 15 scene templates (`vertical` 9:16, `landscape` 16:9, `square` 1:1), 4 palettes, 9 procedural SFX, auto-SFX planner, sidechain music ducking, and `measure_narration_pace`.
+- Added 10-cycle deepening roadmap in `docs/ROADMAP.md` (v3.4.1 -> v3.4.10).
+
 ## 3.3.13 — Cycle 12: Optional YouTube Data API v3 Resumable Publisher (`publish_youtube_video`)
 
 Completes the 4-feature expansion roadmap by adding an opt-in YouTube publisher built strictly with Python's standard library (`urllib` + `http.server`):
