@@ -340,8 +340,12 @@ def encode_frames(frames_dir: str, audio_path: str | None,
     cmd += filt + ["-c:v", "libx264", "-pix_fmt", "yuv420p",
                    "-r", str(fps), "-crf", str(crf), "-preset", preset]
     if audio_path:
+        # The video frame count is authoritative: cap the output at the exact
+        # video duration instead of `-shortest`, which lets a mix that is a
+        # hair shorter than the video (sample rounding, J/L trims) silently
+        # drop the last frames (e.g. 750 -> 747).
         cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-                "-shortest"]
+                "-t", f"{n_frames / fps:.3f}"]
     cmd += ["-movflags", "+faststart", output_path]
     rc, _, err = _run(cmd, timeout=1800)
     if rc != 0 or not os.path.isfile(output_path):
@@ -462,6 +466,7 @@ def encode_png_stream_pipe(
     loudnorm_target: float = DEFAULT_LOUDNESS_TARGET,
     crf: int = DEFAULT_CRF,
     preset: str = "medium",
+    duration: float | None = None,
 ) -> tuple[bool, dict]:
     """Stream raw PNG byte buffers directly into FFmpeg stdin (`image2pipe`)
     so zero `frame_XXXXXX.png` files ever hit the hard drive."""
@@ -487,7 +492,16 @@ def encode_png_stream_pipe(
         "-r", str(fps), "-crf", str(crf), "-preset", preset,
     ]
     if audio_path:
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest"]
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        # Video duration is authoritative (see encode_frames): when the
+        # caller knows it, cap the output at that exact length instead of
+        # `-shortest`, which drops trailing frames when the mix is a hair
+        # shorter than the video. Without a known duration keep `-shortest`
+        # so an overlong audio bed cannot extend the output.
+        if duration is not None and duration > 0:
+            cmd += ["-t", f"{duration:.3f}"]
+        else:
+            cmd += ["-shortest"]
     cmd += ["-movflags", "+faststart", output_path]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -569,7 +583,8 @@ def render_browser_page(html: str, duration: float,
                     browser.close()
 
             return encode_png_stream_pipe(
-                _gen(), audio_path, output_path, fps=fps, loudnorm_target=loudnorm_target
+                _gen(), audio_path, output_path, fps=fps, loudnorm_target=loudnorm_target,
+                duration=duration,
             )
         except Exception as exc:  # noqa: BLE001
             return False, {"code": "CAPTURE_FAILED", "message": f"browser pipe capture failed: {exc}"}

@@ -837,9 +837,12 @@ window.setTime = function(t){
   const beatBoost = beatEnergy(local, sc.peaks || []);
 
   // Scene-level deterministic transition (first 0.26s) + browser camera move.
+  // The first scene opens fully formed: frame 0 is the video cover, so it
+  // must not be an empty fade-in.
+  const isFirst = sc.start === 0;
   const tr = sc.transition || DEFAULT_TRANS;
   const cam = sc.camera_move || DEFAULT_CAM;
-  const tp = Math.min(1, local / 0.26);
+  const tp = isFirst ? 1 : Math.min(1, local / 0.26);
   const te = easeOutCubic(tp);
   root.style.clipPath = '';
   let rootTx = 0, rootTy = 0, rootScale = 1;
@@ -889,7 +892,7 @@ window.setTime = function(t){
   // Entrance + continuous living micro-float for .anim elements.
   root.querySelectorAll('.anim').forEach((el, idx) => {
     const d = parseFloat(el.dataset.delay || '0');
-    const p = Math.min(1, Math.max(0, (local - d) / 0.45));
+    const p = isFirst ? 1 : Math.min(1, Math.max(0, (local - d) / 0.45));
     const e = applyPhysicsEase(p);
     el.style.opacity = p;
     let ty = (1 - p) * 18;
@@ -1321,10 +1324,13 @@ def _scene_comparison(scene: dict, timing: dict, spec: dict,
 def _scene_conclusion(scene: dict, timing: dict, spec: dict,
                       index: int, total: int) -> str:
     icon = _icon_stage(str(scene.get("icon", "check")), 165)
+    title = _esc(str(scene.get("title", "")))
     takeaway = _esc(str(scene.get("body", "")))
     endline = _esc(str(scene.get("subtitle", "")))
     return (
         _tagrow(spec, scene, index, total)
+        + (f'<h1 class="title anim" data-delay="0.05">{title}</h1>'
+           if title else "")
         + '<div class="visual"><div class="art-card anim" data-delay="0.1">'
         + icon
         + (f'<div class="art-label">{takeaway}</div>' if takeaway else "")

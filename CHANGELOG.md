@@ -1,3 +1,8 @@
+## [3.4.6] - 2026-11-27 — Patch: Conclusion Title, Exact Frame Count & First-Frame Cover
+- Fixed `_scene_conclusion` in `flat_reels.py` silently dropping the scene `title` field: the conclusion template now renders the title (when present) above the card, like every other template.
+- Fixed the encoder dropping trailing frames: `encode_frames` and `encode_png_stream_pipe` in `browser_render.py` now cap the output at the exact video duration (`-t <n_frames/fps>`) instead of `-shortest`, which let an audio mix a hair shorter than the video (sample rounding) truncate the output (750 scheduled frames → 747). Reproduced with a synthetic 750-frame encode (`-shortest` → 749, `-t` → 750) before fixing.
+- First scene now opens fully formed in `window.setTime(t)`: the scene transition and `.anim` entrance fades are bypassed when `sc.start === 0`, so frame 0 (the video cover) shows the title, card, badge, and first caption instead of an empty fade-in.
+
 ## [3.4.5] - 2026-11-24 — Cycle 5 (Final): Smart Script Director, Preflight Auditor, Mobile Web Studio & Doctor
 - Added `director_browser.py` (`script_to_spec`) converting raw Arabic/mixed text into a varied multi-template `spec.json` with automatic 104-icon domain matching, numeric badge/statistic extraction, and anti-repetition guards.
 - Added `preflight.py` (`preflight_audit` and `doctor_environment`) checking schema, template variety, real narration WPS pace & script-trim recommendations, HTML `setTime(t)` determinism, WCAG contrast, FFmpeg/Playwright readiness, and `/dev/shm` RAM-disk space.

@@ -1,6 +1,6 @@
-# AgentCut v3.4.5 — Deterministic Browser-Rendered Arabic & English Video Engine
+# AgentCut v3.4.6 — Deterministic Browser-Rendered Arabic & English Video Engine
 
-AgentCut v3.4.5 is a 100% browser-rendered motion-graphics video engine for vertical reels (`9:16`), long-form explainers (`16:9`), and square videos (`1:1`).
+AgentCut v3.4.6 is a 100% browser-rendered motion-graphics video engine for vertical reels (`9:16`), long-form explainers (`16:9`), and square videos (`1:1`).
 Every visual pixel — typography, 104 hand-drawn flat SVG icons, 6 multi-layer composite illustrations, live SVG vector charts, camera moves, and kinetic Arabic captions — is rendered deterministically in headless Chromium via `window.setTime(t)`.
 FFmpeg is used **strictly** as a dumb encoder (`encode_frames` / `encode_png_stream_pipe` with `-14 LUFS` linear loudnorm) and audio mixer/synthesizer (`mix_audio` + `soundscape.py`).
 

@@ -94,7 +94,7 @@ class TestStudioWebAndDoctorV345(unittest.TestCase):
         self.assertTrue(pf_data["ok"])
 
     def test_doctor_mcp_and_cli_v345(self):
-        self.assertEqual(agentcut.__version__, "3.4.5")
+        self.assertEqual(agentcut.__version__, "3.4.6")
         doc = preflight.doctor_environment(probe_browser=False)
         self.assertTrue(doc["ok"], doc)
         self.assertTrue(doc["fonts"]["Cairo.ttf"])
